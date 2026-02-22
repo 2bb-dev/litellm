@@ -203,6 +203,7 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             "web_search_options",
             "speed",
             "context_management",
+            "cache_control",
         ]
 
         if (
@@ -1028,6 +1029,9 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             elif param == "speed" and isinstance(value, str):
                 # Pass through Anthropic-specific speed parameter for fast mode
                 optional_params["speed"] = value
+            elif param == "cache_control" and isinstance(value, dict):
+                # Top-level automatic caching - https://platform.claude.com/docs/en/build-with-claude/prompt-caching#automatic-caching
+                optional_params["cache_control"] = value
 
         ## handle thinking tokens
         self.update_optional_params_with_thinking_tokens(
