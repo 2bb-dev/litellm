@@ -22,11 +22,21 @@ function withBase(path: string): string {
 }
 /** -------------------------------- */
 
+const MOBILE_BREAKPOINT = 768;
+
 function LayoutContent({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { accessToken, userRole, userId, userEmail, premiumUser } = useAuthorized();
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
+
+  // Auto-collapse sidebar on mobile viewports
+  useEffect(() => {
+    const handleResize = () => setSidebarCollapsed(window.innerWidth < MOBILE_BREAKPOINT);
+    handleResize(); // set correct initial state on mount
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
   const [page, setPage] = useState(() => {
     return searchParams.get("page") || "api-keys";
   });
@@ -63,9 +73,9 @@ function LayoutContent({ children }: { children: React.ReactNode }) {
         />
         <div className="flex flex-1 overflow-auto">
           <div className="mt-2">
-            <Sidebar2 defaultSelectedKey={page} accessToken={accessToken} userRole={userRole} />
+            <Sidebar2 defaultSelectedKey={page} accessToken={accessToken} userRole={userRole} collapsed={sidebarCollapsed} />
           </div>
-          <main className="flex-1">{children}</main>
+          <main className="flex-1 min-w-0">{children}</main>
         </div>
       </div>
     </ThemeProvider>

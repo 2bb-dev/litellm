@@ -77,7 +77,7 @@ const Navbar: React.FC<NavbarProps> = ({
   };
 
   return (
-    <nav className="bg-white border-b border-gray-200 sticky top-0 z-10">
+    <nav className="bg-white border-b border-gray-200 sticky top-0 z-10 overflow-hidden">
       <div className="w-full">
         <div className="flex items-center h-14 px-4">
           <div className="flex items-center flex-shrink-0">
@@ -104,7 +104,7 @@ const Navbar: React.FC<NavbarProps> = ({
                 </div>
               </Link>
               {version && (
-                <div className="relative">
+                <div className="relative hidden sm:block">
                   <span
                     className="absolute -top-1 -left-2 text-lg animate-bounce"
                     style={{ animationDuration: "2s" }}
