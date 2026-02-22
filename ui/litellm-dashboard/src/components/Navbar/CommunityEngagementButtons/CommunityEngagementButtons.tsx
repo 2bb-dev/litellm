@@ -12,7 +12,7 @@ export const CommunityEngagementButtons: React.FC = () => {
   }
 
   return (
-    <>
+    <div className="hidden md:flex items-center gap-2">
       <Button
         href="https://www.litellm.ai/support"
         target="_blank"
@@ -31,6 +31,6 @@ export const CommunityEngagementButtons: React.FC = () => {
       >
         Star us on GitHub
       </Button>
-    </>
+    </div>
   );
 };
