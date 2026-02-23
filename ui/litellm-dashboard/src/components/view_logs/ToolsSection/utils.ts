@@ -1,9 +1,10 @@
 /**
  * Utility functions for parsing and processing tool data from log entries
+ * Supports both OpenAI and Anthropic tool formats
  */
 
 import { LogEntry } from "../columns";
-import { ParsedTool, ToolDefinition, ToolCall } from "./types";
+import { ParsedTool, ToolDefinition, ToolCall, AnthropicToolUse } from "./types";
 
 /**
  * Parse raw data that might be a string or object
@@ -43,24 +44,83 @@ function extractToolsFromRequest(log: LogEntry): ToolDefinition[] {
 }
 
 /**
- * Extract tool calls from response data
+ * Extract tool name from a tool definition (supports both formats)
+ *
+ * OpenAI:    { type: "function", function: { name: "foo" } }
+ * Anthropic: { name: "foo", input_schema: {...} }
  */
-function extractToolCallsFromResponse(log: LogEntry): ToolCall[] {
+function getToolName(tool: ToolDefinition, index: number): string {
+  // Anthropic format: name at top level
+  if (tool.name) return tool.name;
+  // OpenAI format: nested under function
+  if (tool.function?.name) return tool.function.name;
+  // Fallback
+  return `Tool ${index + 1}`;
+}
+
+/**
+ * Extract tool description from a tool definition (supports both formats)
+ */
+function getToolDescription(tool: ToolDefinition): string {
+  return tool.description || tool.function?.description || "";
+}
+
+/**
+ * Extract tool parameters from a tool definition (supports both formats)
+ *
+ * OpenAI:    function.parameters
+ * Anthropic: input_schema
+ */
+function getToolParameters(tool: ToolDefinition): Record<string, any> {
+  return tool.input_schema || tool.function?.parameters || {};
+}
+
+/**
+ * Extract tool calls from response data
+ * Supports both OpenAI and Anthropic response formats
+ */
+function extractToolCallsFromResponse(log: LogEntry): { name: string; id: string; arguments: Record<string, any> }[] {
   const responseData = parseData(log.response);
   
   if (!responseData || typeof responseData !== "object") return [];
   
+  const results: { name: string; id: string; arguments: Record<string, any> }[] = [];
+
   // OpenAI format: response.choices[0].message.tool_calls
   const choices = responseData.choices;
   if (Array.isArray(choices) && choices.length > 0) {
     const firstChoice = choices[0];
     const message = firstChoice.message;
     if (message && Array.isArray(message.tool_calls)) {
-      return message.tool_calls;
+      for (const tc of message.tool_calls as ToolCall[]) {
+        const name = tc.function?.name;
+        if (name) {
+          results.push({
+            name,
+            id: tc.id,
+            arguments: parseSafeJson(tc.function?.arguments || "{}"),
+          });
+        }
+      }
     }
   }
-  
-  return [];
+
+  // Anthropic format: response.content[].type === "tool_use"
+  const content = responseData.content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block.type === "tool_use" && block.name) {
+        const toolUse = block as AnthropicToolUse;
+        results.push({
+          name: toolUse.name,
+          id: toolUse.id,
+          arguments: toolUse.input || {},
+        });
+      }
+    }
+  }
+
+  return results;
 }
 
 /**
@@ -87,36 +147,27 @@ export function parseToolsFromLog(log: LogEntry): ParsedTool[] {
   }
   
   // Get tool calls from response
-  const toolCalls = extractToolCallsFromResponse(log);
-  const calledToolNames = new Set(
-    toolCalls.map((tc: ToolCall) => tc.function?.name).filter(Boolean)
-  );
+  const toolCallResults = extractToolCallsFromResponse(log);
+  const calledToolNames = new Set(toolCallResults.map((tc) => tc.name));
   
   // Map tool calls by name for quick lookup
-  const toolCallMap = new Map<string, any>();
-  toolCalls.forEach((tc: ToolCall) => {
-    const name = tc.function?.name;
-    if (name) {
-      toolCallMap.set(name, {
-        id: tc.id,
-        name: name,
-        arguments: parseSafeJson(tc.function?.arguments || "{}"),
-      });
-    }
+  const toolCallMap = new Map<string, { id: string; name: string; arguments: Record<string, any> }>();
+  toolCallResults.forEach((tc) => {
+    toolCallMap.set(tc.name, tc);
   });
   
-  // Parse each tool definition
+  // Parse each tool definition (supports both OpenAI and Anthropic formats)
   return requestTools.map((tool: ToolDefinition, index: number) => {
-    const func = tool.function || { name: `Tool ${index + 1}` };
-    const name = func.name || `Tool ${index + 1}`;
+    const name = getToolName(tool, index);
     
     return {
       index: index + 1,
       name: name,
-      description: func.description || "",
-      parameters: func.parameters || {},
+      description: getToolDescription(tool),
+      parameters: getToolParameters(tool),
       called: calledToolNames.has(name),
       callData: toolCallMap.get(name),
+      originalJson: tool as Record<string, any>,
     };
   });
 }

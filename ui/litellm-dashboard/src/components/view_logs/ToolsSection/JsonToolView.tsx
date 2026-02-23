@@ -9,15 +9,8 @@ interface JsonToolViewProps {
 }
 
 export function JsonToolView({ tool }: JsonToolViewProps) {
-  // Reconstruct the original tool definition
-  const toolJson = {
-    type: "function",
-    function: {
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
-    },
-  };
+  // Show the original tool definition as stored in the request
+  const toolJson = tool.originalJson;
 
   return (
     <pre
