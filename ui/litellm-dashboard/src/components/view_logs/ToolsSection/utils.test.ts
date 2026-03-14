@@ -1,6 +1,5 @@
 /**
  * Tests for tool parsing utilities
- * Covers both OpenAI and Anthropic tool formats
  */
 
 import { describe, it, expect } from "vitest";
@@ -21,7 +20,7 @@ describe("ToolsSection utils", () => {
       expect(result).toEqual([]);
     });
 
-    it("should parse tools from proxy_server_request (OpenAI format)", () => {
+    it("should parse tools from proxy_server_request", () => {
       const log: Partial<LogEntry> = {
         request_id: "test-2",
         proxy_server_request: {
@@ -56,54 +55,6 @@ describe("ToolsSection utils", () => {
       });
     });
 
-    it("should parse tools from proxy_server_request (Anthropic format)", () => {
-      const log: Partial<LogEntry> = {
-        request_id: "test-anthropic-1",
-        proxy_server_request: {
-          tools: [
-            {
-              name: "read_file",
-              description: "Read a file from disk",
-              input_schema: {
-                type: "object",
-                properties: {
-                  path: { type: "string", description: "File path" },
-                },
-                required: ["path"],
-              },
-            },
-            {
-              name: "write_file",
-              description: "Write content to a file",
-              input_schema: {
-                type: "object",
-                properties: {
-                  path: { type: "string" },
-                  content: { type: "string" },
-                },
-                required: ["path", "content"],
-              },
-            },
-          ],
-        },
-        response: {},
-      } as any;
-
-      const result = parseToolsFromLog(log as LogEntry);
-
-      expect(result).toHaveLength(2);
-      expect(result[0].name).toBe("read_file");
-      expect(result[0].description).toBe("Read a file from disk");
-      expect(result[0].parameters).toEqual({
-        type: "object",
-        properties: {
-          path: { type: "string", description: "File path" },
-        },
-        required: ["path"],
-      });
-      expect(result[1].name).toBe("write_file");
-    });
-
     it("should parse tools from messages object format", () => {
       const log: Partial<LogEntry> = {
         request_id: "test-3",
@@ -127,7 +78,7 @@ describe("ToolsSection utils", () => {
       expect(result[0].name).toBe("search_web");
     });
 
-    it("should mark tools as called when present in OpenAI response", () => {
+    it("should mark tools as called when present in response", () => {
       const log: Partial<LogEntry> = {
         request_id: "test-4",
         proxy_server_request: {
@@ -178,44 +129,6 @@ describe("ToolsSection utils", () => {
       });
       expect(result[1].called).toBe(false);
       expect(result[1].callData).toBeUndefined();
-    });
-
-    it("should mark tools as called when present in Anthropic response", () => {
-      const log: Partial<LogEntry> = {
-        request_id: "test-anthropic-2",
-        proxy_server_request: {
-          tools: [
-            {
-              name: "read_file",
-              description: "Read a file",
-              input_schema: { type: "object", properties: {} },
-            },
-            {
-              name: "write_file",
-              description: "Write a file",
-              input_schema: { type: "object", properties: {} },
-            },
-          ],
-        },
-        response: {
-          content: [
-            {
-              type: "tool_use",
-              id: "toolu_123",
-              name: "read_file",
-              input: { path: "/tmp/test.txt" },
-            },
-          ],
-        },
-      } as any;
-
-      const result = parseToolsFromLog(log as LogEntry);
-
-      expect(result).toHaveLength(2);
-      expect(result[0].called).toBe(true);
-      expect(result[0].callData).toBeDefined();
-      expect(result[0].callData?.arguments).toEqual({ path: "/tmp/test.txt" });
-      expect(result[1].called).toBe(false);
     });
 
     it("should handle string format request and response", () => {
@@ -346,23 +259,81 @@ describe("ToolsSection utils", () => {
       expect(result[2].index).toBe(3);
     });
 
-    it("should preserve originalJson for each tool", () => {
-      const anthropicTool = {
-        name: "read_file",
-        description: "Read a file",
-        input_schema: { type: "object", properties: {} },
-      };
+    it("should parse tool calls from realtime API response with tool_calls field", () => {
       const log: Partial<LogEntry> = {
-        request_id: "test-original-json",
+        request_id: "test-realtime-1",
         proxy_server_request: {
-          tools: [anthropicTool],
+          tools: [
+            {
+              type: "function",
+              name: "get_weather",
+              description: "Get current weather",
+            },
+          ],
         },
-        response: {},
+        response: {
+          results: [],
+          usage: {},
+          tool_calls: [
+            {
+              id: "call_abc",
+              type: "function",
+              function: {
+                name: "get_weather",
+                arguments: '{"location": "Paris"}',
+              },
+            },
+          ],
+        },
       } as any;
 
       const result = parseToolsFromLog(log as LogEntry);
 
-      expect(result[0].originalJson).toEqual(anthropicTool);
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe("get_weather");
+      expect(result[0].called).toBe(true);
+      expect(result[0].callData?.arguments).toEqual({ location: "Paris" });
+    });
+
+    it("should parse tool calls from realtime response.done events", () => {
+      const log: Partial<LogEntry> = {
+        request_id: "test-realtime-2",
+        proxy_server_request: {
+          tools: [
+            {
+              type: "function",
+              name: "get_weather",
+              description: "Get current weather",
+            },
+          ],
+        },
+        response: {
+          results: [
+            { type: "session.created", session: {} },
+            {
+              type: "response.done",
+              response: {
+                output: [
+                  {
+                    type: "function_call",
+                    call_id: "call_xyz",
+                    name: "get_weather",
+                    arguments: '{"location": "Tokyo"}',
+                  },
+                ],
+              },
+            },
+          ],
+          usage: {},
+        },
+      } as any;
+
+      const result = parseToolsFromLog(log as LogEntry);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe("get_weather");
+      expect(result[0].called).toBe(true);
+      expect(result[0].callData?.arguments).toEqual({ location: "Tokyo" });
     });
   });
 
@@ -387,23 +358,6 @@ describe("ToolsSection utils", () => {
               function: {
                 name: "test_tool",
               },
-            },
-          ],
-        },
-        response: {},
-      } as any;
-
-      expect(hasTools(log as LogEntry)).toBe(true);
-    });
-
-    it("should return true when Anthropic format tools present", () => {
-      const log: Partial<LogEntry> = {
-        request_id: "test-11",
-        proxy_server_request: {
-          tools: [
-            {
-              name: "test_tool",
-              input_schema: { type: "object", properties: {} },
             },
           ],
         },

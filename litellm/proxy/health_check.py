@@ -234,6 +234,14 @@ def _update_litellm_params_for_health_check(
     - for Bedrock models with region routing (bedrock/region/model), strips the litellm routing prefix but preserves the model ID
     """
     litellm_params["messages"] = _get_random_llm_message()
+    _health_check_max_tokens = model_info.get("health_check_max_tokens", None)
+    if _health_check_max_tokens is not None:
+        litellm_params["max_tokens"] = _health_check_max_tokens
+    elif "*" not in (
+        model_info.get("health_check_model") or litellm_params.get("model") or ""
+    ):
+        litellm_params["max_tokens"] = 1
+
     _health_check_model = model_info.get("health_check_model", None)
     if _health_check_model is not None:
         litellm_params["model"] = _health_check_model
@@ -283,11 +291,16 @@ async def perform_health_check(
     model: Optional[str] = None,
     cli_model: Optional[str] = None,
     details: Optional[bool] = True,
+    model_id: Optional[str] = None,
     max_concurrency: Optional[int] = None,
     instrumentation_context: Optional[dict] = None,
 ):
     """
     Perform a health check on the system.
+
+    When model_id is provided, only the deployment with that id is checked
+    (so models that share the same name but have different ids are checked separately).
+    When model (name) is provided, all deployments matching that name are checked.
 
     Returns:
         (bool): True if the health check passes, False otherwise.
@@ -314,7 +327,14 @@ async def perform_health_check(
     cycle_start_time = time.monotonic()
     requested_model_count = len(model_list)
 
-    if model is not None:
+    # Filter by model_id first so a single deployment is checked when id is specified
+    if model_id is not None:
+        _by_id = [
+            x for x in model_list if (x.get("model_info") or {}).get("id") == model_id
+        ]
+        if _by_id:
+            model_list = _by_id
+    elif model is not None:
         _new_model_list = [
             x for x in model_list if x["litellm_params"]["model"] == model
         ]

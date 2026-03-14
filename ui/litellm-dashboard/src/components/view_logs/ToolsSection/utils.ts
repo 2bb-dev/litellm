@@ -1,10 +1,9 @@
 /**
  * Utility functions for parsing and processing tool data from log entries
- * Supports both OpenAI and Anthropic tool formats
  */
 
 import { LogEntry } from "../columns";
-import { ParsedTool, ToolDefinition, ToolCall, AnthropicToolUse } from "./types";
+import { ParsedTool, ToolDefinition, ToolCall } from "./types";
 
 /**
  * Parse raw data that might be a string or object
@@ -44,47 +43,12 @@ function extractToolsFromRequest(log: LogEntry): ToolDefinition[] {
 }
 
 /**
- * Extract tool name from a tool definition (supports both formats)
- *
- * OpenAI:    { type: "function", function: { name: "foo" } }
- * Anthropic: { name: "foo", input_schema: {...} }
- */
-function getToolName(tool: ToolDefinition, index: number): string {
-  // Anthropic format: name at top level
-  if (tool.name) return tool.name;
-  // OpenAI format: nested under function
-  if (tool.function?.name) return tool.function.name;
-  // Fallback
-  return `Tool ${index + 1}`;
-}
-
-/**
- * Extract tool description from a tool definition (supports both formats)
- */
-function getToolDescription(tool: ToolDefinition): string {
-  return tool.description || tool.function?.description || "";
-}
-
-/**
- * Extract tool parameters from a tool definition (supports both formats)
- *
- * OpenAI:    function.parameters
- * Anthropic: input_schema
- */
-function getToolParameters(tool: ToolDefinition): Record<string, any> {
-  return tool.input_schema || tool.function?.parameters || {};
-}
-
-/**
  * Extract tool calls from response data
- * Supports both OpenAI and Anthropic response formats
  */
-function extractToolCallsFromResponse(log: LogEntry): { name: string; id: string; arguments: Record<string, any> }[] {
+function extractToolCallsFromResponse(log: LogEntry): ToolCall[] {
   const responseData = parseData(log.response);
-  
+
   if (!responseData || typeof responseData !== "object") return [];
-  
-  const results: { name: string; id: string; arguments: Record<string, any> }[] = [];
 
   // OpenAI format: response.choices[0].message.tool_calls
   const choices = responseData.choices;
@@ -92,35 +56,55 @@ function extractToolCallsFromResponse(log: LogEntry): { name: string; id: string
     const firstChoice = choices[0];
     const message = firstChoice.message;
     if (message && Array.isArray(message.tool_calls)) {
-      for (const tc of message.tool_calls as ToolCall[]) {
-        const name = tc.function?.name;
-        if (name) {
-          results.push({
-            name,
-            id: tc.id,
-            arguments: parseSafeJson(tc.function?.arguments || "{}"),
-          });
-        }
-      }
+      return message.tool_calls;
     }
   }
 
   // Anthropic format: response.content[].type === "tool_use"
-  const content = responseData.content;
-  if (Array.isArray(content)) {
-    for (const block of content) {
-      if (block.type === "tool_use" && block.name) {
-        const toolUse = block as AnthropicToolUse;
-        results.push({
-          name: toolUse.name,
-          id: toolUse.id,
-          arguments: toolUse.input || {},
-        });
-      }
+  if (Array.isArray(responseData.content)) {
+    const toolUseBlocks = responseData.content.filter(
+      (block: any) => block.type === "tool_use"
+    );
+    if (toolUseBlocks.length > 0) {
+      return toolUseBlocks.map((block: any) => ({
+        id: block.id,
+        type: "function",
+        function: {
+          name: block.name,
+          arguments: JSON.stringify(block.input || {}),
+        },
+      }));
     }
   }
 
-  return results;
+  // Realtime API format: response.tool_calls (added by spend tracking for realtime calls)
+  if (Array.isArray(responseData.tool_calls)) {
+    return responseData.tool_calls;
+  }
+
+  // Realtime API format: response.results[].response.output[].type === "function_call"
+  if (Array.isArray(responseData.results)) {
+    const toolCalls: ToolCall[] = [];
+    for (const result of responseData.results) {
+      if (result.type === "response.done" && result.response?.output) {
+        for (const item of result.response.output) {
+          if (item.type === "function_call") {
+            toolCalls.push({
+              id: item.call_id || "",
+              type: "function",
+              function: {
+                name: item.name || "",
+                arguments: item.arguments || "{}",
+              },
+            });
+          }
+        }
+      }
+    }
+    if (toolCalls.length > 0) return toolCalls;
+  }
+
+  return [];
 }
 
 /**
@@ -147,27 +131,41 @@ export function parseToolsFromLog(log: LogEntry): ParsedTool[] {
   }
   
   // Get tool calls from response
-  const toolCallResults = extractToolCallsFromResponse(log);
-  const calledToolNames = new Set(toolCallResults.map((tc) => tc.name));
+  const toolCalls = extractToolCallsFromResponse(log);
+  const calledToolNames = new Set(
+    toolCalls.map((tc: ToolCall) => tc.function?.name).filter(Boolean)
+  );
   
   // Map tool calls by name for quick lookup
-  const toolCallMap = new Map<string, { id: string; name: string; arguments: Record<string, any> }>();
-  toolCallResults.forEach((tc) => {
-    toolCallMap.set(tc.name, tc);
+  const toolCallMap = new Map<string, any>();
+  toolCalls.forEach((tc: ToolCall) => {
+    const name = tc.function?.name;
+    if (name) {
+      toolCallMap.set(name, {
+        id: tc.id,
+        name: name,
+        arguments: parseSafeJson(tc.function?.arguments || "{}"),
+      });
+    }
   });
   
-  // Parse each tool definition (supports both OpenAI and Anthropic formats)
-  return requestTools.map((tool: ToolDefinition, index: number) => {
-    const name = getToolName(tool, index);
-    
+  // Parse each tool definition
+  // Handle both OpenAI format (tool.function.name) and Anthropic format (tool.name + tool.input_schema)
+  return requestTools.map((tool: any, index: number) => {
+    const name =
+      tool.function?.name || tool.name || `Tool ${index + 1}`;
+    const description =
+      tool.function?.description || tool.description || "";
+    const parameters =
+      tool.function?.parameters || tool.input_schema || {};
+
     return {
       index: index + 1,
-      name: name,
-      description: getToolDescription(tool),
-      parameters: getToolParameters(tool),
+      name,
+      description,
+      parameters,
       called: calledToolNames.has(name),
       callData: toolCallMap.get(name),
-      originalJson: tool as Record<string, any>,
     };
   });
 }
