@@ -1370,6 +1370,15 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
 
         # Separate system prompt from rest of message
         anthropic_system_message_list = self.translate_system_message(messages=messages)
+        
+        # Inject Claude Code system prompt for OAuth tokens
+        if "authorization" in headers and headers["authorization"].startswith("Bearer sk-ant-oat"):
+            claude_code_system = {
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+            anthropic_system_message_list.insert(0, claude_code_system)
+
         # Handling anthropic API Prompt Caching
         if len(anthropic_system_message_list) > 0:
             optional_params["system"] = anthropic_system_message_list

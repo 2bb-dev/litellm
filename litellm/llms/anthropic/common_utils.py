@@ -450,7 +450,10 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         if _is_oauth:
             headers["authorization"] = f"Bearer {api_key}"
             headers["anthropic-dangerous-direct-browser-access"] = "true"
+            headers["user-agent"] = "claude-cli/2.1.75"
+            headers["x-app"] = "cli"
             betas.add(ANTHROPIC_OAUTH_BETA_HEADER)
+            betas.add("claude-code-20250219")
         else:
             headers["x-api-key"] = api_key
 
