@@ -17,7 +17,7 @@ from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
 from litellm.utils import CustomStreamWrapper
 
-from ..authenticator import Authenticator
+from ..authenticator import get_authenticator
 from ..common_utils import (
     CHATGPT_API_BASE,
     GetAccessTokenError,
@@ -27,14 +27,27 @@ from ..common_utils import (
 )
 
 
+def _extract_slot(litellm_params: Optional[GenericLiteLLMParams]) -> Optional[str]:
+    """Extract the ChatGPT subscription slot from api_key in litellm_params."""
+    if litellm_params is None:
+        return None
+    api_key = getattr(litellm_params, "api_key", None)
+    if api_key and not api_key.startswith("sk-"):
+        return api_key
+    return None
+
+
 class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     def __init__(self) -> None:
         super().__init__()
-        self.authenticator = Authenticator()
 
     @property
     def custom_llm_provider(self) -> LlmProviders:
         return LlmProviders.CHATGPT
+
+    def _get_authenticator(self, litellm_params=None):
+        slot = _extract_slot(litellm_params)
+        return get_authenticator(slot)
 
     def validate_environment(
         self,
@@ -42,8 +55,9 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         model: str,
         litellm_params: Optional[GenericLiteLLMParams],
     ) -> dict:
+        authenticator = self._get_authenticator(litellm_params)
         try:
-            access_token = self.authenticator.get_access_token()
+            access_token = authenticator.get_access_token()
         except GetAccessTokenError as e:
             raise AuthenticationError(
                 model=model,
@@ -51,7 +65,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 message=str(e),
             )
 
-        account_id = self.authenticator.get_account_id()
+        account_id = authenticator.get_account_id()
         session_id = ensure_chatgpt_session_id(litellm_params)
         default_headers = get_chatgpt_default_headers(
             access_token, account_id, session_id
@@ -197,7 +211,8 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         api_base: Optional[str],
         litellm_params: dict,
     ) -> str:
-        api_base = api_base or self.authenticator.get_api_base() or CHATGPT_API_BASE
+        authenticator = self._get_authenticator()
+        api_base = api_base or authenticator.get_api_base() or CHATGPT_API_BASE
         api_base = api_base.rstrip("/")
         return f"{api_base}/responses"
 
