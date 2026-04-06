@@ -27,16 +27,33 @@ DEVICE_CODE_TIMEOUT_SECONDS = 15 * 60
 DEVICE_CODE_COOLDOWN_SECONDS = 5 * 60
 DEVICE_CODE_POLL_SLEEP_SECONDS = 5
 
+# Registry of authenticators keyed by slot name.
+_authenticator_registry: Dict[Optional[str], "Authenticator"] = {}
+
+
+def get_authenticator(slot: Optional[str] = None) -> "Authenticator":
+    """Return a cached Authenticator for the given slot.
+
+    Each slot has its own auth file (device code / refresh token),
+    allowing multiple ChatGPT subscriptions to coexist.
+    """
+    if slot not in _authenticator_registry:
+        _authenticator_registry[slot] = Authenticator(slot=slot)
+    return _authenticator_registry[slot]
+
 
 class Authenticator:
-    def __init__(self) -> None:
+    def __init__(self, slot: Optional[str] = None) -> None:
+        self.slot = slot
         self.token_dir = os.getenv(
             "CHATGPT_TOKEN_DIR",
             os.path.expanduser("~/.config/litellm/chatgpt"),
         )
-        self.auth_file = os.path.join(
-            self.token_dir, os.getenv("CHATGPT_AUTH_FILE", "auth.json")
-        )
+        if slot:
+            filename = f"auth_{slot}.json"
+        else:
+            filename = os.getenv("CHATGPT_AUTH_FILE", "auth.json")
+        self.auth_file = os.path.join(self.token_dir, filename)
         self._ensure_token_dir()
 
     def get_api_base(self) -> str:
@@ -159,8 +176,9 @@ class Authenticator:
 
         device_code = self._request_device_code()
         self._record_device_code_request()
+        slot_label = f" [slot: {self.slot}]" if self.slot else ""
         print(  # noqa: T201
-            "Sign in with ChatGPT using device code:\n"
+            f"Sign in with ChatGPT using device code{slot_label}:\n"
             f"1) Visit {CHATGPT_DEVICE_VERIFY_URL}\n"
             f"2) Enter code: {device_code['user_code']}\n"
             "Device codes are a common phishing target. Never share this code.",

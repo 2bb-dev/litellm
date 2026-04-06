@@ -4,12 +4,19 @@ from litellm.exceptions import AuthenticationError
 from litellm.llms.openai.openai import OpenAIConfig
 from litellm.types.llms.openai import AllMessageValues
 
-from ..authenticator import Authenticator
+from ..authenticator import get_authenticator
 from ..common_utils import (
     GetAccessTokenError,
     ensure_chatgpt_session_id,
     get_chatgpt_default_headers,
 )
+
+
+def _extract_slot(api_key: Optional[str]) -> Optional[str]:
+    """Extract the ChatGPT subscription slot from api_key."""
+    if api_key and not api_key.startswith("sk-"):
+        return api_key
+    return None
 
 
 class ChatGPTConfig(OpenAIConfig):
@@ -20,7 +27,6 @@ class ChatGPTConfig(OpenAIConfig):
         custom_llm_provider: str = "openai",
     ) -> None:
         super().__init__()
-        self.authenticator = Authenticator()
 
     def _get_openai_compatible_provider_info(
         self,
@@ -29,9 +35,11 @@ class ChatGPTConfig(OpenAIConfig):
         api_key: Optional[str],
         custom_llm_provider: str,
     ) -> Tuple[Optional[str], Optional[str], str]:
-        dynamic_api_base = self.authenticator.get_api_base()
+        slot = _extract_slot(api_key)
+        authenticator = get_authenticator(slot)
+        dynamic_api_base = authenticator.get_api_base()
         try:
-            dynamic_api_key = self.authenticator.get_access_token()
+            dynamic_api_key = authenticator.get_access_token()
         except GetAccessTokenError as e:
             raise AuthenticationError(
                 model=model,
@@ -54,7 +62,9 @@ class ChatGPTConfig(OpenAIConfig):
             headers, model, messages, optional_params, litellm_params, api_key, api_base
         )
 
-        account_id = self.authenticator.get_account_id()
+        slot = _extract_slot(api_key)
+        authenticator = get_authenticator(slot)
+        account_id = authenticator.get_account_id()
         session_id = ensure_chatgpt_session_id(litellm_params)
         default_headers = get_chatgpt_default_headers(
             api_key or "", account_id, session_id
