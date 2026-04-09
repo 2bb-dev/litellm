@@ -17,6 +17,10 @@ import VersionVerificationTable from '@site/src/components/VersionVerificationTa
 > **Status:** Active investigation
 > **Last updated:** March 27, 2026
 
+> **Update (March 30):** A new **clean** version of LiteLLM is now available (v1.83.0). This was released by our new [CI/CD v2](https://docs.litellm.ai/blog/ci-cd-v2-improvements) pipeline which added isolated environments, stronger security gates, and safer release separation for LiteLLM.
+
+> **Update (March 27):** Review Townhall updates, including explanation of the incident, what we've done, and what comes next. [Learn more](https://docs.litellm.ai/blog/security-townhall-updates)
+
 > **Update (March 27):** Added [Verified safe versions](#verified-safe-versions) section with SHA-256 checksums for all audited PyPI and Docker releases.
 
 > **Update (March 26):** Added `checkmarx[.]zone` to [Indicators of compromise](#indicators-of-compromise-iocs)
@@ -25,10 +29,10 @@ import VersionVerificationTable from '@site/src/components/VersionVerificationTa
 
 
 ## TLDR; 
-- The compromised PyPI packages were **litellm==1.82.7** and **litellm==1.82.8**. Those packages have now been removed from PyPI.
-- We believe that the compromise originated from the Trivy dependency used in our CI/CD security scanning workflow.
+- The compromised PyPI packages were **litellm==1.82.7** and **litellm==1.82.8**. Those packages were live on March 24, 2026 from 10:39 UTC for about 40 minutes before being quarantined by PyPI.
+- We believe that the compromise originated from the [Trivy dependency](https://www.aquasec.com/blog/trivy-supply-chain-attack-what-you-need-to-know/) used in our CI/CD security scanning workflow.
 - Customers running the official LiteLLM Proxy Docker image were not impacted. That deployment path pins dependencies in requirements.txt and does not rely on the compromised PyPI packages.
-- We are pausing new LiteLLM releases until we complete a broader supply-chain review and confirm the release path is safe.
+- ~~We have paused all new LiteLLM releases until we complete a broader supply-chain review and confirm the release path is safe.~~ **Updated:** We have now released a new **safe** version of LiteLLM (v1.83.0) by our new [CI/CD v2](https://docs.litellm.ai/blog/ci-cd-v2-improvements) pipeline which added isolated environments, stronger security gates, and safer release separation for LiteLLM. We have also verified the codebase is safe and no malicious code was pushed to `main`.
 
 
 ## Overview
@@ -703,6 +707,40 @@ The LiteLLM AI Gateway team has already taken the following steps:
 - Rotated maintainer credentials and established new authorized maintainers
 - Engaged Google's Mandiant security team to assist with forensic analysis of the build and publishing chain
 
+
+## Verify Docker image signatures
+
+Starting from `v1.83.0-nightly`, all LiteLLM Docker images published to GHCR are signed with [cosign](https://docs.sigstore.dev/cosign/overview/). Every release is signed with the same key introduced in [commit `0112e53`](https://github.com/BerriAI/litellm/commit/0112e53046018d726492c814b3644b7d376029d0).
+
+**Verify using the pinned commit hash (recommended):**
+
+A commit hash is cryptographically immutable, so this is the strongest way to ensure you are using the original signing key:
+
+```bash
+cosign verify \
+  --key https://raw.githubusercontent.com/BerriAI/litellm/0112e53046018d726492c814b3644b7d376029d0/cosign.pub \
+  ghcr.io/berriai/litellm:<release-tag>
+```
+
+**Verify using a release tag (convenience):**
+
+Tags are protected in this repository and resolve to the same key. This option is easier to read but relies on tag protection rules:
+
+```bash
+cosign verify \
+  --key https://raw.githubusercontent.com/BerriAI/litellm/<release-tag>/cosign.pub \
+  ghcr.io/berriai/litellm:<release-tag>
+```
+
+Replace `<release-tag>` with the version you are deploying (e.g. `v1.83.0-stable`).
+
+Expected output:
+
+```
+The following checks were performed on each of these signatures:
+  - The cosign claims were validated
+  - The signatures were verified against the specified public key
+```
 
 ## Verified safe versions
 
