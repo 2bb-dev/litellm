@@ -229,6 +229,48 @@ def _infer_openclaw_channel(group_channel: Optional[str]) -> Optional[str]:
     return channel
 
 
+def _normalize_openclaw_channel_name(value: Optional[str]) -> Optional[str]:
+    normalized_value = _normalize_openclaw_observability_string(value, max_length=120)
+    if normalized_value is None:
+        return None
+
+    channel = normalized_value.strip().lower()
+    if not channel:
+        return None
+
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-_.")
+    if any(char not in allowed for char in channel):
+        return None
+
+    return channel
+
+
+def _resolve_openclaw_channel(
+    sender_info: Optional[dict], conversation_info: Optional[dict]
+) -> Optional[str]:
+    candidate_values = [
+        (conversation_info or {}).get("group_channel"),
+        (sender_info or {}).get("group_channel"),
+        (conversation_info or {}).get("channel"),
+        (sender_info or {}).get("channel"),
+        (conversation_info or {}).get("provider"),
+        (sender_info or {}).get("provider"),
+        (conversation_info or {}).get("platform"),
+        (sender_info or {}).get("platform"),
+    ]
+
+    for candidate in candidate_values:
+        inferred_channel = _infer_openclaw_channel(candidate)
+        if inferred_channel is not None:
+            return inferred_channel
+
+        normalized_channel = _normalize_openclaw_channel_name(candidate)
+        if normalized_channel is not None:
+            return normalized_channel
+
+    return None
+
+
 def _build_openclaw_observability_metadata(
     data: dict, existing_metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -277,30 +319,37 @@ def _build_openclaw_observability_metadata(
         (conversation_info or {}).get("conversation_label"),
         max_length=160,
     )
-    inferred_channel = _infer_openclaw_channel(group_channel)
-    user_namespace = inferred_channel or OPENCLAW_SESSION_PREFIX
-    raw_user_id = f"{user_namespace}:{sender_id}"
-    trace_user_id = _build_openclaw_bounded_identifier(
-        raw_user_id,
-        prefix=f"{user_namespace}-user",
+    inferred_channel = _resolve_openclaw_channel(
+        sender_info=sender_info, conversation_info=conversation_info
     )
+    trace_user_id: Optional[str] = None
+    raw_session_id: Optional[str] = None
+    openclaw_session_id: Optional[str] = None
+    if inferred_channel is not None:
+        raw_user_id = f"{inferred_channel}:{sender_id}"
+        trace_user_id = _build_openclaw_bounded_identifier(
+            raw_user_id,
+            prefix=f"{inferred_channel}-user",
+        )
 
-    if group_channel and topic_id:
-        raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:{group_channel}:topic:{topic_id}"
-    elif group_channel:
-        raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:{group_channel}"
-    else:
-        raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:dm:{sender_id}"
+        if group_channel and topic_id:
+            raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:{group_channel}:topic:{topic_id}"
+        elif group_channel:
+            raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:{group_channel}"
+        else:
+            raw_session_id = (
+                f"{OPENCLAW_SESSION_PREFIX}:{inferred_channel}:dm:{sender_id}"
+            )
 
-    session_id = _build_openclaw_bounded_identifier(
-        raw_session_id,
-        prefix=f"{OPENCLAW_SESSION_PREFIX}-session",
-    )
+        openclaw_session_id = _build_openclaw_bounded_identifier(
+            raw_session_id,
+            prefix=f"{OPENCLAW_SESSION_PREFIX}-session",
+        )
 
     metadata_updates = {
         "trace_user_id": trace_user_id,
-        "session_id": session_id,
         "openclaw_user_id": trace_user_id,
+        "openclaw_session_id": openclaw_session_id,
         "openclaw_channel": inferred_channel,
         "openclaw_session_id_raw": raw_session_id,
         "openclaw_sender_id": sender_id,
@@ -348,6 +397,7 @@ def _build_openclaw_observability_metadata(
     )
     for key in (
         "openclaw_user_id",
+        "openclaw_session_id",
         "openclaw_channel",
         "openclaw_session_id_raw",
         "openclaw_sender_id",

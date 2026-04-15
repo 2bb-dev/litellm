@@ -270,12 +270,21 @@ Sender (untrusted metadata):
 
     metadata = updated_data.get("metadata", {})
     assert metadata["trace_user_id"] == "telegram:952754559"
-    assert metadata["session_id"] == "openclaw:telegram:-1001234567890:topic:777"
-    assert updated_data["litellm_session_id"] == metadata["session_id"]
+    assert "session_id" not in metadata
+    assert updated_data.get("litellm_session_id") is None
+    assert metadata["openclaw_session_id"] == "openclaw:telegram:-1001234567890:topic:777"
+    assert (
+        metadata["openclaw_session_id_raw"]
+        == "openclaw:telegram:-1001234567890:topic:777"
+    )
     assert metadata["openclaw_sender_username"] == "on_the_r0ad"
     assert metadata["openclaw_sender_label"] == "𝔰𝔞𝔰𝔥𝔦 (952754559)"
     assert metadata["openclaw_conversation_group_channel"] == "telegram:-1001234567890"
     assert metadata["spend_logs_metadata"]["openclaw_sender_id"] == "952754559"
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_session_id"]
+        == "openclaw:telegram:-1001234567890:topic:777"
+    )
 
 
 @pytest.mark.asyncio
@@ -329,6 +338,57 @@ async def test_add_litellm_data_to_request_preserves_explicit_observability_meta
     assert metadata["session_id"] == "manual-session"
     assert updated_data["litellm_session_id"] == "manual-session"
     assert metadata["openclaw_sender_id"] == "952754559"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_sender_only_openclaw_metadata_requires_channel_context():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    inbound_text = """Sender (untrusted metadata):
+```json
+{
+  "label": "sashi (952754559)",
+  "id": "952754559",
+  "username": "on_the_r0ad"
+}
+```
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": inbound_text}],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    assert metadata["openclaw_sender_id"] == "952754559"
+    assert "trace_user_id" not in metadata
+    assert "openclaw_user_id" not in metadata
+    assert "openclaw_session_id" not in metadata
+    assert "openclaw_session_id_raw" not in metadata
+    assert updated_data.get("litellm_session_id") is None
 
 
 @pytest.mark.asyncio
