@@ -507,6 +507,18 @@ def _get_session_id_for_spend_log(
     """
     from litellm._uuid import uuid
 
+    if standard_logging_payload is not None:
+        metadata = standard_logging_payload.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("session_id") is not None:
+            return str(metadata.get("session_id"))
+
+    litellm_metadata = get_litellm_metadata_from_kwargs(kwargs)
+    if litellm_metadata.get("session_id") is not None:
+        return str(litellm_metadata.get("session_id"))
+
+    if kwargs.get("litellm_session_id") is not None:
+        return str(kwargs.get("litellm_session_id"))
+
     if (
         standard_logging_payload is not None
         and standard_logging_payload.get("trace_id") is not None

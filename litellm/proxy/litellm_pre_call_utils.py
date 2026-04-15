@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -75,6 +76,9 @@ LITELLM_METADATA_ROUTES = (
     "responses",
     "files",
 )
+OPENCLAW_CONVERSATION_INFO_LABEL = "Conversation info (untrusted metadata):"
+OPENCLAW_SENDER_INFO_LABEL = "Sender (untrusted metadata):"
+OPENCLAW_SESSION_PREFIX = "openclaw"
 
 
 def _get_metadata_variable_name(request: Request) -> str:
@@ -94,6 +98,256 @@ def _get_metadata_variable_name(request: Request) -> str:
         return "litellm_metadata"
 
     return "metadata"
+
+
+def _normalize_openclaw_observability_string(
+    value: Any, max_length: Optional[int] = None
+) -> Optional[str]:
+    if value is None:
+        return None
+
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+
+    if max_length is not None and max_length > 0 and len(normalized) > max_length:
+        return normalized[:max_length]
+
+    return normalized
+
+
+def _build_openclaw_bounded_identifier(
+    raw_value: str,
+    prefix: str,
+    max_length: int = 200,
+) -> str:
+    if len(raw_value) <= max_length:
+        return raw_value
+
+    digest = hashlib.sha256(raw_value.encode("utf-8")).hexdigest()[:40]
+    return f"{prefix}:{digest}"
+
+
+def _extract_openclaw_json_block(text: str, label: str) -> Optional[dict]:
+    search_start = 0
+    while True:
+        label_index = text.find(label, search_start)
+        if label_index == -1:
+            return None
+
+        remaining = text[label_index + len(label) :].lstrip()
+        if not remaining.startswith("```"):
+            search_start = label_index + len(label)
+            continue
+
+        remaining = remaining[3:]
+        if remaining[:4].lower() == "json":
+            remaining = remaining[4:]
+        remaining = remaining.lstrip()
+
+        block_end = remaining.find("```")
+        if block_end == -1:
+            return None
+
+        parsed = safe_json_loads(remaining[:block_end].strip())
+        if isinstance(parsed, dict):
+            return parsed
+
+        search_start = label_index + len(label)
+
+
+def _iter_openclaw_candidate_texts(
+    value: Any,
+    seen: Optional[set[int]] = None,
+    depth: int = 0,
+):
+    if depth > 8:
+        return
+
+    if seen is None:
+        seen = set()
+
+    if isinstance(value, str):
+        if (
+            OPENCLAW_CONVERSATION_INFO_LABEL in value
+            or OPENCLAW_SENDER_INFO_LABEL in value
+        ):
+            yield value
+        return
+
+    if not isinstance(value, (dict, list)):
+        return
+
+    object_id = id(value)
+    if object_id in seen:
+        return
+    seen.add(object_id)
+
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_openclaw_candidate_texts(
+                item, seen=seen, depth=depth + 1
+            )
+        return
+
+    for item in value.values():
+        yield from _iter_openclaw_candidate_texts(item, seen=seen, depth=depth + 1)
+
+
+def _infer_openclaw_channel(group_channel: Optional[str]) -> Optional[str]:
+    normalized_group_channel = _normalize_openclaw_observability_string(
+        group_channel, max_length=120
+    )
+    if normalized_group_channel is None or ":" not in normalized_group_channel:
+        return None
+
+    channel = normalized_group_channel.split(":", 1)[0].strip().lower()
+    if not channel:
+        return None
+
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-_.")
+    if any(char not in allowed for char in channel):
+        return None
+
+    return channel
+
+
+def _build_openclaw_observability_metadata(
+    data: dict, existing_metadata: Optional[dict]
+) -> Optional[dict]:
+    texts_to_scan = []
+    for key in ("messages", "input", "prompt", "message"):
+        if key in data:
+            texts_to_scan.append(data[key])
+
+    sender_info: Optional[dict] = None
+    conversation_info: Optional[dict] = None
+    for candidate in texts_to_scan:
+        for text in _iter_openclaw_candidate_texts(candidate):
+            if sender_info is None:
+                sender_info = _extract_openclaw_json_block(
+                    text, OPENCLAW_SENDER_INFO_LABEL
+                )
+            if conversation_info is None:
+                conversation_info = _extract_openclaw_json_block(
+                    text, OPENCLAW_CONVERSATION_INFO_LABEL
+                )
+            if sender_info is not None and conversation_info is not None:
+                break
+        if sender_info is not None and conversation_info is not None:
+            break
+
+    if sender_info is None and conversation_info is None:
+        return None
+
+    sender_id = _normalize_openclaw_observability_string(
+        (sender_info or {}).get("id")
+        or (conversation_info or {}).get("sender_id"),
+        max_length=120,
+    )
+    if sender_id is None:
+        return None
+
+    group_channel = _normalize_openclaw_observability_string(
+        (conversation_info or {}).get("group_channel"),
+        max_length=160,
+    )
+    topic_id = _normalize_openclaw_observability_string(
+        (conversation_info or {}).get("topic_id"),
+        max_length=120,
+    )
+    conversation_label = _normalize_openclaw_observability_string(
+        (conversation_info or {}).get("conversation_label"),
+        max_length=160,
+    )
+    inferred_channel = _infer_openclaw_channel(group_channel)
+    user_namespace = inferred_channel or OPENCLAW_SESSION_PREFIX
+    raw_user_id = f"{user_namespace}:{sender_id}"
+    trace_user_id = _build_openclaw_bounded_identifier(
+        raw_user_id,
+        prefix=f"{user_namespace}-user",
+    )
+
+    if group_channel and topic_id:
+        raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:{group_channel}:topic:{topic_id}"
+    elif group_channel:
+        raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:{group_channel}"
+    else:
+        raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:dm:{sender_id}"
+
+    session_id = _build_openclaw_bounded_identifier(
+        raw_session_id,
+        prefix=f"{OPENCLAW_SESSION_PREFIX}-session",
+    )
+
+    metadata_updates = {
+        "trace_user_id": trace_user_id,
+        "session_id": session_id,
+        "openclaw_user_id": trace_user_id,
+        "openclaw_channel": inferred_channel,
+        "openclaw_session_id_raw": raw_session_id,
+        "openclaw_sender_id": sender_id,
+        "openclaw_sender_name": _normalize_openclaw_observability_string(
+            (sender_info or {}).get("name"),
+            max_length=160,
+        ),
+        "openclaw_sender_username": _normalize_openclaw_observability_string(
+            (sender_info or {}).get("username"),
+            max_length=160,
+        ),
+        "openclaw_sender_label": _normalize_openclaw_observability_string(
+            (sender_info or {}).get("label"),
+            max_length=200,
+        ),
+        "openclaw_conversation_label": conversation_label,
+        "openclaw_conversation_message_id": _normalize_openclaw_observability_string(
+            (conversation_info or {}).get("message_id"),
+            max_length=160,
+        ),
+        "openclaw_conversation_reply_to_id": _normalize_openclaw_observability_string(
+            (conversation_info or {}).get("reply_to_id"),
+            max_length=160,
+        ),
+        "openclaw_conversation_group_channel": group_channel,
+        "openclaw_conversation_topic_id": topic_id,
+    }
+
+    resolved_metadata: dict = {}
+    existing_metadata = (
+        existing_metadata if isinstance(existing_metadata, dict) else {}
+    )
+    for key, value in metadata_updates.items():
+        if value is None:
+            continue
+        if key in {"trace_user_id", "session_id"} and existing_metadata.get(key):
+            continue
+        resolved_metadata[key] = value
+
+    spend_logs_metadata = existing_metadata.get("spend_logs_metadata")
+    merged_spend_logs_metadata = (
+        copy.deepcopy(spend_logs_metadata)
+        if isinstance(spend_logs_metadata, dict)
+        else {}
+    )
+    for key in (
+        "openclaw_user_id",
+        "openclaw_channel",
+        "openclaw_session_id_raw",
+        "openclaw_sender_id",
+        "openclaw_sender_username",
+        "openclaw_sender_label",
+        "openclaw_conversation_group_channel",
+        "openclaw_conversation_topic_id",
+    ):
+        value = resolved_metadata.get(key) or metadata_updates.get(key)
+        if value is None or key in merged_spend_logs_metadata:
+            continue
+        merged_spend_logs_metadata[key] = value
+
+    if merged_spend_logs_metadata:
+        resolved_metadata["spend_logs_metadata"] = merged_spend_logs_metadata
+
+    return resolved_metadata or None
 
 
 def get_chain_id_from_headers(headers: Optional[Dict[str, str]]) -> Optional[str]:
@@ -1052,6 +1306,21 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
             for key, value in data["litellm_metadata"].items():
                 if key not in data[_metadata_variable_name]:
                     data[_metadata_variable_name][key] = value
+
+    openclaw_observability_metadata = _build_openclaw_observability_metadata(
+        data=data,
+        existing_metadata=data.get(_metadata_variable_name),
+    )
+    if openclaw_observability_metadata is not None:
+        data[_metadata_variable_name].update(openclaw_observability_metadata)
+        if data.get("litellm_session_id") is None:
+            resolved_session_id = (
+                data[_metadata_variable_name].get("session_id")
+                if isinstance(data[_metadata_variable_name], dict)
+                else None
+            )
+            if resolved_session_id is not None:
+                data["litellm_session_id"] = resolved_session_id
 
     data = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
         data=data,
