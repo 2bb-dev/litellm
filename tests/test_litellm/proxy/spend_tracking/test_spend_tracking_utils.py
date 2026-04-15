@@ -23,6 +23,7 @@ from litellm.constants import (
 )
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy.spend_tracking.spend_tracking_utils import (
+    _get_session_id_for_spend_log,
     _get_messages_for_spend_logs_payload,
     _get_proxy_server_request_for_spend_logs_payload,
     _get_request_duration_ms,
@@ -40,6 +41,48 @@ from litellm.types.utils import (
     StandardLoggingModelInformation,
     StandardLoggingPayload,
 )
+
+
+def test_get_session_id_for_spend_log_prefers_metadata_session_id():
+    standard_logging_payload = cast(
+        StandardLoggingPayload,
+        {
+            "metadata": {"session_id": "openclaw:telegram:-1001234567890:topic:777"},
+            "trace_id": "trace-123",
+        },
+    )
+
+    session_id = _get_session_id_for_spend_log(
+        kwargs={},
+        standard_logging_payload=standard_logging_payload,
+    )
+
+    assert session_id == "openclaw:telegram:-1001234567890:topic:777"
+
+
+def test_get_session_id_for_spend_log_prefers_kwargs_metadata_session_id():
+    session_id = _get_session_id_for_spend_log(
+        kwargs={
+            "metadata": {"session_id": "metadata-session"},
+            "litellm_session_id": "litellm-session",
+            "litellm_trace_id": "trace-456",
+        },
+        standard_logging_payload=None,
+    )
+
+    assert session_id == "metadata-session"
+
+
+def test_get_session_id_for_spend_log_prefers_litellm_session_id_over_trace_id():
+    session_id = _get_session_id_for_spend_log(
+        kwargs={
+            "litellm_session_id": "litellm-session",
+            "litellm_trace_id": "trace-456",
+        },
+        standard_logging_payload=None,
+    )
+
+    assert session_id == "litellm-session"
 
 
 def test_sanitize_request_body_for_spend_logs_payload_basic():
