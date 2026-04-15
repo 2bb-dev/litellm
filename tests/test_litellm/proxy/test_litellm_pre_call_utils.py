@@ -210,6 +210,130 @@ async def test_add_litellm_data_to_request_parses_string_metadata():
 
 
 @pytest.mark.asyncio
+async def test_add_litellm_data_to_request_extracts_openclaw_observability_metadata():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    inbound_text = """Conversation info (untrusted metadata):
+```json
+{
+  "message_id": "msg-123",
+  "sender_id": "952754559",
+  "group_channel": "telegram:-1001234567890",
+  "topic_id": "777",
+  "conversation_label": "OpenClaw Chat"
+}
+```
+
+Sender (untrusted metadata):
+```json
+{
+  "label": "sashi (952754559)",
+  "id": "952754559",
+  "name": "sashi",
+  "username": "on_the_r0ad"
+}
+```
+
+what can you do?
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": inbound_text}],
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    assert metadata["trace_user_id"] == "telegram:952754559"
+    assert metadata["session_id"] == "openclaw:telegram:-1001234567890:topic:777"
+    assert updated_data["litellm_session_id"] == metadata["session_id"]
+    assert metadata["openclaw_sender_username"] == "on_the_r0ad"
+    assert metadata["openclaw_sender_label"] == "sashi (952754559)"
+    assert metadata["openclaw_conversation_group_channel"] == "telegram:-1001234567890"
+    assert metadata["spend_logs_metadata"]["openclaw_sender_id"] == "952754559"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_preserves_explicit_observability_metadata():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    inbound_text = """Sender (untrusted metadata):
+```json
+{
+  "label": "sashi (952754559)",
+  "id": "952754559",
+  "username": "on_the_r0ad"
+}
+```
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "metadata": {
+            "trace_user_id": "manual-user",
+            "session_id": "manual-session",
+        },
+        "messages": [{"role": "user", "content": inbound_text}],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    assert metadata["trace_user_id"] == "manual-user"
+    assert metadata["session_id"] == "manual-session"
+    assert updated_data["litellm_session_id"] == "manual-session"
+    assert metadata["openclaw_sender_id"] == "952754559"
+
+
+@pytest.mark.asyncio
 async def test_add_litellm_data_to_request_strips_admin_injection_slots():
     """User-supplied user_api_key_metadata / user_api_key_team_metadata /
     _pipeline_managed_guardrails must be stripped from both metadata keys
