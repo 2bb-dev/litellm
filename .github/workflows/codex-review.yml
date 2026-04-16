@@ -2,6 +2,12 @@ name: Codex Review Bot
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to review
+        required: true
+        type: number
 
 jobs:
   review:
@@ -15,10 +21,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get PR diff
+      - name: Get PR info
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git fetch origin ${{ github.base_ref }}
-          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+          PR_NUMBER=${{ github.event.pull_request.number || inputs.pr_number }}
+          BASE=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json baseRefName --jq '.baseRefName')
+          HEAD=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json headRefName --jq '.headRefName')
+          echo "number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "base=$BASE" >> $GITHUB_OUTPUT
+          echo "head=$HEAD" >> $GITHUB_OUTPUT
+
+      - name: Get PR diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff ${{ steps.pr.outputs.number }} --repo ${{ github.repository }} > /tmp/pr.diff
           echo "Diff size: $(wc -l < /tmp/pr.diff) lines"
 
       - name: Run Codex review via LiteLLM
@@ -76,8 +95,6 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `### Codex Review
-
-${review}`
+              issue_number: context.issue.number || ${{ steps.pr.outputs.number }},
+              body: `### Codex Review\n\n${review}`
             });
