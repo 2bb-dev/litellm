@@ -1,7 +1,7 @@
 name: Codex Review Bot
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -9,9 +9,14 @@ on:
         required: true
         type: number
 
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     permissions:
       pull-requests: write
 
@@ -37,15 +42,30 @@ jobs:
         env:
           LITELLM_KEY: ${{ secrets.LITELLM_KEY }}
           LITELLM_URL: ${{ secrets.LITELLM_BASE_URL }}
+          PRIMARY_MODEL: openai/gpt-5.3-codex
+          FALLBACK_MODEL: openai/gpt-4o
+          MAX_DIFF_CHARS: "8000"
+          REQUEST_TIMEOUT: "120"
         run: |
           cat > /tmp/review.py << 'PYEOF'
-          import os, json, sys
+          import os, json, sys, time, random
           from urllib.request import urlopen, Request
+          from urllib.error import HTTPError, URLError
+
+          MAX_DIFF_CHARS = int(os.environ.get("MAX_DIFF_CHARS", "8000"))
+          REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "120"))
+          PRIMARY_MODEL = os.environ["PRIMARY_MODEL"]
+          FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "")
 
           diff = open("/tmp/pr.diff").read()
           if not diff.strip():
               open("/tmp/review.md", "w").write("No changes to review.")
               sys.exit(0)
+
+          truncated_note = ""
+          if len(diff) > MAX_DIFF_CHARS:
+              truncated_note = f"\n\n_(diff truncated to {MAX_DIFF_CHARS} of {len(diff)} chars)_"
+              diff = diff[:MAX_DIFF_CHARS]
 
           prompt = (
               "You are a code reviewer. Review the following PR diff and provide structured feedback.\n\n"
@@ -55,26 +75,68 @@ jobs:
               "3. **Suggestions** - specific improvements\n"
               "4. **Verdict** - APPROVE / REQUEST_CHANGES / COMMENT\n\n"
               "## PR Diff\n\n"
-              + diff[:12000]
+              + diff
           )
 
-          payload = json.dumps({
-              "model": "openai/gpt-5.3-codex",
-              "messages": [{"role": "user", "content": prompt}],
-              "max_tokens": 2000
-          }).encode()
+          def call_model(model, max_attempts=3):
+              payload = json.dumps({
+                  "model": model,
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 2000
+              }).encode()
+              last_err = None
+              for attempt in range(1, max_attempts + 1):
+                  req = Request(
+                      os.environ["LITELLM_URL"] + "/chat/completions",
+                      data=payload,
+                      headers={
+                          "Authorization": "Bearer " + os.environ["LITELLM_KEY"],
+                          "Content-Type": "application/json",
+                      },
+                  )
+                  try:
+                      with urlopen(req, timeout=REQUEST_TIMEOUT) as r:
+                          return json.loads(r.read())
+                  except HTTPError as e:
+                      last_err = e
+                      body = ""
+                      try:
+                          body = e.read().decode("utf-8", "replace")[:500]
+                      except Exception:
+                          pass
+                      print(f"[{model}] attempt {attempt}/{max_attempts} -> HTTP {e.code} {body}", file=sys.stderr)
+                      if e.code == 429 and attempt < max_attempts:
+                          sleep_s = random.randint(30, 60) * attempt
+                          print(f"[{model}] rate limited, sleeping {sleep_s}s", file=sys.stderr)
+                          time.sleep(sleep_s)
+                          continue
+                      if 500 <= e.code < 600 and attempt < max_attempts:
+                          time.sleep(5 * attempt)
+                          continue
+                      break
+                  except URLError as e:
+                      last_err = e
+                      print(f"[{model}] attempt {attempt}/{max_attempts} -> {e}", file=sys.stderr)
+                      if attempt < max_attempts:
+                          time.sleep(5 * attempt)
+                          continue
+                      break
+              raise last_err if last_err else RuntimeError("unknown failure")
 
-          req = Request(
-              os.environ["LITELLM_URL"] + "/chat/completions",
-              data=payload,
-              headers={
-                  "Authorization": "Bearer " + os.environ["LITELLM_KEY"],
-                  "Content-Type": "application/json"
-              }
-          )
-          resp = json.loads(urlopen(req).read())
+          try:
+              resp = call_model(PRIMARY_MODEL)
+              used_model = PRIMARY_MODEL
+          except HTTPError as e:
+              if e.code == 429 and FALLBACK_MODEL:
+                  print(f"primary {PRIMARY_MODEL} still rate limited, falling back to {FALLBACK_MODEL}", file=sys.stderr)
+                  resp = call_model(FALLBACK_MODEL, max_attempts=2)
+                  used_model = FALLBACK_MODEL
+              else:
+                  raise
+
           review = resp["choices"][0]["message"]["content"]
-          open("/tmp/review.md", "w").write(review)
+          footer = f"\n\n---\n_Reviewed by `{used_model}`._"
+          open("/tmp/review.md", "w").write(review + truncated_note + footer)
           PYEOF
           python3 /tmp/review.py
 
