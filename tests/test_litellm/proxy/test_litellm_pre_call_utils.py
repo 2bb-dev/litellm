@@ -18,6 +18,7 @@ from litellm.proxy.litellm_pre_call_utils import (
     _get_dynamic_logging_metadata,
     _get_enforced_params,
     _get_metadata_variable_name,
+    _infer_openclaw_channel,
     _resolve_credential_from_model_config,
     _update_model_if_key_alias_exists,
     add_guardrails_from_policy_engine,
@@ -389,6 +390,188 @@ async def test_add_litellm_data_to_request_sender_only_openclaw_metadata_require
     assert "openclaw_session_id" not in metadata
     assert "openclaw_session_id_raw" not in metadata
     assert updated_data.get("litellm_session_id") is None
+
+
+def test_infer_openclaw_channel_mattermost_group_channel():
+    # Mattermost direct-message / group channel id shape: "#<hash>__<hash>"
+    value = "#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+    assert _infer_openclaw_channel(value) == "mattermost"
+
+
+def test_infer_openclaw_channel_still_infers_telegram():
+    # Regression: Telegram ":"-delimited channel keeps working.
+    assert _infer_openclaw_channel("telegram:-1001234567890") == "telegram"
+
+
+def test_infer_openclaw_channel_rejects_bare_hash():
+    # "#abc" without "__" is NOT Mattermost - return None.
+    assert _infer_openclaw_channel("#abc") is None
+    # "#__" has empty halves around the separator - also rejected.
+    assert _infer_openclaw_channel("#__") is None
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_extracts_openclaw_observability_metadata_mattermost_messages():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    inbound_text = """Conversation info (untrusted metadata):
+```json
+{
+  "message_id": "irp4e1f7kpgg7ebp15f84zpwxa",
+  "sender_id": "pwanex3ne3fx58nr5oaxg4j54w",
+  "sender": "@ziabinartem",
+  "timestamp": "Thu 2026-04-16 15:02 UTC",
+  "group_channel": "#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+}
+```
+
+Sender (untrusted metadata):
+```json
+{
+  "label": "@ziabinartem (pwanex3ne3fx58nr5oaxg4j54w)",
+  "id": "pwanex3ne3fx58nr5oaxg4j54w",
+  "name": "@ziabinartem"
+}
+```
+
+hello
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": inbound_text}],
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    assert metadata["openclaw_channel"] == "mattermost"
+    assert metadata["trace_user_id"] == "mattermost:pwanex3ne3fx58nr5oaxg4j54w"
+    assert metadata["openclaw_user_id"] == "mattermost:pwanex3ne3fx58nr5oaxg4j54w"
+    assert (
+        metadata["session_id"]
+        == "openclaw:#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+    )
+    assert (
+        metadata["openclaw_session_id"]
+        == "openclaw:#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+    )
+    assert (
+        metadata["openclaw_session_id_raw"]
+        == "openclaw:#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+    )
+    assert metadata["openclaw_sender_id"] == "pwanex3ne3fx58nr5oaxg4j54w"
+    assert metadata["openclaw_sender_name"] == "@ziabinartem"
+    assert (
+        metadata["openclaw_sender_label"]
+        == "@ziabinartem (pwanex3ne3fx58nr5oaxg4j54w)"
+    )
+    assert (
+        metadata["openclaw_conversation_group_channel"]
+        == "#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+    )
+    assert (
+        updated_data["litellm_session_id"]
+        == "openclaw:#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+    )
+    spend_meta = metadata["spend_logs_metadata"]
+    assert spend_meta["openclaw_channel"] == "mattermost"
+    assert spend_meta["openclaw_sender_id"] == "pwanex3ne3fx58nr5oaxg4j54w"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_extracts_openclaw_observability_metadata_mattermost_input():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/responses"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    inbound_text = """Conversation info (untrusted metadata):
+```json
+{
+  "message_id": "irp4e1f7kpgg7ebp15f84zpwxa",
+  "sender_id": "pwanex3ne3fx58nr5oaxg4j54w",
+  "group_channel": "#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+}
+```
+
+Sender (untrusted metadata):
+```json
+{
+  "label": "@ziabinartem (pwanex3ne3fx58nr5oaxg4j54w)",
+  "id": "pwanex3ne3fx58nr5oaxg4j54w",
+  "name": "@ziabinartem"
+}
+```
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": inbound_text}],
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    # /responses routes metadata to "litellm_metadata" (per _get_metadata_variable_name)
+    metadata = updated_data.get("litellm_metadata") or updated_data.get(
+        "metadata", {}
+    )
+    assert metadata["openclaw_channel"] == "mattermost"
+    assert metadata["trace_user_id"] == "mattermost:pwanex3ne3fx58nr5oaxg4j54w"
+    assert (
+        metadata["session_id"]
+        == "openclaw:#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+    )
+    assert metadata["openclaw_sender_name"] == "@ziabinartem"
 
 
 @pytest.mark.asyncio
