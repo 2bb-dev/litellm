@@ -513,6 +513,10 @@ def _get_session_id_for_spend_log(
         if isinstance(metadata, dict) and metadata.get("session_id") is not None:
             return str(metadata.get("session_id"))
 
+    metadata = kwargs.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("session_id") is not None:
+        return str(metadata.get("session_id"))
+
     litellm_metadata = get_litellm_metadata_from_kwargs(kwargs)
     if litellm_metadata.get("session_id") is not None:
         return str(litellm_metadata.get("session_id"))

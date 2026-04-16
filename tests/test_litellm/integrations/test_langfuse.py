@@ -616,6 +616,50 @@ class TestLangfuseUsageDetails(unittest.TestCase):
         # status_message should be set for error traces
         assert self.last_trace_kwargs.get("status_message") is not None
 
+    def test_log_langfuse_v2_trace_user_id_mapped_to_langfuse_user_id(self):
+        """
+        Test that metadata.trace_user_id maps to Langfuse trace user_id while
+        session_id remains available for trace grouping.
+        """
+        payload = self._build_standard_logging_payload(trace_id="std-trace-openclaw")
+        kwargs = self._build_langfuse_kwargs(payload)
+        self.last_trace_kwargs = {}
+
+        with patch(
+            "litellm.integrations.langfuse.langfuse._add_prompt_to_generation_params",
+            side_effect=lambda generation_params, **kwargs: generation_params,
+            create=True,
+        ):
+            self.logger._log_langfuse_v2(
+                user_id="fallback-user",
+                metadata={
+                    "trace_user_id": "telegram:952754559",
+                    "session_id": "openclaw:telegram:-1001234567890:topic:777",
+                },
+                litellm_params={
+                    "metadata": {
+                        "trace_user_id": "telegram:952754559",
+                        "session_id": "openclaw:telegram:-1001234567890:topic:777",
+                    }
+                },
+                output=None,
+                start_time=datetime.datetime.utcnow(),
+                end_time=datetime.datetime.utcnow(),
+                kwargs=kwargs,
+                optional_params={},
+                input=None,
+                response_obj=None,
+                level="INFO",
+                litellm_call_id="call-id-openclaw",
+            )
+
+        assert self.last_trace_kwargs.get("user_id") == "telegram:952754559"
+        assert (
+            self.last_trace_kwargs.get("session_id")
+            == "openclaw:telegram:-1001234567890:topic:777"
+        )
+        assert self.last_trace_kwargs.get("id") == "std-trace-openclaw"
+
     def test_log_langfuse_v2_explicit_trace_id_takes_priority_over_session_id(self):
         """
         Test that when both trace_id and session_id are provided in metadata,
