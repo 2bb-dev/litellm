@@ -249,20 +249,30 @@ def _iter_openclaw_candidate_texts(
 
 def _infer_openclaw_channel(group_channel: Optional[str]) -> Optional[str]:
     normalized_group_channel = _normalize_openclaw_observability_string(
-        group_channel, max_length=120
+        group_channel, max_length=160
     )
-    if normalized_group_channel is None or ":" not in normalized_group_channel:
+    if normalized_group_channel is None:
         return None
 
-    channel = normalized_group_channel.split(":", 1)[0].strip().lower()
-    if not channel:
-        return None
+    if ":" in normalized_group_channel:
+        channel = normalized_group_channel.split(":", 1)[0].strip().lower()
+        if not channel:
+            return None
 
-    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-_.")
-    if any(char not in allowed for char in channel):
-        return None
+        allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-_.")
+        if any(char not in allowed for char in channel):
+            return None
 
-    return channel
+        return channel
+
+    # Mattermost shapes its DM/group channel ids as "#<hash>__<hash>"
+    # (channel id starts with '#', two user ids joined by '__').
+    if normalized_group_channel.startswith("#") and "__" in normalized_group_channel:
+        head, _sep, tail = normalized_group_channel[1:].partition("__")
+        if head and tail:
+            return "mattermost"
+
+    return None
 
 
 def _normalize_openclaw_channel_name(value: Optional[str]) -> Optional[str]:
