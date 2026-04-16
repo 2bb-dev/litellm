@@ -270,8 +270,8 @@ Sender (untrusted metadata):
 
     metadata = updated_data.get("metadata", {})
     assert metadata["trace_user_id"] == "telegram:952754559"
-    assert "session_id" not in metadata
-    assert updated_data.get("litellm_session_id") is None
+    assert metadata["session_id"] == "openclaw:telegram:-1001234567890:topic:777"
+    assert updated_data["litellm_session_id"] == "openclaw:telegram:-1001234567890:topic:777"
     assert metadata["openclaw_session_id"] == "openclaw:telegram:-1001234567890:topic:777"
     assert (
         metadata["openclaw_session_id_raw"]

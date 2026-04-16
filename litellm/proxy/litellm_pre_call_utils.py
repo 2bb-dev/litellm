@@ -348,6 +348,7 @@ def _build_openclaw_observability_metadata(
 
     metadata_updates = {
         "trace_user_id": trace_user_id,
+        "session_id": openclaw_session_id,
         "openclaw_user_id": trace_user_id,
         "openclaw_session_id": openclaw_session_id,
         "openclaw_channel": inferred_channel,
