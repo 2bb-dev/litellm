@@ -4815,6 +4815,12 @@ class StandardLoggingPayloadSetup:
             user_api_key_auth_metadata=None,
             team_alias=None,
             team_id=None,
+            session_id=None,
+            trace_user_id=None,
+            openclaw_user_id=None,
+            openclaw_session_id=None,
+            openclaw_channel=None,
+            traffic_type=None,
         )
         if isinstance(metadata, dict):
             for key in metadata.keys() & _STANDARD_LOGGING_METADATA_KEYS:
@@ -5656,6 +5662,12 @@ def get_standard_logging_metadata(
         user_api_key_auth_metadata=None,
         team_alias=None,
         team_id=None,
+        session_id=None,
+        trace_user_id=None,
+        openclaw_user_id=None,
+        openclaw_session_id=None,
+        openclaw_channel=None,
+        traffic_type=None,
     )
     if isinstance(metadata, dict):
         # Update the clean_metadata with values from input metadata that match StandardLoggingMetadata fields

@@ -702,6 +702,177 @@ class TestLangfuseUsageDetails(unittest.TestCase):
         # session_id must still be set for session grouping
         assert self.last_trace_kwargs.get("session_id") == "session-999"
 
+    def test_log_langfuse_v2_user_id_falls_back_to_openclaw_user_id(self):
+        """
+        When standard_logging_object metadata has no trace_user_id or
+        user_api_key_end_user_id but has openclaw_user_id, Langfuse must use it
+        as the trace user_id. Guards against API-key-only user identity.
+        """
+        payload = self._build_standard_logging_payload(trace_id="std-trace-oc")
+        payload["metadata"]["openclaw_user_id"] = "telegram:424242"
+        kwargs = self._build_langfuse_kwargs(payload)
+        self.last_trace_kwargs = {}
+
+        with patch(
+            "litellm.integrations.langfuse.langfuse._add_prompt_to_generation_params",
+            side_effect=lambda generation_params, **kwargs: generation_params,
+            create=True,
+        ):
+            self.logger._log_langfuse_v2(
+                user_id=None,
+                metadata={},
+                litellm_params={"metadata": {}},
+                output=None,
+                start_time=datetime.datetime.utcnow(),
+                end_time=datetime.datetime.utcnow(),
+                kwargs=kwargs,
+                optional_params={},
+                input=None,
+                response_obj=None,
+                level="DEFAULT",
+                litellm_call_id="call-oc-1",
+            )
+
+        assert self.last_trace_kwargs.get("user_id") == "telegram:424242"
+
+    def test_log_langfuse_v2_session_id_falls_back_to_openclaw_session_id(self):
+        """When no session_id is set but openclaw_session_id is, use it."""
+        payload = self._build_standard_logging_payload(trace_id="std-trace-oc-2")
+        kwargs = self._build_langfuse_kwargs(payload)
+        self.last_trace_kwargs = {}
+
+        with patch(
+            "litellm.integrations.langfuse.langfuse._add_prompt_to_generation_params",
+            side_effect=lambda generation_params, **kwargs: generation_params,
+            create=True,
+        ):
+            self.logger._log_langfuse_v2(
+                user_id=None,
+                metadata={
+                    "openclaw_session_id": "openclaw:tg:-100999:topic:1",
+                },
+                litellm_params={
+                    "metadata": {
+                        "openclaw_session_id": "openclaw:tg:-100999:topic:1",
+                    }
+                },
+                output=None,
+                start_time=datetime.datetime.utcnow(),
+                end_time=datetime.datetime.utcnow(),
+                kwargs=kwargs,
+                optional_params={},
+                input=None,
+                response_obj=None,
+                level="DEFAULT",
+                litellm_call_id="call-oc-2",
+            )
+
+        assert self.last_trace_kwargs.get("session_id") == "openclaw:tg:-100999:topic:1"
+
+    def test_log_langfuse_v2_existing_trace_id_sets_user_id(self):
+        """
+        Regression: the existing_trace_id branch previously skipped user_id
+        entirely, so continuing traces lost chat-session identity. Verify the
+        resolved end_user_id is now carried onto the trace.
+        """
+        payload = self._build_standard_logging_payload(trace_id="does-not-matter")
+        payload["metadata"]["openclaw_user_id"] = "telegram:99"
+        kwargs = self._build_langfuse_kwargs(payload)
+        self.last_trace_kwargs = {}
+
+        with patch(
+            "litellm.integrations.langfuse.langfuse._add_prompt_to_generation_params",
+            side_effect=lambda generation_params, **kwargs: generation_params,
+            create=True,
+        ):
+            self.logger._log_langfuse_v2(
+                user_id=None,
+                metadata={"existing_trace_id": "resumed-trace-123"},
+                litellm_params={"metadata": {"existing_trace_id": "resumed-trace-123"}},
+                output=None,
+                start_time=datetime.datetime.utcnow(),
+                end_time=datetime.datetime.utcnow(),
+                kwargs=kwargs,
+                optional_params={},
+                input=None,
+                response_obj=None,
+                level="DEFAULT",
+                litellm_call_id="call-oc-3",
+            )
+
+        assert self.last_trace_kwargs.get("id") == "resumed-trace-123"
+        assert self.last_trace_kwargs.get("user_id") == "telegram:99"
+
+    def test_log_langfuse_v2_spend_logs_metadata_promotes_openclaw_tags(self):
+        """
+        OpenClaw pre_call nests openclaw_channel inside spend_logs_metadata.
+        Verify the Langfuse callback flattens it and emits a `channel:*` tag.
+        """
+        payload = self._build_standard_logging_payload(trace_id="std-trace-oc-4")
+        kwargs = self._build_langfuse_kwargs(payload)
+        self.last_trace_kwargs = {}
+
+        nested_metadata = {
+            "spend_logs_metadata": {
+                "openclaw_channel": "telegram",
+                "openclaw_sender_username": "alice",
+            },
+            "traffic_type": "user",
+        }
+
+        with patch(
+            "litellm.integrations.langfuse.langfuse._add_prompt_to_generation_params",
+            side_effect=lambda generation_params, **kwargs: generation_params,
+            create=True,
+        ):
+            self.logger._log_langfuse_v2(
+                user_id=None,
+                metadata=nested_metadata,
+                litellm_params={"metadata": nested_metadata},
+                output=None,
+                start_time=datetime.datetime.utcnow(),
+                end_time=datetime.datetime.utcnow(),
+                kwargs=kwargs,
+                optional_params={},
+                input=None,
+                response_obj=None,
+                level="DEFAULT",
+                litellm_call_id="call-oc-4",
+            )
+
+        tags = self.last_trace_kwargs.get("tags") or []
+        assert "channel:telegram" in tags
+        assert "traffic_type:user" in tags
+
+    def test_get_responses_api_content_empty_output_falls_back_to_model_dump(self):
+        """
+        Streamed Responses API reassembly can leave .output == []. Verify
+        _get_responses_api_content_for_langfuse returns the model_dump so
+        Langfuse has something to render instead of None.
+        """
+        fake_response = MagicMock()
+        fake_response.output = []
+        fake_response.model_dump.return_value = {
+            "id": "resp_1",
+            "status": "completed",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+
+        result = LangFuseLogger._get_responses_api_content_for_langfuse(fake_response)
+
+        assert isinstance(result, dict)
+        assert result["id"] == "resp_1"
+        assert result["status"] == "completed"
+
+    def test_get_responses_api_content_returns_output_when_present(self):
+        """When .output is populated, return it unchanged."""
+        fake_response = MagicMock()
+        fake_response.output = [{"type": "message", "content": "hi"}]
+
+        result = LangFuseLogger._get_responses_api_content_for_langfuse(fake_response)
+
+        assert result == [{"type": "message", "content": "hi"}]
+
 
 def test_failure_handler_langfuse_kwargs_excludes_original_response():
     """
