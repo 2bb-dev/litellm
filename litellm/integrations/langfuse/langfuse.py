@@ -608,7 +608,11 @@ class LangFuseLogger:
             _spend_logs_md = clean_metadata.get("spend_logs_metadata")
             if isinstance(_spend_logs_md, dict):
                 for _k, _v in _spend_logs_md.items():
-                    if _k.startswith("openclaw_") and _k not in clean_metadata:
+                    if (
+                        isinstance(_k, str)
+                        and _k.startswith("openclaw_")
+                        and _k not in clean_metadata
+                    ):
                         clean_metadata[_k] = _v
             for _tag_key, _tag_label in (
                 ("openclaw_channel", "channel"),
