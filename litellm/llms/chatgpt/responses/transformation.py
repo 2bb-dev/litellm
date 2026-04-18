@@ -77,9 +77,9 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         existing_instructions = request.get("instructions")
         if existing_instructions:
             if base_instructions not in existing_instructions:
-                request[
-                    "instructions"
-                ] = f"{base_instructions}\n\n{existing_instructions}"
+                request["instructions"] = (
+                    f"{base_instructions}\n\n{existing_instructions}"
+                )
         else:
             request["instructions"] = base_instructions
         request["store"] = False
@@ -134,6 +134,14 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
 
         completed_response = None
         error_message = None
+        # Accumulate output items from SSE events. ChatGPT subscription sometimes
+        # ships `response.completed` with an empty `output` even when the assistant
+        # text was delivered via `response.output_item.done` / `output_text.delta`.
+        # Mirrors the accumulator in
+        # litellm/proxy/response_polling/background_streaming.py.
+        output_items: dict = {}
+        output_item_order: list = []
+        accumulated_text: dict = {}
         for chunk in body_text.splitlines():
             stripped_chunk = CustomStreamWrapper._strip_sse_data_from_chunk(chunk)
             if not stripped_chunk:
@@ -150,7 +158,61 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             if not isinstance(parsed_chunk, dict):
                 continue
             event_type = parsed_chunk.get("type")
-            if event_type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
+            if event_type == "response.output_item.added":
+                item = parsed_chunk.get("item") or {}
+                item_id = item.get("id")
+                if item_id:
+                    if item_id not in output_items:
+                        output_item_order.append(item_id)
+                    output_items[item_id] = dict(item)
+            elif event_type == "response.content_part.added":
+                item_id = parsed_chunk.get("item_id")
+                part = parsed_chunk.get("part") or {}
+                content_index = parsed_chunk.get("content_index", 0)
+                if item_id and item_id in output_items:
+                    content_list = output_items[item_id].setdefault("content", [])
+                    while len(content_list) <= content_index:
+                        content_list.append({})
+                    content_list[content_index] = dict(part)
+            elif event_type == "response.output_text.delta":
+                item_id = parsed_chunk.get("item_id")
+                content_index = parsed_chunk.get("content_index", 0)
+                delta = parsed_chunk.get("delta", "")
+                if item_id:
+                    key = (item_id, content_index)
+                    accumulated_text[key] = accumulated_text.get(key, "") + delta
+                    if item_id not in output_items:
+                        output_items[item_id] = {
+                            "id": item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                        }
+                        output_item_order.append(item_id)
+                    content_list = output_items[item_id].setdefault("content", [])
+                    while len(content_list) <= content_index:
+                        content_list.append({"type": "output_text", "text": ""})
+                    part = content_list[content_index]
+                    if isinstance(part, dict):
+                        part.setdefault("type", "output_text")
+                        part["text"] = accumulated_text[key]
+            elif event_type == "response.content_part.done":
+                item_id = parsed_chunk.get("item_id")
+                part = parsed_chunk.get("part") or {}
+                content_index = parsed_chunk.get("content_index", 0)
+                if item_id and item_id in output_items:
+                    content_list = output_items[item_id].setdefault("content", [])
+                    while len(content_list) <= content_index:
+                        content_list.append({})
+                    content_list[content_index] = dict(part)
+            elif event_type == "response.output_item.done":
+                item = parsed_chunk.get("item") or {}
+                item_id = item.get("id")
+                if item_id:
+                    if item_id not in output_items:
+                        output_item_order.append(item_id)
+                    output_items[item_id] = dict(item)
+            elif event_type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
                 response_payload = parsed_chunk.get("response")
                 if isinstance(response_payload, dict):
                     response_payload = dict(response_payload)
@@ -158,6 +220,13 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                         response_payload["created_at"] = _safe_convert_created_field(
                             response_payload["created_at"]
                         )
+                    # Fill empty `output` from accumulated SSE items. Never
+                    # overwrite a populated `output` — the terminal event wins.
+                    existing_output = response_payload.get("output")
+                    if not existing_output and output_item_order:
+                        response_payload["output"] = [
+                            output_items[_id] for _id in output_item_order
+                        ]
                     try:
                         completed_response = ResponsesAPIResponse(**response_payload)
                     except Exception:
@@ -165,7 +234,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                             **response_payload
                         )
                 break
-            if event_type in (
+            elif event_type in (
                 ResponsesAPIStreamEvents.RESPONSE_FAILED,
                 ResponsesAPIStreamEvents.ERROR,
             ):

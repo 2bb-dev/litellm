@@ -3,6 +3,7 @@ Tests for ChatGPT subscription Responses API transformation
 
 Source: litellm/llms/chatgpt/responses/transformation.py
 """
+
 import json
 import os
 import sys
@@ -103,9 +104,7 @@ class TestChatGPTResponsesAPITransformation:
 
         assert request["stream"] is True
         assert "reasoning.encrypted_content" in request["include"]
-        assert request["instructions"].startswith(
-            "You are Codex, based on GPT-5."
-        )
+        assert request["instructions"].startswith("You are Codex, based on GPT-5.")
 
     @pytest.mark.parametrize(
         "model_name",
@@ -124,7 +123,9 @@ class TestChatGPTResponsesAPITransformation:
                 "user": "user_123",
                 "temperature": 0.2,
                 "top_p": 0.9,
-                "context_management": [{"type": "compaction", "compact_threshold": 200000}],
+                "context_management": [
+                    {"type": "compaction", "compact_threshold": 200000}
+                ],
                 "metadata": {"foo": "bar"},
                 "max_output_tokens": 123,
                 "stream_options": {"include_usage": True},
@@ -151,7 +152,10 @@ class TestChatGPTResponsesAPITransformation:
         assert request["previous_response_id"] == "resp_123"
         assert request["reasoning"] == {"effort": "medium"}
         assert request["tools"] == [{"type": "function", "function": {"name": "hello"}}]
-        assert request["tool_choice"] == {"type": "function", "function": {"name": "hello"}}
+        assert request["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "hello"},
+        }
 
     @pytest.mark.parametrize(
         ("model_name", "response_model"),
@@ -197,3 +201,191 @@ class TestChatGPTResponsesAPITransformation:
         )
 
         assert parsed.output_text == "Hello!"
+
+    def test_chatgpt_non_stream_reassembles_output_from_sse_when_completed_empty(self):
+        """
+        In production, some ChatGPT Responses API completions arrive with
+        the assistant text in `response.output_item.done` + `response.output_text.delta`
+        events, but `response.completed.response.output` is empty.
+        The transformer must reconstruct `output` from the SSE events rather
+        than return `output=[]`.
+        """
+        config = ChatGPTResponsesAPIConfig()
+        item_id = "msg_test_1"
+        events = [
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                },
+            },
+            {
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            },
+            {
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "content_index": 0,
+                "delta": "Hel",
+            },
+            {
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "content_index": 0,
+                "delta": "lo!",
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello!"}],
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_reassemble_1",
+                    "object": "response",
+                    "created_at": 1700000000,
+                    "status": "completed",
+                    "model": "gpt-5.3-codex",
+                    "output": [],
+                    "usage": {"output_tokens": 2},
+                },
+            },
+        ]
+        sse_body = "\n".join(
+            [f"data: {json.dumps(e)}" for e in events] + ["data: [DONE]", ""]
+        )
+        raw_response = httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=sse_body
+        )
+
+        parsed = config.transform_response_api_response(
+            model="chatgpt/gpt-5.3-codex",
+            raw_response=raw_response,
+            logging_obj=MagicMock(),
+        )
+
+        assert parsed.output_text == "Hello!"
+        assert len(parsed.output) == 1
+
+    def test_chatgpt_non_stream_reassembles_output_from_deltas_only(self):
+        """
+        Fallback path: `response.completed.response.output` is empty AND
+        `response.output_item.done` never arrived — only deltas did.
+        Reassembly must still produce the assistant text from `output_text.delta`.
+        """
+        config = ChatGPTResponsesAPIConfig()
+        item_id = "msg_delta_only"
+        events = [
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                },
+            },
+            {
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            },
+            {
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "content_index": 0,
+                "delta": "Partial",
+            },
+            {
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "content_index": 0,
+                "delta": " answer",
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_reassemble_2",
+                    "object": "response",
+                    "created_at": 1700000000,
+                    "status": "completed",
+                    "model": "gpt-5.3-codex",
+                    "output": [],
+                },
+            },
+        ]
+        sse_body = "\n".join(
+            [f"data: {json.dumps(e)}" for e in events] + ["data: [DONE]", ""]
+        )
+        raw_response = httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=sse_body
+        )
+
+        parsed = config.transform_response_api_response(
+            model="chatgpt/gpt-5.3-codex",
+            raw_response=raw_response,
+            logging_obj=MagicMock(),
+        )
+
+        assert parsed.output_text == "Partial answer"
+
+    def test_chatgpt_non_stream_preserves_nonempty_output_from_completed(self):
+        """
+        Regression guard: if `response.completed.response.output` is already
+        populated, the transformer must NOT overwrite it with accumulated state.
+        """
+        config = ChatGPTResponsesAPIConfig()
+        item_id = "msg_happy"
+        events = [
+            {
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "content_index": 0,
+                "delta": "stale",
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_happy",
+                    "object": "response",
+                    "created_at": 1700000000,
+                    "status": "completed",
+                    "model": "gpt-5.3-codex",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "authoritative"}
+                            ],
+                        }
+                    ],
+                },
+            },
+        ]
+        sse_body = "\n".join(
+            [f"data: {json.dumps(e)}" for e in events] + ["data: [DONE]", ""]
+        )
+        raw_response = httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=sse_body
+        )
+
+        parsed = config.transform_response_api_response(
+            model="chatgpt/gpt-5.3-codex",
+            raw_response=raw_response,
+            logging_obj=MagicMock(),
+        )
+
+        assert parsed.output_text == "authoritative"

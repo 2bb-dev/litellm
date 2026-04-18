@@ -1,13 +1,19 @@
 """
 Test for response_api_endpoints/endpoints.py
 """
+
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.proxy_server import app
+
+
+def _override_auth():
+    return MagicMock(token="test_token", user_id="test_user", team_id=None)
 
 
 class TestResponsesAPIEndpoints(unittest.TestCase):
@@ -81,7 +87,9 @@ class TestResponsesAPIEndpoints(unittest.TestCase):
                     type="message",
                     role="assistant",
                     content=[
-                        ResponseOutputText(type="output_text", text="Hello from Cursor!")
+                        ResponseOutputText(
+                            type="output_text", text="Hello from Cursor!"
+                        )
                     ],
                 )
             ],
@@ -123,7 +131,7 @@ class TestResponsesAPIEndpoints(unittest.TestCase):
         """
         Test that x-litellm-key-spend header includes the current request's response_cost
         for /v1/responses endpoint.
-        
+
         This ensures the spend header reflects updated spend including the current request,
         even though spend tracking updates happen asynchronously after the response.
         """
@@ -142,7 +150,7 @@ class TestResponsesAPIEndpoints(unittest.TestCase):
         mock_user_api_key_dict.allowed_model_region = None
         mock_user_api_key_dict.api_key = "sk-test-key"
         mock_user_api_key_dict.metadata = {}
-        
+
         mock_auth.return_value = mock_user_api_key_dict
 
         # Mock response with hidden_params containing response_cost
@@ -161,13 +169,13 @@ class TestResponsesAPIEndpoints(unittest.TestCase):
                 )
             ],
         )
-        
+
         # Add hidden_params with response_cost to the mock response
         mock_response._hidden_params = {
             "response_cost": 0.0005,  # Current request cost: $0.0005
             "model_id": "test-model-id",
         }
-        
+
         mock_router.aresponses = AsyncMock(return_value=mock_response)
 
         client = TestClient(app)
@@ -194,3 +202,55 @@ class TestResponsesAPIEndpoints(unittest.TestCase):
         response_cost_value = float(response.headers["x-litellm-response-cost"])
         assert response_cost_value == pytest.approx(0.0005, abs=1e-10)
 
+
+class TestResponsesAPIInputValidation(unittest.TestCase):
+    """
+    The /v1/responses endpoint must reject requests missing the required `input`
+    field with a 400 before they reach `aresponses()`, which otherwise raises
+    `TypeError: aresponses() missing 1 required positional argument: 'input'`
+    and surfaces as a 500 to the client.
+    """
+
+    def setUp(self):
+        app.dependency_overrides[user_api_key_auth] = _override_auth
+
+    def tearDown(self):
+        app.dependency_overrides.pop(user_api_key_auth, None)
+
+    def _post(self, path, body):
+        with patch("litellm.proxy.proxy_server.llm_router") as mock_router:
+            mock_router.aresponses = AsyncMock()
+            client = TestClient(app)
+            response = client.post(
+                path,
+                json=body,
+                headers={"Authorization": "Bearer sk-1234"},
+            )
+            return response, mock_router
+
+    def test_responses_missing_input_returns_400(self):
+        response, mock_router = self._post("/v1/responses", {"model": "openai/gpt-5.4"})
+        assert response.status_code == 400
+        body = response.json()
+        # FastAPI / litellm error envelopes vary — confirm the message mentions `input`.
+        assert "input" in str(body).lower()
+        mock_router.aresponses.assert_not_awaited()
+
+    def test_responses_null_input_returns_400(self):
+        response, mock_router = self._post(
+            "/v1/responses", {"model": "openai/gpt-5.4", "input": None}
+        )
+        assert response.status_code == 400
+        mock_router.aresponses.assert_not_awaited()
+
+    def test_responses_openai_prefixed_route_validates(self):
+        response, mock_router = self._post(
+            "/openai/v1/responses", {"model": "openai/gpt-5.4"}
+        )
+        assert response.status_code == 400
+        mock_router.aresponses.assert_not_awaited()
+
+    def test_responses_short_route_validates(self):
+        response, mock_router = self._post("/responses", {"model": "openai/gpt-5.4"})
+        assert response.status_code == 400
+        mock_router.aresponses.assert_not_awaited()
