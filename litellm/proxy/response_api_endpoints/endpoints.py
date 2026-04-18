@@ -98,20 +98,16 @@ async def responses_api(
     # ingress (e.g. top-level `content` blocks instead of `input`) gets a clear
     # client error. See Linear 2BB-291.
     if data.get("input") is None:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": {
-                    "message": (
-                        "Missing required field 'input' for /v1/responses. "
-                        "The OpenAI Responses API requires an 'input' field "
-                        "(string or array of input items)."
-                    ),
-                    "type": "invalid_request_error",
-                    "param": "input",
-                    "code": "missing_required_field",
-                }
-            },
+        raise ProxyException(
+            message=(
+                "Missing required field 'input' for /v1/responses. "
+                "The OpenAI Responses API requires an 'input' field "
+                "(string or array of input items)."
+            ),
+            type="invalid_request_error",
+            param="input",
+            code=400,
+            openai_code="missing_required_field",
         )
 
     # Check if polling via cache should be used for this request

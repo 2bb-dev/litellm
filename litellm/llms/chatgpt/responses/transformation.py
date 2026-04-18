@@ -141,6 +141,10 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         # litellm/proxy/response_polling/background_streaming.py.
         output_items: dict = {}
         output_item_order: list = []
+        # Track output_index per item so we can reassemble canonical order.
+        # Responses API events for distinct items can be interleaved; relying
+        # on arrival order would misorder multi-item completions.
+        output_item_indices: dict = {}
         accumulated_text: dict = {}
         for chunk in body_text.splitlines():
             stripped_chunk = CustomStreamWrapper._strip_sse_data_from_chunk(chunk)
@@ -165,6 +169,9 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                     if item_id not in output_items:
                         output_item_order.append(item_id)
                     output_items[item_id] = dict(item)
+                    _oi = parsed_chunk.get("output_index")
+                    if isinstance(_oi, int):
+                        output_item_indices[item_id] = _oi
             elif event_type == "response.content_part.added":
                 item_id = parsed_chunk.get("item_id")
                 part = parsed_chunk.get("part") or {}
@@ -179,6 +186,9 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 content_index = parsed_chunk.get("content_index", 0)
                 delta = parsed_chunk.get("delta", "")
                 if item_id:
+                    _oi = parsed_chunk.get("output_index")
+                    if isinstance(_oi, int) and item_id not in output_item_indices:
+                        output_item_indices[item_id] = _oi
                     key = (item_id, content_index)
                     accumulated_text[key] = accumulated_text.get(key, "") + delta
                     if item_id not in output_items:
@@ -212,6 +222,9 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                     if item_id not in output_items:
                         output_item_order.append(item_id)
                     output_items[item_id] = dict(item)
+                    _oi = parsed_chunk.get("output_index")
+                    if isinstance(_oi, int):
+                        output_item_indices[item_id] = _oi
             elif event_type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
                 response_payload = parsed_chunk.get("response")
                 if isinstance(response_payload, dict):
@@ -224,8 +237,20 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                     # overwrite a populated `output` — the terminal event wins.
                     existing_output = response_payload.get("output")
                     if not existing_output and output_item_order:
+                        # Sort by the server-provided output_index when
+                        # available; fall back to arrival order for ties
+                        # or missing indices so ordering remains stable.
+                        ordered_ids = sorted(
+                            output_item_order,
+                            key=lambda _id: (
+                                output_item_indices.get(
+                                    _id, output_item_order.index(_id)
+                                ),
+                                output_item_order.index(_id),
+                            ),
+                        )
                         response_payload["output"] = [
-                            output_items[_id] for _id in output_item_order
+                            output_items[_id] for _id in ordered_ids
                         ]
                     try:
                         completed_response = ResponsesAPIResponse(**response_payload)
