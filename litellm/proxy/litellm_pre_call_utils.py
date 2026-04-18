@@ -363,6 +363,24 @@ def _iter_openclaw_raw_texts(
         yield from _iter_openclaw_raw_texts(item, seen=seen, depth=depth + 1)
 
 
+def _has_openclaw_payload_signal(data: dict) -> bool:
+    """Return True if the request payload carries an OpenClaw-specific label.
+
+    Used to disambiguate generic heartbeat markers from genuine OpenClaw
+    heartbeat traffic when no sender/conversation JSON block was parsed.
+    """
+    for key in ("messages", "input", "prompt", "message"):
+        if key not in data:
+            continue
+        for text in _iter_openclaw_raw_texts(data[key]):
+            if (
+                OPENCLAW_SENDER_INFO_LABEL in text
+                or OPENCLAW_CONVERSATION_INFO_LABEL in text
+            ):
+                return True
+    return False
+
+
 def _is_openclaw_heartbeat(
     data: dict,
     sender_info: Optional[dict],
@@ -487,9 +505,13 @@ def _build_openclaw_observability_metadata(
     if sender_info is None and conversation_info is None:
         if not is_heartbeat:
             return None
-        # Heartbeat request without OpenClaw sender/conversation metadata:
-        # synthesize a minimal bucket so the trace still lands in Langfuse
-        # under a dedicated user + session (issue 2BB-289, fix #4).
+        # Heartbeat request without parseable OpenClaw sender/conversation
+        # metadata: only synthesize a bucket if an OpenClaw-specific signal
+        # is present in the raw payload. Generic heartbeat markers alone
+        # (e.g. "# HEARTBEAT.md", "[heartbeat]") can appear in unrelated
+        # prompts and must not relabel them as OpenClaw traffic.
+        if not _has_openclaw_payload_signal(data):
+            return None
         synthetic: Dict[str, Any] = {}
         if not existing_metadata_dict.get("trace_user_id"):
             synthetic["trace_user_id"] = OPENCLAW_HEARTBEAT_USER_ID
