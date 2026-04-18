@@ -92,6 +92,24 @@ async def responses_api(
 
     data = await _read_request_body(request=request)
 
+    # OpenAI Responses API requires `input`. Without it, downstream code raises
+    # `TypeError: aresponses() missing 1 required positional argument: 'input'`
+    # and surfaces as a 500 to the client. Reject early with a 400 so malformed
+    # ingress (e.g. top-level `content` blocks instead of `input`) gets a clear
+    # client error. See Linear 2BB-291.
+    if data.get("input") is None:
+        raise ProxyException(
+            message=(
+                "Missing required field 'input' for /v1/responses. "
+                "The OpenAI Responses API requires an 'input' field "
+                "(string or array of input items)."
+            ),
+            type="invalid_request_error",
+            param="input",
+            code=400,
+            openai_code="missing_required_field",
+        )
+
     # Check if polling via cache should be used for this request
     from litellm.proxy.response_polling.polling_handler import (
         should_use_polling_for_request,
