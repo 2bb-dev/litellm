@@ -2640,6 +2640,15 @@ class StandardLoggingMetadata(StandardLoggingUserAPIKeyMetadata):
     ]  # S3/GCS object key for cold storage retrieval
     team_alias: Optional[str]
     team_id: Optional[str]
+    # OpenClaw observability — set by litellm_pre_call_utils._build_openclaw_observability_metadata
+    # Declared here so the _STANDARD_LOGGING_METADATA_KEYS filter in litellm_logging.py
+    # preserves them through standard-logging payload construction.
+    session_id: Optional[str]
+    trace_user_id: Optional[str]
+    openclaw_user_id: Optional[str]
+    openclaw_session_id: Optional[str]
+    openclaw_channel: Optional[str]
+    traffic_type: Optional[str]
 
 
 class StandardLoggingAdditionalHeaders(TypedDict, total=False):

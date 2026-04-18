@@ -556,15 +556,21 @@ class LangFuseLogger:
                     StandardLoggingPromptManagementMetadata
                 ] = None
             else:
-                end_user_id = standard_logging_object["metadata"].get(
-                    "user_api_key_end_user_id", None
+                # OpenClaw: prefer chat-session identity over API-key identity.
+                # trace_user_id / openclaw_user_id are set by
+                # litellm_pre_call_utils._build_openclaw_observability_metadata
+                # and survive standard-logging filtering because they are declared
+                # on StandardLoggingMetadata.
+                _md = standard_logging_object["metadata"]
+                end_user_id = (
+                    _md.get("trace_user_id")
+                    or _md.get("openclaw_user_id")
+                    or _md.get("user_api_key_end_user_id")
                 )
 
                 prompt_management_metadata = cast(
                     Optional[StandardLoggingPromptManagementMetadata],
-                    standard_logging_object["metadata"].get(
-                        "prompt_management_metadata", None
-                    ),
+                    _md.get("prompt_management_metadata", None),
                 )
 
             # Clean Metadata before logging - never log raw metadata
@@ -572,9 +578,9 @@ class LangFuseLogger:
             # we clean out all extra litellm metadata params before logging
             clean_metadata: Dict[str, Any] = {}
             if prompt_management_metadata is not None:
-                clean_metadata[
-                    "prompt_management_metadata"
-                ] = prompt_management_metadata
+                clean_metadata["prompt_management_metadata"] = (
+                    prompt_management_metadata
+                )
             if isinstance(metadata, dict):
                 for key, value in metadata.items():
                     # generate langfuse tags - Default Tags sent to Langfuse from LiteLLM Proxy
@@ -596,12 +602,34 @@ class LangFuseLogger:
                     else:
                         clean_metadata[key] = value
 
+            # OpenClaw: promote nested spend_logs_metadata openclaw_* keys to top-level
+            # so Langfuse's trace-metadata panel renders them individually, and emit
+            # compact tags so dashboards can filter by channel / traffic_type.
+            _spend_logs_md = clean_metadata.get("spend_logs_metadata")
+            if isinstance(_spend_logs_md, dict):
+                for _k, _v in _spend_logs_md.items():
+                    if _k.startswith("openclaw_") and _k not in clean_metadata:
+                        clean_metadata[_k] = _v
+            for _tag_key, _tag_label in (
+                ("openclaw_channel", "channel"),
+                ("traffic_type", "traffic_type"),
+                ("openclaw_user_id", "openclaw_user"),
+            ):
+                _tag_value = clean_metadata.get(_tag_key)
+                if _tag_value is not None and _tag_value != "":
+                    _candidate = f"{_tag_label}:{_tag_value}"
+                    if _candidate not in tags:
+                        tags.append(_candidate)
+
             # Add default langfuse tags
             tags = self.add_default_langfuse_tags(
                 tags=tags, kwargs=kwargs, metadata=metadata
             )
 
             session_id = clean_metadata.pop("session_id", None)
+            if session_id is None:
+                # OpenClaw fallback — chat-session identity lives under openclaw_session_id
+                session_id = clean_metadata.pop("openclaw_session_id", None)
             trace_name = cast(Optional[str], clean_metadata.pop("trace_name", None))
             trace_id = clean_metadata.pop("trace_id", None)
             # Use standard_logging_object.trace_id if available (when trace_id from metadata is None)
@@ -640,6 +668,11 @@ class LangFuseLogger:
 
             if existing_trace_id is not None:
                 trace_params: Dict[str, Any] = {"id": existing_trace_id}
+
+                # OpenClaw: carry chat-session user_id onto continuing traces.
+                # Without this, retried or resumed traces silently lose user identity.
+                if end_user_id is not None:
+                    trace_params["user_id"] = end_user_id
 
                 # Update the following keys for this trace
                 for metadata_param_key in update_trace_keys:
@@ -916,10 +949,17 @@ class LangFuseLogger:
         Get the responses API content for Langfuse logging
         """
         if hasattr(response_obj, "output") and response_obj.output:
-            # ResponsesAPIResponse.output is a list of strings
+            # ResponsesAPIResponse.output is a list of output items
             return response_obj.output
-        else:
-            return None
+        # Streamed Responses API completions can arrive with an empty .output
+        # (reassembly edge case). Fall back to the full model dump so Langfuse
+        # still renders usage + status + id instead of "No response data available".
+        if hasattr(response_obj, "model_dump"):
+            try:
+                return response_obj.model_dump(exclude_none=True)
+            except Exception:
+                pass
+        return None
 
     @staticmethod
     def _get_langfuse_tags(
