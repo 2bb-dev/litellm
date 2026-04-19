@@ -722,7 +722,14 @@ class LangFuseLogger:
                     )
 
                 if level == "ERROR":
-                    trace_params["output"] = output
+                    trace_params["status_message"] = output
+                    # Also populate output so the trace viewer renders the
+                    # failure body; downstream code (and repo tests around
+                    # _log_langfuse_v2) still keys off status_message for
+                    # error details, so keep both.
+                    trace_params["output"] = (
+                        output if not mask_output else "redacted-by-litellm"
+                    )
                 else:
                     trace_params["output"] = (
                         output if not mask_output else "redacted-by-litellm"
