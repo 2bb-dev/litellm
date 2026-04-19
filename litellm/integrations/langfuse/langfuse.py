@@ -722,7 +722,7 @@ class LangFuseLogger:
                     )
 
                 if level == "ERROR":
-                    trace_params["status_message"] = output
+                    trace_params["output"] = output
                 else:
                     trace_params["output"] = (
                         output if not mask_output else "redacted-by-litellm"
@@ -785,6 +785,13 @@ class LangFuseLogger:
                         # these headers can leak our API keys and/or JWT tokens
                         if key.lower() not in ["authorization", "cookie", "referer"]:
                             clean_headers[key] = value
+
+            if "metadata" in trace_params and isinstance(
+                trace_params["metadata"], dict
+            ):
+                trace_params["metadata"] = {**trace_params["metadata"], **clean_metadata}
+            else:
+                trace_params["metadata"] = clean_metadata
 
             trace: StatefulTraceClient = self.Langfuse.trace(**trace_params)
 
