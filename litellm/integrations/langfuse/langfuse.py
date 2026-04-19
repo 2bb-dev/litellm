@@ -723,6 +723,13 @@ class LangFuseLogger:
 
                 if level == "ERROR":
                     trace_params["status_message"] = output
+                    # Also populate output so the trace viewer renders the
+                    # failure body; downstream code (and repo tests around
+                    # _log_langfuse_v2) still keys off status_message for
+                    # error details, so keep both.
+                    trace_params["output"] = (
+                        output if not mask_output else "redacted-by-litellm"
+                    )
                 else:
                     trace_params["output"] = (
                         output if not mask_output else "redacted-by-litellm"
@@ -785,6 +792,32 @@ class LangFuseLogger:
                         # these headers can leak our API keys and/or JWT tokens
                         if key.lower() not in ["authorization", "cookie", "referer"]:
                             clean_headers[key] = value
+
+            # Mirror clean_metadata onto the trace row so downstream callbacks
+            # that inject trace-level keys (e.g. openclaw_channel) reach the
+            # Langfuse trace and not just its child generation span.
+            #
+            # Honor update_trace_keys on continuation traces: each generation
+            # in a continued trace would otherwise overwrite root metadata
+            # (generation_id, cache_hit, litellm_response_cost) with the
+            # latest generation's values. Only write when the trace is new
+            # OR the caller explicitly asked for trace_metadata updates.
+            #
+            # On key collisions, pre-existing trace_params["metadata"] wins.
+            # That slot holds explicit trace_metadata values from
+            # update_trace_keys and the debug block above — per-generation
+            # metadata should never silently clobber those.
+            should_write_metadata = (
+                existing_trace_id is None
+                or "trace_metadata" in update_trace_keys
+            )
+            if should_write_metadata:
+                if "metadata" in trace_params and isinstance(
+                    trace_params["metadata"], dict
+                ):
+                    trace_params["metadata"] = {**clean_metadata, **trace_params["metadata"]}
+                else:
+                    trace_params["metadata"] = clean_metadata
 
             trace: StatefulTraceClient = self.Langfuse.trace(**trace_params)
 
