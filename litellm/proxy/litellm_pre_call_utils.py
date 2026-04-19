@@ -44,6 +44,8 @@ def _sanitize_for_log(value: Any) -> str:
         text = repr(value)
     # Strip CR/LF characters commonly used for log injection
     return text.replace("\r", "").replace("\n", "")
+
+
 from litellm.router import Router
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.llms.anthropic import ANTHROPIC_API_HEADERS
@@ -96,6 +98,18 @@ LITELLM_METADATA_ROUTES = (
 OPENCLAW_CONVERSATION_INFO_LABEL = "Conversation info (untrusted metadata):"
 OPENCLAW_SENDER_INFO_LABEL = "Sender (untrusted metadata):"
 OPENCLAW_SESSION_PREFIX = "openclaw"
+OPENCLAW_HEARTBEAT_SESSION_ID = f"{OPENCLAW_SESSION_PREFIX}:heartbeats"
+OPENCLAW_HEARTBEAT_USER_ID = f"{OPENCLAW_SESSION_PREFIX}:heartbeat"
+OPENCLAW_HEARTBEAT_TAG = "heartbeat"
+OPENCLAW_SUB_AGENT_TAG = "sub-agent"
+# Content-level signals that mark a heartbeat request. Prometheus loads
+# HEARTBEAT.md into its workspace, so its literal content header
+# ("# HEARTBEAT.md") is present for every heartbeat call.
+_OPENCLAW_HEARTBEAT_CONTENT_MARKERS = (
+    "# HEARTBEAT.md",
+    "[heartbeat]",
+    "HEARTBEAT_OK",
+)
 
 
 def _get_metadata_variable_name(request: Request) -> str:
@@ -202,9 +216,7 @@ def _iter_openclaw_candidate_texts(
 
     if isinstance(value, list):
         for item in value:
-            yield from _iter_openclaw_candidate_texts(
-                item, seen=seen, depth=depth + 1
-            )
+            yield from _iter_openclaw_candidate_texts(item, seen=seen, depth=depth + 1)
         return
 
     for item in value.values():
@@ -281,6 +293,148 @@ def _resolve_openclaw_channel(
     return None
 
 
+def _iter_openclaw_raw_texts(
+    value: Any, seen: Optional[set[int]] = None, depth: int = 0
+):
+    """
+    Yield every string found inside `value` (walking dicts/lists up to depth 8).
+
+    Unlike `_iter_openclaw_candidate_texts`, this does not filter for
+    OpenClaw metadata labels — used to scan for heartbeat content markers.
+    """
+    if depth > 8:
+        return
+
+    if seen is None:
+        seen = set()
+
+    if isinstance(value, str):
+        yield value
+        return
+
+    if not isinstance(value, (dict, list)):
+        return
+
+    object_id = id(value)
+    if object_id in seen:
+        return
+    seen.add(object_id)
+
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_openclaw_raw_texts(item, seen=seen, depth=depth + 1)
+        return
+
+    for item in value.values():
+        yield from _iter_openclaw_raw_texts(item, seen=seen, depth=depth + 1)
+
+
+def _has_openclaw_payload_signal(data: dict) -> bool:
+    """Return True if the request payload carries an OpenClaw-specific label.
+
+    Used to disambiguate generic heartbeat markers from genuine OpenClaw
+    heartbeat traffic when no sender/conversation JSON block was parsed.
+    """
+    for key in ("messages", "input", "prompt", "message"):
+        if key not in data:
+            continue
+        for text in _iter_openclaw_raw_texts(data[key]):
+            if (
+                OPENCLAW_SENDER_INFO_LABEL in text
+                or OPENCLAW_CONVERSATION_INFO_LABEL in text
+            ):
+                return True
+    return False
+
+
+def _is_openclaw_heartbeat(
+    data: dict,
+    sender_info: Optional[dict],
+    conversation_info: Optional[dict],
+) -> bool:
+    """Detect heartbeat signals from sender metadata or raw request content."""
+    for info in (sender_info, conversation_info):
+        if not isinstance(info, dict):
+            continue
+        if info.get("heartbeat") is True:
+            return True
+        kind = info.get("kind")
+        if isinstance(kind, str) and kind.strip().lower() == "heartbeat":
+            return True
+
+    for key in ("messages", "input", "prompt", "message"):
+        if key not in data:
+            continue
+        for text in _iter_openclaw_raw_texts(data[key]):
+            for marker in _OPENCLAW_HEARTBEAT_CONTENT_MARKERS:
+                if marker in text:
+                    return True
+    return False
+
+
+def _resolve_openclaw_sub_agent_suffix(sender_info: Optional[dict]) -> Optional[str]:
+    """
+    Return a normalized sub-agent suffix if the sender is a sub-agent.
+
+    Checks explicit sender_info fields: `sub_agent_id`, `agent_id`, or a
+    `role`/`agent_role` value of "sub_agent"/"subagent" (with an
+    accompanying id). Returns None for regular senders.
+    """
+    if not isinstance(sender_info, dict):
+        return None
+
+    for key in ("sub_agent_id", "subagent_id"):
+        suffix = _normalize_openclaw_observability_string(
+            sender_info.get(key), max_length=120
+        )
+        if suffix is not None:
+            return suffix
+
+    role_value = sender_info.get("agent_role") or sender_info.get("role")
+    if isinstance(role_value, str) and role_value.strip().lower().replace("-", "_") in {
+        "sub_agent",
+        "subagent",
+    }:
+        agent_id = _normalize_openclaw_observability_string(
+            sender_info.get("agent_id"), max_length=120
+        )
+        if agent_id is not None:
+            return agent_id
+
+    return None
+
+
+def _resolve_openclaw_user_name(sender_info: Optional[dict]) -> Optional[str]:
+    """
+    Pick a human-readable display name for the Langfuse user profile.
+
+    Prefers sender_info.name, then username, then label. Mirrors the
+    precedence the existing Langfuse callback expects in `metadata.user_name`.
+    """
+    if not isinstance(sender_info, dict):
+        return None
+    for key in ("name", "username", "label"):
+        value = _normalize_openclaw_observability_string(
+            sender_info.get(key), max_length=160
+        )
+        if value is not None:
+            return value
+    return None
+
+
+def _merge_openclaw_tags(existing_tags: Any, new_tags: List[str]) -> List[str]:
+    """Append tags to the existing list (if any) without duplicates, preserving order."""
+    merged: List[str] = []
+    if isinstance(existing_tags, list):
+        for tag in existing_tags:
+            if isinstance(tag, str) and tag not in merged:
+                merged.append(tag)
+    for tag in new_tags:
+        if tag and tag not in merged:
+            merged.append(tag)
+    return merged
+
+
 def _build_openclaw_observability_metadata(
     data: dict, existing_metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -306,12 +460,37 @@ def _build_openclaw_observability_metadata(
         if sender_info is not None and conversation_info is not None:
             break
 
+    is_heartbeat = _is_openclaw_heartbeat(
+        data=data, sender_info=sender_info, conversation_info=conversation_info
+    )
+
+    existing_metadata_dict: dict = (
+        existing_metadata if isinstance(existing_metadata, dict) else {}
+    )
+
     if sender_info is None and conversation_info is None:
-        return None
+        if not is_heartbeat:
+            return None
+        # Heartbeat request without parseable OpenClaw sender/conversation
+        # metadata: only synthesize a bucket if an OpenClaw-specific signal
+        # is present in the raw payload. Generic heartbeat markers alone
+        # (e.g. "# HEARTBEAT.md", "[heartbeat]") can appear in unrelated
+        # prompts and must not relabel them as OpenClaw traffic.
+        if not _has_openclaw_payload_signal(data):
+            return None
+        synthetic: Dict[str, Any] = {}
+        if not existing_metadata_dict.get("trace_user_id"):
+            synthetic["trace_user_id"] = OPENCLAW_HEARTBEAT_USER_ID
+        if not existing_metadata_dict.get("session_id"):
+            synthetic["session_id"] = OPENCLAW_HEARTBEAT_SESSION_ID
+        synthetic["openclaw_heartbeat"] = True
+        synthetic["tags"] = _merge_openclaw_tags(
+            existing_metadata_dict.get("tags"), [OPENCLAW_HEARTBEAT_TAG]
+        )
+        return synthetic or None
 
     sender_id = _normalize_openclaw_observability_string(
-        (sender_info or {}).get("id")
-        or (conversation_info or {}).get("sender_id"),
+        (sender_info or {}).get("id") or (conversation_info or {}).get("sender_id"),
         max_length=120,
     )
     if sender_id is None:
@@ -332,8 +511,11 @@ def _build_openclaw_observability_metadata(
     inferred_channel = _resolve_openclaw_channel(
         sender_info=sender_info, conversation_info=conversation_info
     )
+    sub_agent_suffix = _resolve_openclaw_sub_agent_suffix(sender_info)
+
     trace_user_id: Optional[str] = None
     raw_session_id: Optional[str] = None
+    parent_raw_session_id: Optional[str] = None
     openclaw_session_id: Optional[str] = None
     if inferred_channel is not None:
         raw_user_id = f"{inferred_channel}:{sender_id}"
@@ -342,8 +524,16 @@ def _build_openclaw_observability_metadata(
             prefix=f"{inferred_channel}-user",
         )
 
-        if group_channel and topic_id:
-            raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:{group_channel}:topic:{topic_id}"
+        if is_heartbeat:
+            # Route heartbeats to a dedicated session bucket so they don't
+            # pollute user conversations (issue 2BB-289, fix #2).
+            raw_session_id = (
+                f"{OPENCLAW_SESSION_PREFIX}:heartbeats:{inferred_channel}:{sender_id}"
+            )
+        elif group_channel and topic_id:
+            raw_session_id = (
+                f"{OPENCLAW_SESSION_PREFIX}:{group_channel}:topic:{topic_id}"
+            )
         elif group_channel:
             raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:{group_channel}"
         else:
@@ -351,18 +541,44 @@ def _build_openclaw_observability_metadata(
                 f"{OPENCLAW_SESSION_PREFIX}:{inferred_channel}:dm:{sender_id}"
             )
 
+        if sub_agent_suffix is not None and not is_heartbeat:
+            # Keep the parent's session id distinguishable so users can
+            # filter sub-agent traffic separately (issue 2BB-289, fix #3).
+            parent_raw_session_id = raw_session_id
+            raw_session_id = f"{raw_session_id}:sub:{sub_agent_suffix}"
+
         openclaw_session_id = _build_openclaw_bounded_identifier(
             raw_session_id,
             prefix=f"{OPENCLAW_SESSION_PREFIX}-session",
         )
 
+    user_name = _resolve_openclaw_user_name(sender_info)
+    parent_session_id = (
+        _build_openclaw_bounded_identifier(
+            parent_raw_session_id,
+            prefix=f"{OPENCLAW_SESSION_PREFIX}-session",
+        )
+        if parent_raw_session_id is not None
+        else None
+    )
+
     metadata_updates = {
         "trace_user_id": trace_user_id,
         "session_id": openclaw_session_id,
+        # `user_name` / `channel` are the keys the Langfuse Users page
+        # surfaces as the "Username" / "Channel" columns (issue 2BB-289,
+        # fix #1). They mirror `openclaw_sender_username` / `openclaw_channel`
+        # but use Langfuse-standard naming so the existing UI columns
+        # populate without per-tenant config.
+        "user_name": user_name,
+        "channel": inferred_channel,
         "openclaw_user_id": trace_user_id,
         "openclaw_session_id": openclaw_session_id,
         "openclaw_channel": inferred_channel,
         "openclaw_session_id_raw": raw_session_id,
+        "openclaw_parent_session_id": parent_session_id,
+        "openclaw_sub_agent_id": sub_agent_suffix,
+        "openclaw_heartbeat": True if is_heartbeat else None,
         "openclaw_sender_id": sender_id,
         "openclaw_sender_name": _normalize_openclaw_observability_string(
             (sender_info or {}).get("name"),
@@ -390,15 +606,27 @@ def _build_openclaw_observability_metadata(
     }
 
     resolved_metadata: dict = {}
-    existing_metadata = (
-        existing_metadata if isinstance(existing_metadata, dict) else {}
-    )
+    existing_metadata = existing_metadata_dict
     for key, value in metadata_updates.items():
         if value is None:
             continue
         if key in {"trace_user_id", "session_id"} and existing_metadata.get(key):
             continue
         resolved_metadata[key] = value
+
+    # Langfuse tags — channel surfaces in the Users page filter bar, and
+    # heartbeat/sub-agent tags let operators slice those buckets quickly.
+    new_tags: List[str] = []
+    if inferred_channel is not None:
+        new_tags.append(f"channel:{inferred_channel}")
+    if is_heartbeat:
+        new_tags.append(OPENCLAW_HEARTBEAT_TAG)
+    if sub_agent_suffix is not None and not is_heartbeat:
+        new_tags.append(OPENCLAW_SUB_AGENT_TAG)
+    if new_tags:
+        resolved_metadata["tags"] = _merge_openclaw_tags(
+            existing_metadata.get("tags"), new_tags
+        )
 
     spend_logs_metadata = existing_metadata.get("spend_logs_metadata")
     merged_spend_logs_metadata = (
@@ -411,6 +639,9 @@ def _build_openclaw_observability_metadata(
         "openclaw_session_id",
         "openclaw_channel",
         "openclaw_session_id_raw",
+        "openclaw_parent_session_id",
+        "openclaw_sub_agent_id",
+        "openclaw_heartbeat",
         "openclaw_sender_id",
         "openclaw_sender_username",
         "openclaw_sender_label",
@@ -535,12 +766,12 @@ def _get_dynamic_logging_metadata(
     user_api_key_dict: UserAPIKeyAuth, proxy_config: ProxyConfig
 ) -> Optional[TeamCallbackMetadata]:
     callback_settings_obj: Optional[TeamCallbackMetadata] = None
-    key_dynamic_logging_settings: Optional[
-        dict
-    ] = KeyAndTeamLoggingSettings.get_key_dynamic_logging_settings(user_api_key_dict)
-    team_dynamic_logging_settings: Optional[
-        dict
-    ] = KeyAndTeamLoggingSettings.get_team_dynamic_logging_settings(user_api_key_dict)
+    key_dynamic_logging_settings: Optional[dict] = (
+        KeyAndTeamLoggingSettings.get_key_dynamic_logging_settings(user_api_key_dict)
+    )
+    team_dynamic_logging_settings: Optional[dict] = (
+        KeyAndTeamLoggingSettings.get_team_dynamic_logging_settings(user_api_key_dict)
+    )
     #########################################################################################
     # Key-based callbacks
     #########################################################################################
@@ -1094,11 +1325,11 @@ class LiteLLMProxyRequestSetup:
 
         ## KEY-LEVEL SPEND LOGS / TAGS
         if "tags" in key_metadata and key_metadata["tags"] is not None:
-            data[_metadata_variable_name][
-                "tags"
-            ] = LiteLLMProxyRequestSetup._merge_tags(
-                request_tags=data[_metadata_variable_name].get("tags"),
-                tags_to_add=key_metadata["tags"],
+            data[_metadata_variable_name]["tags"] = (
+                LiteLLMProxyRequestSetup._merge_tags(
+                    request_tags=data[_metadata_variable_name].get("tags"),
+                    tags_to_add=key_metadata["tags"],
+                )
             )
         if "disable_global_guardrails" in key_metadata and isinstance(
             key_metadata["disable_global_guardrails"], bool
@@ -1409,9 +1640,9 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
     data[_metadata_variable_name]["litellm_api_version"] = version
 
     if general_settings is not None:
-        data[_metadata_variable_name][
-            "global_max_parallel_requests"
-        ] = general_settings.get("global_max_parallel_requests", None)
+        data[_metadata_variable_name]["global_max_parallel_requests"] = (
+            general_settings.get("global_max_parallel_requests", None)
+        )
 
     ### KEY-LEVEL Controls
     key_metadata = user_api_key_dict.metadata
@@ -2211,7 +2442,9 @@ async def move_guardrails_to_metadata(
     )
 
     # Only check policy engine if no local config (avoid import + registry lookup)
-    if not (has_key_config or has_team_config or has_project_config or has_request_config):
+    if not (
+        has_key_config or has_team_config or has_project_config or has_request_config
+    ):
         from litellm.proxy.policy_engine.policy_registry import get_policy_registry
 
         if not get_policy_registry().is_initialized():
