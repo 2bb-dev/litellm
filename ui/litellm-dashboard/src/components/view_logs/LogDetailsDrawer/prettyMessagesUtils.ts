@@ -15,6 +15,12 @@ export const ROLE_STYLES: Record<string, RoleStyle> = {
     label: 'SYSTEM',
     labelColor: '#8c8c8c',
   },
+  developer: {
+    background: 'transparent',
+    borderColor: '#722ed1',
+    label: 'DEVELOPER',
+    labelColor: '#722ed1',
+  },
   user: {
     background: 'transparent',
     borderColor: '#1677ff',
@@ -37,9 +43,11 @@ export const ROLE_STYLES: Record<string, RoleStyle> = {
 
 type ParsedRole = ParsedMessage['role'];
 
+const KNOWN_ROLES: readonly ParsedRole[] = ['system', 'developer', 'user', 'assistant', 'tool'];
+
 const normalizeRole = (role: any): ParsedRole => {
-  if (role === 'system' || role === 'user' || role === 'assistant' || role === 'tool') {
-    return role;
+  if (typeof role === 'string' && (KNOWN_ROLES as readonly string[]).includes(role)) {
+    return role as ParsedRole;
   }
   return 'user';
 };

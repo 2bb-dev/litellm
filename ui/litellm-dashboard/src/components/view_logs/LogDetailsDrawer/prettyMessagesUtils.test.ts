@@ -180,6 +180,43 @@ describe("parseMessages - Responses API", () => {
   });
 });
 
+describe("parseMessages - role preservation", () => {
+  it("preserves the OpenAI `developer` role (does not coerce to user)", () => {
+    const { requestMessages } = parseMessages(
+      {
+        messages: [
+          { role: "developer", content: "Internal instructions" },
+          { role: "user", content: "hi" },
+        ],
+      },
+      {},
+    );
+    expect(requestMessages[0].role).toBe("developer");
+    expect(requestMessages[1].role).toBe("user");
+  });
+
+  it("preserves `developer` role on the Responses API input path", () => {
+    const { requestMessages } = parseMessages(
+      {
+        input: [
+          { role: "developer", content: "Internal instructions" },
+          { role: "user", content: "hi" },
+        ],
+      },
+      {},
+    );
+    expect(requestMessages[0].role).toBe("developer");
+  });
+
+  it("falls back to `user` only for genuinely unknown roles", () => {
+    const { requestMessages } = parseMessages(
+      { messages: [{ role: "moderator", content: "hi" }] },
+      {},
+    );
+    expect(requestMessages[0].role).toBe("user");
+  });
+});
+
 describe("parseMessages - Anthropic-style system field", () => {
   it("promotes top-level system string to a system message", () => {
     const { requestMessages } = parseMessages(
