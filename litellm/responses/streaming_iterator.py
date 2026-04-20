@@ -88,6 +88,11 @@ class BaseResponsesAPIStreamingIterator:
         self._hidden_params["additional_headers"] = process_response_headers(
             self.response.headers or {}
         )  # GUARANTEE OPENAI HEADERS IN RESPONSE
+        self._stream_output_items: Dict[str, Dict[str, Any]] = {}
+        self._stream_output_item_order: List[str] = []
+        self._stream_output_item_indices: Dict[str, int] = {}
+        self._stream_accumulated_text: Dict[tuple[str, int], str] = {}
+        self._stream_accumulated_refusals: Dict[tuple[str, int], str] = {}
 
     def _check_max_streaming_duration(self) -> None:
         """Raise litellm.Timeout if the stream has exceeded LITELLM_MAX_STREAMING_DURATION_SECONDS."""
@@ -100,6 +105,228 @@ class BaseResponsesAPIStreamingIterator:
                 model=self.model or "",
                 llm_provider=self.custom_llm_provider or "",
             )
+
+    @staticmethod
+    def _stream_obj_to_dict(obj: Any) -> Dict[str, Any]:
+        if obj is None:
+            return {}
+        if isinstance(obj, dict):
+            return dict(obj)
+        if hasattr(obj, "model_dump"):
+            try:
+                return obj.model_dump()
+            except Exception:
+                pass
+        if hasattr(obj, "__dict__"):
+            try:
+                return {
+                    k: v for k, v in vars(obj).items() if not k.startswith("__")
+                }
+            except Exception:
+                pass
+        return {}
+
+    def _ensure_stream_output_item(self, item_id: str) -> Dict[str, Any]:
+        if item_id not in self._stream_output_items:
+            self._stream_output_items[item_id] = {
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+            }
+            self._stream_output_item_order.append(item_id)
+        return self._stream_output_items[item_id]
+
+    def _set_stream_output_index(self, item_id: str, output_index: Any) -> None:
+        if isinstance(output_index, int):
+            self._stream_output_item_indices[item_id] = output_index
+
+    def _set_stream_content_part(
+        self, item_id: str, content_index: int, part: Dict[str, Any]
+    ) -> None:
+        item = self._ensure_stream_output_item(item_id)
+        content = item.setdefault("content", [])
+        if not isinstance(content, list):
+            content = []
+            item["content"] = content
+        while len(content) <= content_index:
+            content.append({})
+        content[content_index] = part
+
+    def _track_stream_output_event(self, event: Any) -> None:
+        event_type = getattr(event, "type", None)
+
+        if event_type in (
+            ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
+            ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+        ):
+            item = self._stream_obj_to_dict(getattr(event, "item", None))
+            item_id = item.get("id")
+            if item_id:
+                if item_id not in self._stream_output_item_order:
+                    self._stream_output_item_order.append(item_id)
+                self._stream_output_items[item_id] = item
+                self._set_stream_output_index(
+                    item_id, getattr(event, "output_index", None)
+                )
+            return
+
+        if event_type in (
+            ResponsesAPIStreamEvents.CONTENT_PART_ADDED,
+            ResponsesAPIStreamEvents.CONTENT_PART_DONE,
+        ):
+            item_id = getattr(event, "item_id", None)
+            if not item_id:
+                return
+            self._set_stream_output_index(item_id, getattr(event, "output_index", None))
+            content_index = int(getattr(event, "content_index", 0) or 0)
+            part = self._stream_obj_to_dict(getattr(event, "part", None))
+            self._set_stream_content_part(item_id, content_index, part)
+            return
+
+        if event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA:
+            item_id = getattr(event, "item_id", None)
+            if not item_id:
+                return
+            self._set_stream_output_index(item_id, getattr(event, "output_index", None))
+            content_index = int(getattr(event, "content_index", 0) or 0)
+            delta = str(getattr(event, "delta", "") or "")
+            key = (item_id, content_index)
+            self._stream_accumulated_text[key] = (
+                self._stream_accumulated_text.get(key, "") + delta
+            )
+            item = self._ensure_stream_output_item(item_id)
+            content = item.setdefault("content", [])
+            if not isinstance(content, list):
+                content = []
+                item["content"] = content
+            while len(content) <= content_index:
+                content.append({"type": "output_text", "text": ""})
+            part = content[content_index]
+            if not isinstance(part, dict):
+                part = {"type": "output_text", "text": ""}
+                content[content_index] = part
+            part.setdefault("type", "output_text")
+            part["text"] = self._stream_accumulated_text[key]
+            return
+
+        if event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE:
+            item_id = getattr(event, "item_id", None)
+            if not item_id:
+                return
+            self._set_stream_output_index(item_id, getattr(event, "output_index", None))
+            content_index = int(getattr(event, "content_index", 0) or 0)
+            text = str(getattr(event, "text", "") or "")
+            self._set_stream_content_part(
+                item_id,
+                content_index,
+                {
+                    "type": "output_text",
+                    "text": text,
+                },
+            )
+            return
+
+        if event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_ANNOTATION_ADDED:
+            item_id = getattr(event, "item_id", None)
+            if not item_id:
+                return
+            self._set_stream_output_index(item_id, getattr(event, "output_index", None))
+            content_index = int(getattr(event, "content_index", 0) or 0)
+            annotation_index = int(getattr(event, "annotation_index", 0) or 0)
+            annotation = self._stream_obj_to_dict(getattr(event, "annotation", None))
+            item = self._ensure_stream_output_item(item_id)
+            content = item.setdefault("content", [])
+            if not isinstance(content, list):
+                content = []
+                item["content"] = content
+            while len(content) <= content_index:
+                content.append({"type": "output_text", "text": ""})
+            part = content[content_index]
+            if not isinstance(part, dict):
+                part = {"type": "output_text", "text": ""}
+                content[content_index] = part
+            annotations = part.setdefault("annotations", [])
+            if not isinstance(annotations, list):
+                annotations = []
+                part["annotations"] = annotations
+            while len(annotations) <= annotation_index:
+                annotations.append({})
+            annotations[annotation_index] = annotation
+            return
+
+        if event_type == ResponsesAPIStreamEvents.REFUSAL_DELTA:
+            item_id = getattr(event, "item_id", None)
+            if not item_id:
+                return
+            self._set_stream_output_index(item_id, getattr(event, "output_index", None))
+            content_index = int(getattr(event, "content_index", 0) or 0)
+            delta = str(getattr(event, "delta", "") or "")
+            key = (item_id, content_index)
+            self._stream_accumulated_refusals[key] = (
+                self._stream_accumulated_refusals.get(key, "") + delta
+            )
+            self._set_stream_content_part(
+                item_id,
+                content_index,
+                {
+                    "type": "refusal",
+                    "refusal": self._stream_accumulated_refusals[key],
+                },
+            )
+            return
+
+        if event_type == ResponsesAPIStreamEvents.REFUSAL_DONE:
+            item_id = getattr(event, "item_id", None)
+            if not item_id:
+                return
+            self._set_stream_output_index(item_id, getattr(event, "output_index", None))
+            content_index = int(getattr(event, "content_index", 0) or 0)
+            refusal = str(getattr(event, "refusal", "") or "")
+            self._set_stream_content_part(
+                item_id,
+                content_index,
+                {
+                    "type": "refusal",
+                    "refusal": refusal,
+                },
+            )
+
+    def _maybe_backfill_terminal_response_output(self, event: Any) -> None:
+        if not self._stream_output_item_order:
+            return
+
+        response = getattr(event, "response", None)
+        if response is None:
+            return
+
+        existing_output = (
+            response.get("output") if isinstance(response, dict) else getattr(response, "output", None)
+        )
+        if existing_output:
+            return
+
+        ordered_ids = sorted(
+            self._stream_output_item_order,
+            key=lambda item_id: (
+                self._stream_output_item_indices.get(
+                    item_id, self._stream_output_item_order.index(item_id)
+                ),
+                self._stream_output_item_order.index(item_id),
+            ),
+        )
+        patched_output = [
+            self._stream_output_items[item_id]
+            for item_id in ordered_ids
+            if item_id in self._stream_output_items
+        ]
+        if not patched_output:
+            return
+
+        if isinstance(response, dict):
+            response["output"] = patched_output
+        else:
+            setattr(response, "output", patched_output)
 
     def _process_chunk(self, chunk) -> Optional[ResponsesAPIStreamingResponse]:
         """Process a single chunk of data from the stream"""
@@ -217,6 +444,8 @@ class BaseResponsesAPIStreamingIterator:
                                     )
                                     setattr(item, "encrypted_content", wrapped_content)
 
+                self._track_stream_output_event(openai_responses_api_chunk)
+
                 # Store the completed response (also for incomplete/failed so logging still fires)
                 _chunk_type = getattr(openai_responses_api_chunk, "type", None)
                 if openai_responses_api_chunk and _chunk_type in (
@@ -224,6 +453,9 @@ class BaseResponsesAPIStreamingIterator:
                     ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE,
                     ResponsesAPIStreamEvents.RESPONSE_FAILED,
                 ):
+                    self._maybe_backfill_terminal_response_output(
+                        openai_responses_api_chunk
+                    )
                     self.completed_response = openai_responses_api_chunk
                     # Add cost to usage object if include_cost_in_streaming_usage is True
                     if (
