@@ -294,6 +294,178 @@ class TestBaseResponsesAPIStreamingIterator:
             }
         ]
 
+    def test_process_chunk_preserves_annotations_through_output_text_done(self):
+        """
+        Regression: OUTPUT_TEXT_DONE must preserve annotations accumulated by
+        OUTPUT_TEXT_ANNOTATION_ADDED when the terminal response.output is empty
+        and backfilled from stream events.
+        """
+        mock_response = Mock()
+        mock_response.headers = {}
+        mock_logging_obj = Mock(spec=LiteLLMLoggingObj)
+        mock_logging_obj.model_call_details = {"litellm_params": {}}
+        mock_config = Mock(spec=BaseResponsesAPIConfig)
+
+        completed_response = Mock(spec=ResponsesAPIResponse)
+        completed_response.id = "resp_terminal_456"
+        completed_response.output = []
+        completed_response.usage = None
+
+        output_item_added_event = Mock()
+        output_item_added_event.type = ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
+        output_item_added_event.output_index = 0
+        output_item_added_event.item = {
+            "id": "msg_456",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+        }
+
+        text_delta_event = Mock(spec=OutputTextDeltaEvent)
+        text_delta_event.type = ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA
+        text_delta_event.item_id = "msg_456"
+        text_delta_event.output_index = 0
+        text_delta_event.content_index = 0
+        text_delta_event.delta = "See source"
+
+        annotation_event = Mock()
+        annotation_event.type = ResponsesAPIStreamEvents.OUTPUT_TEXT_ANNOTATION_ADDED
+        annotation_event.item_id = "msg_456"
+        annotation_event.output_index = 0
+        annotation_event.content_index = 0
+        annotation_event.annotation_index = 0
+        annotation_event.annotation = {
+            "type": "url_citation",
+            "url": "https://example.com",
+            "title": "Example",
+        }
+
+        text_done_event = Mock()
+        text_done_event.type = ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE
+        text_done_event.item_id = "msg_456"
+        text_done_event.output_index = 0
+        text_done_event.content_index = 0
+        text_done_event.text = "See source"
+
+        completed_event = Mock(spec=ResponseCompletedEvent)
+        completed_event.type = ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+        completed_event.response = completed_response
+
+        event_by_type = {
+            ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED: output_item_added_event,
+            ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA: text_delta_event,
+            ResponsesAPIStreamEvents.OUTPUT_TEXT_ANNOTATION_ADDED: annotation_event,
+            ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE: text_done_event,
+            ResponsesAPIStreamEvents.RESPONSE_COMPLETED: completed_event,
+        }
+
+        def transform_streaming_response_side_effect(*, parsed_chunk, **kwargs):
+            return event_by_type[parsed_chunk["type"]]
+
+        mock_config.transform_streaming_response.side_effect = (
+            transform_streaming_response_side_effect
+        )
+
+        iterator = BaseResponsesAPIStreamingIterator(
+            response=mock_response,
+            model="gpt-4",
+            responses_api_provider_config=mock_config,
+            logging_obj=mock_logging_obj,
+            litellm_metadata={"model_info": {"id": "model_123"}},
+            custom_llm_provider="openai",
+        )
+
+        with patch.object(
+            ResponsesAPIRequestUtils,
+            "_update_responses_api_response_id_with_model_id",
+            return_value=completed_response,
+        ):
+            iterator._process_chunk(
+                json.dumps(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "id": "msg_456",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    }
+                )
+            )
+            iterator._process_chunk(
+                json.dumps(
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_456",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": "See source",
+                    }
+                )
+            )
+            iterator._process_chunk(
+                json.dumps(
+                    {
+                        "type": "response.output_text.annotation.added",
+                        "item_id": "msg_456",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "annotation_index": 0,
+                        "annotation": {
+                            "type": "url_citation",
+                            "url": "https://example.com",
+                            "title": "Example",
+                        },
+                    }
+                )
+            )
+            iterator._process_chunk(
+                json.dumps(
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": "msg_456",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": "See source",
+                    }
+                )
+            )
+
+            iterator._process_chunk(
+                json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_terminal_456",
+                            "output": [],
+                        },
+                    }
+                )
+            )
+
+        assert completed_response.output == [
+            {
+                "id": "msg_456",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "See source",
+                        "annotations": [
+                            {
+                                "type": "url_citation",
+                                "url": "https://example.com",
+                                "title": "Example",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
     def test_process_chunk_handles_invalid_json(self):
         """
         Test that _process_chunk gracefully handles invalid JSON.
