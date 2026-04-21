@@ -217,14 +217,19 @@ class BaseResponsesAPIStreamingIterator:
             self._set_stream_output_index(item_id, getattr(event, "output_index", None))
             content_index = int(getattr(event, "content_index", 0) or 0)
             text = str(getattr(event, "text", "") or "")
-            self._set_stream_content_part(
-                item_id,
-                content_index,
-                {
-                    "type": "output_text",
-                    "text": text,
-                },
-            )
+            item = self._ensure_stream_output_item(item_id)
+            content = item.setdefault("content", [])
+            if not isinstance(content, list):
+                content = []
+                item["content"] = content
+            while len(content) <= content_index:
+                content.append({"type": "output_text", "text": ""})
+            part = content[content_index]
+            if not isinstance(part, dict):
+                part = {"type": "output_text", "text": ""}
+                content[content_index] = part
+            part.setdefault("type", "output_text")
+            part["text"] = text
             return
 
         if event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_ANNOTATION_ADDED:
