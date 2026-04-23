@@ -78,4 +78,27 @@ describe("PrettyMessagesView", () => {
     expect(screen.getByText("Test")).toBeInTheDocument();
     expect(screen.getByText("Reply")).toBeInTheDocument();
   });
+
+  it("should render OpenClaw sender metadata in the input card", () => {
+    const request = {
+      input: [
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "Hello from Telegram" }],
+        },
+      ],
+    };
+    const response = {
+      output_text: "Hi",
+    };
+    const metadata = {
+      spend_logs_metadata: {
+        openclaw_channel: "telegram",
+        openclaw_sender_username: "verify_user",
+      },
+    };
+
+    render(<PrettyMessagesView request={request} response={response} metadata={metadata} />);
+    expect(screen.getByText("From Telegram: @verify_user")).toBeInTheDocument();
+  });
 });

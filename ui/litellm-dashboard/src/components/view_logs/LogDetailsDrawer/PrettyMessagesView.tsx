@@ -4,7 +4,7 @@
  * Detects realtime API responses and renders a specialized view.
  */
 
-import { parseMessages } from './prettyMessagesUtils';
+import { extractOpenClawSenderInfo, parseMessages } from './prettyMessagesUtils';
 import { InputCard } from './InputCard';
 import { OutputCard } from './OutputCard';
 import { isRealtimeResponse, RealtimePrettyView } from './RealtimePrettyView';
@@ -12,6 +12,7 @@ import { isRealtimeResponse, RealtimePrettyView } from './RealtimePrettyView';
 interface PrettyMessagesViewProps {
   request: any;
   response: any;
+  metadata?: any;
   metrics?: {
     prompt_tokens?: number;
     completion_tokens?: number;
@@ -20,12 +21,13 @@ interface PrettyMessagesViewProps {
   };
 }
 
-export function PrettyMessagesView({ request, response, metrics }: PrettyMessagesViewProps) {
+export function PrettyMessagesView({ request, response, metadata, metrics }: PrettyMessagesViewProps) {
   if (isRealtimeResponse(response)) {
     return <RealtimePrettyView response={response} metrics={metrics} />;
   }
 
   const { requestMessages, responseMessage } = parseMessages(request, response);
+  const senderInfo = extractOpenClawSenderInfo(metadata);
 
   return (
     <div>
@@ -34,6 +36,7 @@ export function PrettyMessagesView({ request, response, metrics }: PrettyMessage
         messages={requestMessages}
         promptTokens={metrics?.prompt_tokens}
         inputCost={metrics?.input_cost}
+        senderInfo={senderInfo}
       />
 
       {/* Output Card */}

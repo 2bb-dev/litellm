@@ -20,6 +20,11 @@ export interface ParsedMessages {
   responseMessage: ParsedMessage | null;
 }
 
+export interface SenderInfo {
+  label: string;
+  channel?: string;
+}
+
 export interface RoleStyle {
   background: string;
   borderColor: string;

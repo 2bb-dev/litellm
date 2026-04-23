@@ -2,7 +2,7 @@
  * Utility functions for parsing and formatting messages for pretty view
  */
 
-import { ParsedMessage, ParsedMessages, RoleStyle, ToolCall } from './prettyMessagesTypes';
+import { ParsedMessage, ParsedMessages, RoleStyle, SenderInfo, ToolCall } from './prettyMessagesTypes';
 
 /**
  * Role color styles for message cards - minimal, professional design
@@ -50,6 +50,44 @@ const normalizeRole = (role: any): ParsedRole => {
     return role as ParsedRole;
   }
   return 'user';
+};
+
+const formatChannel = (channel: any): string | undefined => {
+  if (typeof channel !== 'string' || channel.length === 0) {
+    return undefined;
+  }
+  return channel.charAt(0).toUpperCase() + channel.slice(1);
+};
+
+/**
+ * Extract OpenClaw sender information from LiteLLM spend log metadata.
+ */
+export const extractOpenClawSenderInfo = (metadata: any): SenderInfo | undefined => {
+  const spendLogsMetadata = metadata?.spend_logs_metadata;
+  if (!spendLogsMetadata || typeof spendLogsMetadata !== 'object') {
+    return undefined;
+  }
+
+  const senderLabel = spendLogsMetadata.openclaw_sender_label;
+  const senderUsername = spendLogsMetadata.openclaw_sender_username;
+  const label =
+    (typeof senderLabel === 'string' && senderLabel.length > 0 && senderLabel) ||
+    (typeof senderUsername === 'string' && senderUsername.length > 0
+      ? senderUsername.startsWith('@')
+        ? senderUsername
+        : `@${senderUsername}`
+      : undefined) ||
+    spendLogsMetadata.openclaw_user_id ||
+    spendLogsMetadata.openclaw_sender_id;
+
+  if (typeof label !== 'string' || label.length === 0) {
+    return undefined;
+  }
+
+  return {
+    label,
+    channel: formatChannel(spendLogsMetadata.openclaw_channel),
+  };
 };
 
 /**
@@ -189,7 +227,9 @@ const parseResponseMessage = (response: any): ParsedMessage | null => {
     };
   }
 
-  // Responses API: { output: [ { type: "message", content: [{ type: "output_text", text }] }, { type: "function_call", ... } ] }
+  // Responses API: prefer visible assistant text. Reasoning items are intentionally
+  // skipped because they are not the user-visible answer.
+  const responseOutputText = typeof response.output_text === 'string' ? response.output_text : '';
   if (Array.isArray(response.output) && response.output.length > 0) {
     const textParts: string[] = [];
     const toolCalls: ToolCall[] = [];
@@ -203,12 +243,14 @@ const parseResponseMessage = (response: any): ParsedMessage | null => {
         });
         return;
       }
-      // Message or reasoning item with content parts.
+      if (item.type === 'reasoning') {
+        return;
+      }
       const rendered = parseMessageContent(item.content);
       if (rendered) textParts.push(rendered);
     });
 
-    const content = textParts.join('\n') || (typeof response.output_text === 'string' ? response.output_text : '');
+    const content = responseOutputText || textParts.join('\n');
     if (content || toolCalls.length > 0) {
       return {
         role: 'assistant',
@@ -219,8 +261,8 @@ const parseResponseMessage = (response: any): ParsedMessage | null => {
   }
 
   // Responses API fallback: convenience field `output_text` only.
-  if (typeof response.output_text === 'string' && response.output_text.length > 0) {
-    return { role: 'assistant', content: response.output_text };
+  if (responseOutputText.length > 0) {
+    return { role: 'assistant', content: responseOutputText };
   }
 
   return null;

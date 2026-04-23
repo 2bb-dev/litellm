@@ -415,6 +415,7 @@ function RequestResponseSection({
                   <PrettyMessagesView
                     request={getRawRequest()}
                     response={getFormattedResponse()}
+                    metadata={logEntry.metadata}
                     metrics={{
                       prompt_tokens: promptTokens,
                       completion_tokens: completionTokens,

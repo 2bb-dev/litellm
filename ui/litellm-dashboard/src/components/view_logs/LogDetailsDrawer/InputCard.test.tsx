@@ -91,6 +91,47 @@ describe("InputCard", () => {
     expect(screen.getByText("What is the weather?")).toBeInTheDocument();
   });
 
+  it("should display the last real user message instead of trailing tool output", () => {
+    const messages: ParsedMessage[] = [
+      {
+        role: "user",
+        content: "Please update the import logic",
+      },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          {
+            id: "call-1",
+            name: "edit_file",
+            arguments: { path: "script.py" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: "Successfully replaced 6 blocks",
+        toolCallId: "call-1",
+      },
+    ];
+    render(<InputCard messages={messages} />);
+    expect(screen.getByText("Please update the import logic")).toBeInTheDocument();
+    expect(screen.getByText("HISTORY (2 messages)")).toBeInTheDocument();
+  });
+
+  it("should display OpenClaw sender information when provided", () => {
+    render(
+      <InputCard
+        messages={mockMessages}
+        senderInfo={{
+          channel: "Telegram",
+          label: "@verify_user",
+        }}
+      />,
+    );
+    expect(screen.getByText("From Telegram: @verify_user")).toBeInTheDocument();
+  });
+
   it("should display token count when provided", () => {
     render(<InputCard messages={mockMessages} promptTokens={150} />);
     expect(screen.getByText(/Tokens: 150/)).toBeInTheDocument();

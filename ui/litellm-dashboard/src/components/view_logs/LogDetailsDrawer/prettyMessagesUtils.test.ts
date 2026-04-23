@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseMessages } from "./prettyMessagesUtils";
+import { extractOpenClawSenderInfo, parseMessages } from "./prettyMessagesUtils";
 
 describe("parseMessages - Chat Completions", () => {
   it("parses messages[] request and choices[0].message response", () => {
@@ -106,6 +106,43 @@ describe("parseMessages - Responses API", () => {
     });
   });
 
+  it("prefers response.output_text over heavy output[] fields", () => {
+    const { responseMessage } = parseMessages(
+      {},
+      {
+        output_text: "Visible answer",
+        output: [
+          {
+            type: "reasoning",
+            content: [{ type: "output_text", text: "Hidden reasoning" }],
+          },
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Nested answer" }],
+          },
+        ],
+      },
+    );
+    expect(responseMessage?.content).toBe("Visible answer");
+  });
+
+  it("falls back to output[].content[].text when output_text is missing", () => {
+    const { responseMessage } = parseMessages(
+      {},
+      {
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Nested answer" }],
+          },
+        ],
+      },
+    );
+    expect(responseMessage?.content).toBe("Nested answer");
+  });
+
   it("extracts function_call items from response.output[] as tool calls", () => {
     const { responseMessage } = parseMessages(
       {},
@@ -177,6 +214,36 @@ describe("parseMessages - Responses API", () => {
   it("returns null response when neither choices nor output is present", () => {
     const { responseMessage } = parseMessages({}, { status: "completed" });
     expect(responseMessage).toBeNull();
+  });
+});
+
+describe("extractOpenClawSenderInfo", () => {
+  it("extracts Mattermost sender labels from spend log metadata", () => {
+    expect(
+      extractOpenClawSenderInfo({
+        spend_logs_metadata: {
+          openclaw_channel: "mattermost",
+          openclaw_sender_label: "@abramov (tmbrrfprofbn8y81yaoxm47ygw)",
+        },
+      }),
+    ).toEqual({
+      channel: "Mattermost",
+      label: "@abramov (tmbrrfprofbn8y81yaoxm47ygw)",
+    });
+  });
+
+  it("formats Telegram username fallback with an @ prefix", () => {
+    expect(
+      extractOpenClawSenderInfo({
+        spend_logs_metadata: {
+          openclaw_channel: "telegram",
+          openclaw_sender_username: "verify_user",
+        },
+      }),
+    ).toEqual({
+      channel: "Telegram",
+      label: "@verify_user",
+    });
   });
 });
 
