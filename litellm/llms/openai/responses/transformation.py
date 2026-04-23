@@ -188,6 +188,7 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         # Store processed headers in additional_headers so they get returned to the client
         response._hidden_params["additional_headers"] = processed_headers
         response._hidden_params["headers"] = raw_response_headers
+        response._hidden_params["original_response"] = raw_response.text
         return response
 
     def validate_environment(
@@ -426,6 +427,7 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         response = ResponsesAPIResponse(**raw_response_json)
         response._hidden_params["additional_headers"] = processed_headers
         response._hidden_params["headers"] = raw_response_headers
+        response._hidden_params["original_response"] = raw_response.text
 
         return response
 
@@ -510,6 +512,7 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         response = ResponsesAPIResponse(**raw_response_json)
         response._hidden_params["additional_headers"] = processed_headers
         response._hidden_params["headers"] = raw_response_headers
+        response._hidden_params["original_response"] = raw_response.text
 
         return response
 
@@ -579,5 +582,6 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
 
         response._hidden_params["additional_headers"] = processed_headers
         response._hidden_params["headers"] = raw_response_headers
+        response._hidden_params["original_response"] = raw_response.text
 
         return response

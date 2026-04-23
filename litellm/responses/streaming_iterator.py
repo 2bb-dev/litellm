@@ -141,6 +141,10 @@ class BaseResponsesAPIStreamingIterator:
         if isinstance(output_index, int):
             self._stream_output_item_indices[item_id] = output_index
 
+    @staticmethod
+    def _is_valid_stream_item_id(item_id: Any) -> bool:
+        return isinstance(item_id, str) and bool(item_id)
+
     def _set_stream_content_part(
         self, item_id: str, content_index: int, part: Dict[str, Any]
     ) -> None:
@@ -162,7 +166,7 @@ class BaseResponsesAPIStreamingIterator:
         ):
             item = self._stream_obj_to_dict(getattr(event, "item", None))
             item_id = item.get("id")
-            if item_id:
+            if self._is_valid_stream_item_id(item_id):
                 if item_id not in self._stream_output_item_order:
                     self._stream_output_item_order.append(item_id)
                 self._stream_output_items[item_id] = item
@@ -176,7 +180,7 @@ class BaseResponsesAPIStreamingIterator:
             ResponsesAPIStreamEvents.CONTENT_PART_DONE,
         ):
             item_id = getattr(event, "item_id", None)
-            if not item_id:
+            if not self._is_valid_stream_item_id(item_id):
                 return
             self._set_stream_output_index(item_id, getattr(event, "output_index", None))
             content_index = int(getattr(event, "content_index", 0) or 0)
@@ -186,7 +190,7 @@ class BaseResponsesAPIStreamingIterator:
 
         if event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA:
             item_id = getattr(event, "item_id", None)
-            if not item_id:
+            if not self._is_valid_stream_item_id(item_id):
                 return
             self._set_stream_output_index(item_id, getattr(event, "output_index", None))
             content_index = int(getattr(event, "content_index", 0) or 0)
@@ -212,7 +216,7 @@ class BaseResponsesAPIStreamingIterator:
 
         if event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE:
             item_id = getattr(event, "item_id", None)
-            if not item_id:
+            if not self._is_valid_stream_item_id(item_id):
                 return
             self._set_stream_output_index(item_id, getattr(event, "output_index", None))
             content_index = int(getattr(event, "content_index", 0) or 0)
@@ -234,7 +238,7 @@ class BaseResponsesAPIStreamingIterator:
 
         if event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_ANNOTATION_ADDED:
             item_id = getattr(event, "item_id", None)
-            if not item_id:
+            if not self._is_valid_stream_item_id(item_id):
                 return
             self._set_stream_output_index(item_id, getattr(event, "output_index", None))
             content_index = int(getattr(event, "content_index", 0) or 0)
@@ -262,7 +266,7 @@ class BaseResponsesAPIStreamingIterator:
 
         if event_type == ResponsesAPIStreamEvents.REFUSAL_DELTA:
             item_id = getattr(event, "item_id", None)
-            if not item_id:
+            if not self._is_valid_stream_item_id(item_id):
                 return
             self._set_stream_output_index(item_id, getattr(event, "output_index", None))
             content_index = int(getattr(event, "content_index", 0) or 0)
@@ -283,7 +287,7 @@ class BaseResponsesAPIStreamingIterator:
 
         if event_type == ResponsesAPIStreamEvents.REFUSAL_DONE:
             item_id = getattr(event, "item_id", None)
-            if not item_id:
+            if not self._is_valid_stream_item_id(item_id):
                 return
             self._set_stream_output_index(item_id, getattr(event, "output_index", None))
             content_index = int(getattr(event, "content_index", 0) or 0)
@@ -298,17 +302,20 @@ class BaseResponsesAPIStreamingIterator:
             )
 
     def _maybe_backfill_terminal_response_output(self, event: Any) -> None:
-        if not self._stream_output_item_order:
-            return
-
         response = getattr(event, "response", None)
         if response is None:
             return
 
         existing_output = (
-            response.get("output") if isinstance(response, dict) else getattr(response, "output", None)
+            response.get("output")
+            if isinstance(response, dict)
+            else getattr(response, "output", None)
         )
         if existing_output:
+            self._maybe_set_response_output_text(response, existing_output)
+            return
+
+        if not self._stream_output_item_order:
             return
 
         ordered_ids = sorted(
@@ -332,6 +339,53 @@ class BaseResponsesAPIStreamingIterator:
             response["output"] = patched_output
         else:
             setattr(response, "output", patched_output)
+        self._maybe_set_response_output_text(response, patched_output)
+
+    @staticmethod
+    def _extract_text_from_output_items(output_items: Any) -> str:
+        if not isinstance(output_items, list):
+            return ""
+
+        text_parts: List[str] = []
+        for item in output_items:
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                content = item.get("content") or []
+            else:
+                item_type = getattr(item, "type", None)
+                content = getattr(item, "content", None) or []
+
+            if item_type != "message" or not isinstance(content, list):
+                continue
+
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                    text = part.get("text")
+                else:
+                    part_type = getattr(part, "type", None)
+                    text = getattr(part, "text", None)
+                if part_type == "output_text" and text:
+                    text_parts.append(str(text))
+
+        return "".join(text_parts)
+
+    def _maybe_set_response_output_text(
+        self, response: Any, output_items: Any
+    ) -> None:
+        output_text = self._extract_text_from_output_items(output_items)
+        if not output_text:
+            return
+
+        if isinstance(response, dict):
+            response.setdefault("output_text", output_text)
+            return
+
+        # ResponsesAPIResponse exposes output_text as a read-only convenience
+        # property, so store the serialized value as a Pydantic extra field.
+        pydantic_extra = getattr(response, "__pydantic_extra__", None)
+        if isinstance(pydantic_extra, dict) and "output_text" not in pydantic_extra:
+            pydantic_extra["output_text"] = output_text
 
     def _process_chunk(self, chunk) -> Optional[ResponsesAPIStreamingResponse]:
         """Process a single chunk of data from the stream"""

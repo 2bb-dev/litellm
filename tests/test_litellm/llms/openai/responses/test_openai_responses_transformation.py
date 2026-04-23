@@ -149,6 +149,64 @@ class TestOpenAIResponsesAPIConfig:
             assert result.type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
             assert result.response.id == "resp_123"
 
+    @pytest.mark.parametrize(
+        "transformer_name, extra_kwargs",
+        [
+            ("transform_response_api_response", {"model": "gpt-5.4"}),
+            ("transform_get_response_api_response", {}),
+            ("transform_cancel_response_api_response", {}),
+            ("transform_compact_response_api_response", {}),
+        ],
+    )
+    def test_response_transforms_store_original_response(
+        self, transformer_name, extra_kwargs
+    ):
+        raw_json = {
+            "id": "resp_123",
+            "created_at": 1700000000,
+            "model": "gpt-5.4",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_123",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Hello from the upstream response body",
+                            "annotations": [],
+                        }
+                    ],
+                }
+            ],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 12,
+                "total_tokens": 22,
+            },
+        }
+        raw_response = httpx.Response(
+            200,
+            json=raw_json,
+            headers={"x-request-id": "req_123", "content-type": "application/json"},
+        )
+
+        response = getattr(self.config, transformer_name)(
+            raw_response=raw_response,
+            logging_obj=self.logging_obj,
+            **extra_kwargs,
+        )
+
+        assert (
+            response.output[0].content[0].text
+            == "Hello from the upstream response body"
+        )
+        assert response._hidden_params["headers"]["x-request-id"] == "req_123"
+        assert response._hidden_params["original_response"] == raw_response.text
+
     @pytest.mark.serial
     def test_validate_environment(self):
         """Test that validate_environment correctly sets the Authorization header"""

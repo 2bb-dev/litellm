@@ -186,10 +186,14 @@ class TestBaseResponsesAPIStreamingIterator:
         mock_logging_obj.model_call_details = {"litellm_params": {}}
         mock_config = Mock(spec=BaseResponsesAPIConfig)
 
-        completed_response = Mock(spec=ResponsesAPIResponse)
-        completed_response.id = "resp_terminal_123"
-        completed_response.output = []
-        completed_response.usage = None
+        completed_response = ResponsesAPIResponse(
+            id="resp_terminal_123",
+            created_at=1700000000,
+            object="response",
+            status="completed",
+            output=[],
+            usage=None,
+        )
 
         output_item_added_event = Mock()
         output_item_added_event.type = ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
@@ -293,6 +297,8 @@ class TestBaseResponsesAPIStreamingIterator:
                 "content": [{"type": "output_text", "text": "Hello world"}],
             }
         ]
+        assert completed_response.output_text == "Hello world"
+        assert completed_response.model_dump()["output_text"] == "Hello world"
 
     def test_process_chunk_preserves_annotations_through_output_text_done(self):
         """
@@ -306,10 +312,14 @@ class TestBaseResponsesAPIStreamingIterator:
         mock_logging_obj.model_call_details = {"litellm_params": {}}
         mock_config = Mock(spec=BaseResponsesAPIConfig)
 
-        completed_response = Mock(spec=ResponsesAPIResponse)
-        completed_response.id = "resp_terminal_456"
-        completed_response.output = []
-        completed_response.usage = None
+        completed_response = ResponsesAPIResponse(
+            id="resp_terminal_456",
+            created_at=1700000000,
+            object="response",
+            status="completed",
+            output=[],
+            usage=None,
+        )
 
         output_item_added_event = Mock()
         output_item_added_event.type = ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
@@ -465,6 +475,66 @@ class TestBaseResponsesAPIStreamingIterator:
                 ],
             }
         ]
+        assert completed_response.output_text == "See source"
+        assert completed_response.model_dump()["output_text"] == "See source"
+
+    def test_process_chunk_adds_serialized_output_text_for_nonempty_terminal_output(self):
+        """
+        If response.completed already includes output, logging should still persist
+        the top-level output_text convenience field for LiteLLM UI detail views.
+        """
+        mock_response = Mock()
+        mock_response.headers = {}
+        mock_logging_obj = Mock(spec=LiteLLMLoggingObj)
+        mock_logging_obj.model_call_details = {"litellm_params": {}}
+        mock_config = Mock(spec=BaseResponsesAPIConfig)
+
+        completed_response = ResponsesAPIResponse(
+            id="resp_terminal_with_output",
+            created_at=1700000000,
+            object="response",
+            status="completed",
+            output=[
+                {
+                    "id": "msg_123",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Already here"}],
+                }
+            ],
+        )
+
+        completed_event = Mock(spec=ResponseCompletedEvent)
+        completed_event.type = ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+        completed_event.response = completed_response
+        mock_config.transform_streaming_response.return_value = completed_event
+
+        iterator = BaseResponsesAPIStreamingIterator(
+            response=mock_response,
+            model="gpt-4",
+            responses_api_provider_config=mock_config,
+            logging_obj=mock_logging_obj,
+            litellm_metadata={"model_info": {"id": "model_123"}},
+            custom_llm_provider="openai",
+        )
+
+        with patch.object(
+            ResponsesAPIRequestUtils,
+            "_update_responses_api_response_id_with_model_id",
+            return_value=completed_response,
+        ):
+            result = iterator._process_chunk(
+                json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": completed_response.model_dump(),
+                    }
+                )
+            )
+
+        assert result is completed_event
+        assert completed_response.output_text == "Already here"
+        assert completed_response.model_dump()["output_text"] == "Already here"
 
     def test_process_chunk_handles_invalid_json(self):
         """
