@@ -282,8 +282,13 @@ what can you do?
     )
     assert metadata["openclaw_sender_username"] == "on_the_r0ad"
     assert metadata["openclaw_sender_label"] == "sashi (952754559)"
+    assert metadata["openclaw_actor_id"] == "telegram:952754559"
+    assert metadata["openclaw_actor_type"] == "human"
+    assert metadata["openclaw_execution_type"] == "direct"
     assert metadata["openclaw_conversation_group_channel"] == "telegram:-1001234567890"
     assert metadata["spend_logs_metadata"]["openclaw_sender_id"] == "952754559"
+    assert metadata["spend_logs_metadata"]["openclaw_actor_type"] == "human"
+    assert metadata["spend_logs_metadata"]["openclaw_execution_type"] == "direct"
     assert (
         metadata["spend_logs_metadata"]["openclaw_session_id"]
         == "openclaw:telegram:-1001234567890:topic:777"
@@ -1078,6 +1083,9 @@ hello
     spend_meta = metadata["spend_logs_metadata"]
     assert spend_meta["openclaw_channel"] == "mattermost"
     assert spend_meta["openclaw_sender_id"] == "pwanex3ne3fx58nr5oaxg4j54w"
+    assert spend_meta["openclaw_actor_id"] == "mattermost:pwanex3ne3fx58nr5oaxg4j54w"
+    assert spend_meta["openclaw_actor_type"] == "human"
+    assert spend_meta["openclaw_execution_type"] == "direct"
 
 
 @pytest.mark.asyncio
