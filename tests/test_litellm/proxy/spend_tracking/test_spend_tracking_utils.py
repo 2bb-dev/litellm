@@ -5,6 +5,7 @@ import os
 import sys
 from datetime import timezone
 from typing import Any, cast
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -58,6 +59,94 @@ def test_get_session_id_for_spend_log_prefers_metadata_session_id():
     )
 
     assert session_id == "openclaw:telegram:-1001234567890:topic:777"
+
+
+def test_get_session_id_for_spend_log_preserves_metadata_session_id_for_openclaw_heartbeat():
+    heartbeat_session_id = "openclaw:heartbeat:78e07fa4-487b-483a-857a-7684fdc3ad03"
+    standard_logging_payload = cast(
+        StandardLoggingPayload,
+        {
+            "metadata": {
+                "session_id": heartbeat_session_id,
+                "spend_logs_metadata": {"openclaw_heartbeat": True},
+            },
+            "trace_id": "trace-123",
+        },
+    )
+
+    session_id = _get_session_id_for_spend_log(
+        kwargs={},
+        standard_logging_payload=standard_logging_payload,
+    )
+
+    assert session_id == heartbeat_session_id
+
+
+def test_get_session_id_for_spend_log_generates_uuid_for_openclaw_heartbeat_without_unique_session_id():
+    request_id = "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVy"
+    standard_logging_payload = cast(
+        StandardLoggingPayload,
+        {
+            "metadata": {
+                "session_id": f"openclaw:heartbeat:{request_id}",
+                "spend_logs_metadata": {"openclaw_heartbeat": True},
+            },
+            "trace_id": "trace-123",
+        },
+    )
+
+    session_id = _get_session_id_for_spend_log(
+        kwargs={"id": request_id},
+        standard_logging_payload=standard_logging_payload,
+    )
+
+    assert session_id.startswith("openclaw:heartbeat:")
+    UUID(session_id.rsplit(":", 1)[1])
+    assert request_id not in session_id
+
+
+def test_get_session_id_for_spend_log_preserves_metadata_session_id_for_openclaw_human():
+    human_session_id = "openclaw:human:78e07fa4-487b-483a-857a-7684fdc3ad03"
+    standard_logging_payload = cast(
+        StandardLoggingPayload,
+        {
+            "metadata": {
+                "session_id": human_session_id,
+                "spend_logs_metadata": {"openclaw_actor_type": "human"},
+            },
+            "trace_id": "trace-123",
+        },
+    )
+
+    session_id = _get_session_id_for_spend_log(
+        kwargs={},
+        standard_logging_payload=standard_logging_payload,
+    )
+
+    assert session_id == human_session_id
+
+
+def test_get_session_id_for_spend_log_generates_uuid_for_openclaw_human_without_unique_session_id():
+    old_session_id = "openclaw:#cw8r1sen13nczfytc5ptgish3e__ijktuj13i3d9ucsi9uk8ic79ha"
+    standard_logging_payload = cast(
+        StandardLoggingPayload,
+        {
+            "metadata": {
+                "session_id": old_session_id,
+                "spend_logs_metadata": {"openclaw_actor_type": "human"},
+            },
+            "trace_id": "trace-123",
+        },
+    )
+
+    session_id = _get_session_id_for_spend_log(
+        kwargs={},
+        standard_logging_payload=standard_logging_payload,
+    )
+
+    assert session_id.startswith("openclaw:human:")
+    UUID(session_id.rsplit(":", 1)[1])
+    assert session_id != old_session_id
 
 
 def test_get_session_id_for_spend_log_prefers_kwargs_metadata_session_id():
