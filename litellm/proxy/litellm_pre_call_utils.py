@@ -432,6 +432,17 @@ def _resolve_openclaw_trusted_inbound_channel(data: dict) -> Optional[str]:
 def _is_openclaw_subagent_request(data: dict) -> bool:
     """Detect OpenClaw subagent requests from current and legacy templates."""
 
+    for metadata_key in ("metadata", "litellm_metadata"):
+        metadata = data.get(metadata_key)
+        if not isinstance(metadata, dict):
+            continue
+        tags = metadata.get("tags")
+        if not isinstance(tags, list):
+            continue
+        for tag in tags:
+            if isinstance(tag, str) and tag.lower() == OPENCLAW_SUB_AGENT_TAG:
+                return True
+
     has_context_marker = False
     has_task_marker = False
     for text in _iter_openclaw_input_content_texts(data):

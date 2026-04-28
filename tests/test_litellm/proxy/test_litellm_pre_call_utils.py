@@ -1681,6 +1681,54 @@ async def test_add_litellm_data_to_request_tags_openclaw_subagent_messages_templ
 
 
 @pytest.mark.asyncio
+async def test_add_litellm_data_to_request_uses_subagent_tag_when_prompt_markers_absent():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/responses"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {
+        "Content-Type": "application/json",
+        "user-agent": "OpenAI",
+    }
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    data = {
+        "model": "gpt-4o-mini",
+        "litellm_metadata": {"tags": ["subagent"]},
+        "input": [
+            {
+                "role": "user",
+                "content": "Summarize current task state.",
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={"allow_client_tags": True},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["tags"] == ["subagent"]
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["spend_logs_metadata"]["openclaw_execution_type"] == "subagent"
+
+
+@pytest.mark.asyncio
 async def test_add_litellm_data_to_request_openclaw_current_subagent_template_links_parent_and_child_sessions():
     request_mock = MagicMock(spec=Request)
     request_mock.url.path = "/responses"
