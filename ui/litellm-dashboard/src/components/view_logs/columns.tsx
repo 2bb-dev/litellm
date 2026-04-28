@@ -114,7 +114,7 @@ function openClawValue(row: LogEntry, key: string): string {
 }
 
 function conversationId(row: LogEntry): string {
-  return openClawValue(row, "openclaw_session_id") || row.session_id || "";
+  return openClawValue(row, "openclaw_session_id");
 }
 
 function executionId(row: LogEntry): string {
@@ -147,6 +147,10 @@ function executionType(row: LogEntry): string {
 
 function isUuidOnlySession(row: LogEntry): boolean {
   return Boolean(row.session_id?.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) && !openClawValue(row, "openclaw_session_id");
+}
+
+function storedSessionId(row: LogEntry): string {
+  return row.session_id || "";
 }
 
 export const createColumns = (sortProps?: LogsSortProps): ColumnDef<LogEntry>[] => [
@@ -203,6 +207,7 @@ export const createColumns = (sortProps?: LogsSortProps): ColumnDef<LogEntry>[] 
     cell: (info: any) => {
       const row = info.row.original as LogEntry;
       const value = conversationId(row);
+      const clickSessionId = storedSessionId(row);
       const onSessionClick = info.row.original.onSessionClick;
       return (
         <Tooltip title={value || "No OpenClaw conversation id"}>
@@ -210,7 +215,8 @@ export const createColumns = (sortProps?: LogsSortProps): ColumnDef<LogEntry>[] 
             size="xs"
             variant="light"
             className="font-mono text-blue-500 bg-blue-50 hover:bg-blue-100 text-xs font-normal text-xs max-w-[15ch] truncate block"
-            onClick={() => onSessionClick?.(value)}
+            disabled={!value || !clickSessionId}
+            onClick={() => onSessionClick?.(clickSessionId)}
           >
             {value || "-"}
           </Button>

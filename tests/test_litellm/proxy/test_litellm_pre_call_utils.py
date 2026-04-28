@@ -1089,6 +1089,75 @@ hello
 
 
 @pytest.mark.asyncio
+async def test_add_litellm_data_to_request_uses_actor_specific_id_for_subagents():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/responses"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    inbound_text = """Conversation info (untrusted metadata):
+```json
+{
+  "sender_id": "human-mm-id",
+  "group_channel": "#team-channel",
+  "human_user_id": "mattermost:human-mm-id"
+}
+```
+
+Sender (untrusted metadata):
+```json
+{
+  "id": "human-mm-id",
+  "name": "@human",
+  "agent_role": "subagent",
+  "agent_id": "research-worker-1"
+}
+```
+
+hello
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": inbound_text}],
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    spend_meta = metadata["spend_logs_metadata"]
+    assert metadata["openclaw_user_id"] == "mattermost:human-mm-id"
+    assert metadata["openclaw_parent_user_id"] == "mattermost:human-mm-id"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["openclaw_actor_id"] == "subagent:research-worker-1"
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert spend_meta["openclaw_actor_id"] == "subagent:research-worker-1"
+
+
+@pytest.mark.asyncio
 async def test_add_litellm_data_to_request_extracts_openclaw_observability_metadata_mattermost_input():
     request_mock = MagicMock(spec=Request)
     request_mock.url.path = "/responses"

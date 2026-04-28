@@ -48,9 +48,22 @@ export interface PaginatedResponse {
   total_pages: number;
 }
 
+function openClawMetadataValue(log: LogEntry, key: string): unknown {
+  const metadata = log.metadata ?? {};
+  const spendMetadata = metadata.spend_logs_metadata;
+  if (
+    spendMetadata &&
+    typeof spendMetadata === "object" &&
+    !Array.isArray(spendMetadata) &&
+    (spendMetadata as Record<string, unknown>)[key] != null
+  ) {
+    return (spendMetadata as Record<string, unknown>)[key];
+  }
+  return (metadata as Record<string, unknown>)[key];
+}
+
 function hasOpenClawConversation(log: LogEntry): boolean {
-  const metadata = log.metadata?.spend_logs_metadata ?? log.metadata ?? {};
-  return Boolean(metadata.openclaw_session_id);
+  return Boolean(openClawMetadataValue(log, "openclaw_session_id"));
 }
 
 function isUuidOnlySession(log: LogEntry): boolean {
