@@ -8,7 +8,10 @@ sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
 
-from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
+from litellm.litellm_core_utils.safe_json_dumps import (
+    safe_dumps,
+    strip_null_characters,
+)
 
 
 def test_primitive_types():
@@ -27,6 +30,24 @@ def test_nested_structures():
     assert result["name"] == "test"
     assert result["numbers"] == [1, 2, 3]
     assert result["nested"] == {"a": 1, "b": 2}
+
+
+def test_null_characters_are_removed_from_json_strings():
+    data = {
+        "bad\x00key": "hello\x00world",
+        "nested": [{"value": "a\x00b"}],
+    }
+
+    json_dump = safe_dumps(data)
+    result = json.loads(json_dump)
+
+    assert "\x00" not in json_dump
+    assert "\\u0000" not in json_dump
+    assert result == {"badkey": "helloworld", "nested": [{"value": "ab"}]}
+
+
+def test_strip_null_characters():
+    assert strip_null_characters("a\x00b\x00c") == "abc"
 
 
 def test_circular_reference():

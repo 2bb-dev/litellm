@@ -24,7 +24,10 @@ from litellm.litellm_core_utils.core_helpers import (
     get_litellm_metadata_from_kwargs,
     reconstruct_model_name,
 )
-from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
+from litellm.litellm_core_utils.safe_json_dumps import (
+    safe_dumps,
+    strip_null_characters,
+)
 from litellm.proxy._types import SpendLogsMetadata, SpendLogsPayload
 from litellm.proxy.utils import PrismaClient, hash_token
 from litellm.types.utils import (
@@ -747,7 +750,7 @@ def _get_messages_for_spend_logs_payload(
                 messages = standard_logging_payload.get("messages")
                 if messages is not None:
                     try:
-                        return json.dumps(messages, default=str)
+                        return safe_dumps(messages)
                     except Exception:
                         return "{}"
     return "{}"
@@ -930,7 +933,7 @@ def _get_proxy_server_request_for_spend_logs_payload(
                     perform_redaction(model_call_details=_request_body, result=None)
 
             _request_body = _sanitize_request_body_for_spend_logs_payload(_request_body)
-            _request_body_json_str = json.dumps(_request_body, default=str)
+            _request_body_json_str = safe_dumps(_request_body)
             if LITELLM_TRUNCATED_PAYLOAD_FIELD in _request_body_json_str:
                 verbose_proxy_logger.info(
                     "Spend Log: request body was truncated before storing in DB. %s",
@@ -1013,7 +1016,7 @@ def _get_response_for_spend_logs_payload(
         if sanitized_response is None:
             return "{}"
         if isinstance(sanitized_response, str):
-            result_str = sanitized_response
+            result_str = strip_null_characters(sanitized_response)
         else:
             result_str = safe_dumps(sanitized_response)
         if LITELLM_TRUNCATED_PAYLOAD_FIELD in result_str:
