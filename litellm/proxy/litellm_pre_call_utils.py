@@ -285,27 +285,33 @@ def _iter_openclaw_candidate_texts(
 def _iter_openclaw_input_content_texts(
     data: dict, allowed_roles: Optional[set] = None
 ):
-    input_value = data.get("input")
-    if not isinstance(input_value, list):
-        return
-
-    for item in input_value:
-        if not isinstance(item, dict):
+    for payload_key in ("input", "messages"):
+        payload_value = data.get(payload_key)
+        if not isinstance(payload_value, list):
             continue
+        for item in payload_value:
+            yield from _iter_openclaw_content_item_texts(item, allowed_roles)
+
+
+def _iter_openclaw_content_item_texts(
+    item: Any, allowed_roles: Optional[set] = None
+):
+        if not isinstance(item, dict):
+            return
         role = item.get("role")
         if allowed_roles is not None and role not in allowed_roles:
-            continue
+            return
         content = item.get("content")
         if isinstance(content, str):
             yield content
-            continue
+            return
         if isinstance(content, dict):
             text = content.get("text")
             if isinstance(text, str):
                 yield text
-            continue
+            return
         if not isinstance(content, list):
-            continue
+            return
         for content_item in content:
             if isinstance(content_item, str):
                 yield content_item

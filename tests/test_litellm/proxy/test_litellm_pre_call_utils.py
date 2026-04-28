@@ -1299,6 +1299,61 @@ HEARTBEAT_OK
 
 
 @pytest.mark.asyncio
+async def test_add_litellm_data_to_request_marks_openclaw_heartbeat_from_trusted_messages_context():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    system_text = """## Inbound Context (trusted metadata)
+```json
+{
+  "schema": "openclaw.inbound_meta.v2",
+  "channel": "heartbeat",
+  "provider": "heartbeat",
+  "chat_type": "direct"
+}
+```
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": system_text,
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    assert metadata["openclaw_heartbeat"] is True
+    assert metadata["openclaw_channel"] == "heartbeat"
+    assert metadata["openclaw_execution_type"] == "heartbeat"
+    assert metadata["session_id"].startswith("openclaw:heartbeat:")
+
+
+@pytest.mark.asyncio
 async def test_add_litellm_data_to_request_tags_openclaw_channel_from_trusted_input_context():
     request_mock = MagicMock(spec=Request)
     request_mock.url.path = "/responses"
@@ -1506,6 +1561,52 @@ async def test_add_litellm_data_to_request_tags_openclaw_subagent_template_witho
     assert metadata["session_id"] == requester_session_id
     assert updated_data["litellm_session_id"] == requester_session_id
     assert metadata["tags"] == ["0: User-Agent: OpenAI", "subagent"]
+    assert "openclaw_session_id" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_tags_openclaw_subagent_messages_template():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    data = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "[Subagent Context] You are a subagent.\n"
+                    "[Subagent Task]: inspect and report."
+                ),
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    assert metadata["tags"] == ["subagent"]
+    assert "session_id" not in metadata
     assert "openclaw_session_id" not in metadata
 
 
