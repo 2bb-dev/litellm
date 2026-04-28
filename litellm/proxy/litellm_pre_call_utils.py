@@ -117,6 +117,16 @@ OPENCLAW_HUMAN_SESSION_ID = f"{OPENCLAW_SESSION_PREFIX}:human"
 OPENCLAW_SUB_AGENT_TAG = "subagent"
 OPENCLAW_SUBAGENT_CONTEXT_MARKER = "[Subagent Context]"
 OPENCLAW_SUBAGENT_TASK_MARKER = "[Subagent Task]"
+OPENCLAW_SUBAGENT_SYSTEM_HEADING = "# Subagent Context"
+OPENCLAW_SUBAGENT_SPAWNED_MARKER = "You are a **subagent** spawned"
+_OPENCLAW_SUBAGENT_REQUESTER_SESSION_RE = re.compile(
+    r"^\s*-\s*Requester session:\s*([^\n.]+)\.?\s*$",
+    re.MULTILINE,
+)
+_OPENCLAW_SUBAGENT_CHILD_SESSION_RE = re.compile(
+    r"^\s*-\s*Your session:\s*([^\n.]+)\.?\s*$",
+    re.MULTILINE,
+)
 
 
 def _get_metadata_variable_name(request: Request) -> str:
@@ -420,11 +430,21 @@ def _resolve_openclaw_trusted_inbound_channel(data: dict) -> Optional[str]:
 
 
 def _is_openclaw_subagent_request(data: dict) -> bool:
-    """Detect OpenClaw subagent task requests from the user input template."""
+    """Detect OpenClaw subagent requests from current and legacy templates."""
 
     has_context_marker = False
     has_task_marker = False
-    for text in _iter_openclaw_input_content_texts(data, allowed_roles={"user"}):
+    for text in _iter_openclaw_input_content_texts(data):
+        if (
+            OPENCLAW_SUBAGENT_SYSTEM_HEADING in text
+            and OPENCLAW_SUBAGENT_SPAWNED_MARKER in text
+        ):
+            return True
+        if (
+            OPENCLAW_SUBAGENT_CONTEXT_MARKER in text
+            and "running as a subagent" in text.lower()
+        ):
+            return True
         if OPENCLAW_SUBAGENT_CONTEXT_MARKER in text:
             has_context_marker = True
         if OPENCLAW_SUBAGENT_TASK_MARKER in text:
@@ -432,6 +452,33 @@ def _is_openclaw_subagent_request(data: dict) -> bool:
         if has_context_marker and has_task_marker:
             return True
     return False
+
+
+def _extract_openclaw_subagent_session_context(data: dict) -> dict:
+    """Extract parent/child session keys from OpenClaw subagent prompt text."""
+
+    context: Dict[str, str] = {}
+    for text in _iter_openclaw_input_content_texts(data):
+        requester_match = _OPENCLAW_SUBAGENT_REQUESTER_SESSION_RE.search(text)
+        if requester_match and "parent_session_id" not in context:
+            parent_session_id = _normalize_openclaw_observability_string(
+                requester_match.group(1), max_length=200
+            )
+            if parent_session_id is not None:
+                context["parent_session_id"] = parent_session_id
+
+        child_match = _OPENCLAW_SUBAGENT_CHILD_SESSION_RE.search(text)
+        if child_match and "subagent_session_id" not in context:
+            subagent_session_id = _normalize_openclaw_observability_string(
+                child_match.group(1), max_length=200
+            )
+            if subagent_session_id is not None:
+                context["subagent_session_id"] = subagent_session_id
+
+        if "parent_session_id" in context and "subagent_session_id" in context:
+            break
+
+    return context
 
 
 def _resolve_openclaw_sub_agent_suffix(sender_info: Optional[dict]) -> Optional[str]:
@@ -731,6 +778,96 @@ def _build_openclaw_cron_metadata(
     return {key: value for key, value in synthetic.items() if value is not None}
 
 
+def _build_openclaw_subagent_template_metadata(
+    data: dict, existing_metadata: dict
+) -> dict:
+    """
+    Build metadata for legacy OpenClaw subagent requests that only include the
+    prompt template markers, not the newer sender/conversation JSON blocks.
+
+    Keep LiteLLM's session as the parent work context so dashboards can show a
+    combined timeline. The subagent itself is represented by execution metadata
+    and tags until callers send an explicit subagent run id.
+    """
+
+    prompt_context = _extract_openclaw_subagent_session_context(data)
+    prompt_parent_session_id = prompt_context.get("parent_session_id")
+    prompt_subagent_session_id = prompt_context.get("subagent_session_id")
+
+    raw_session_id = _first_openclaw_metadata_value(
+        (
+            "openclaw_conversation_id",
+            "openclaw_session_id",
+            "session_id",
+            "litellm_session_id",
+        ),
+        existing_metadata,
+        max_length=200,
+    ) or prompt_parent_session_id
+    session_id = (
+        _build_openclaw_bounded_identifier(
+            raw_session_id,
+            prefix=f"{OPENCLAW_SESSION_PREFIX}-session",
+        )
+        if raw_session_id is not None
+        else None
+    )
+    parent_session_id = _first_openclaw_metadata_value(
+        ("openclaw_parent_session_id", "parent_session_id"),
+        existing_metadata,
+        max_length=200,
+    ) or prompt_parent_session_id or session_id
+    subagent_session_id = _first_openclaw_metadata_value(
+        (
+            "openclaw_subagent_session_id",
+            "openclaw_child_session_id",
+            "child_session_id",
+        ),
+        existing_metadata,
+        max_length=200,
+    ) or prompt_subagent_session_id
+    sub_agent_id = _first_openclaw_metadata_value(
+        (
+            "openclaw_sub_agent_id",
+            "openclaw_subagent_id",
+            "sub_agent_id",
+            "subagent_id",
+        ),
+        existing_metadata,
+        max_length=120,
+    ) or subagent_session_id
+    execution_id = _first_openclaw_metadata_value(
+        ("openclaw_execution_id", "execution_id", "response_id", "request_id"),
+        existing_metadata,
+        max_length=180,
+    )
+    synthetic: Dict[str, Any] = {
+        "session_id": session_id,
+        "openclaw_session_id": session_id,
+        "openclaw_conversation_id": session_id,
+        "openclaw_session_id_raw": raw_session_id,
+        "openclaw_parent_session_id": parent_session_id,
+        "openclaw_execution_id": execution_id,
+        "openclaw_execution_type": "subagent",
+        "openclaw_actor_type": "subagent",
+        "openclaw_sub_agent_id": sub_agent_id,
+        "openclaw_subagent_session_id": subagent_session_id,
+        "tags": _merge_openclaw_tags(
+            existing_metadata.get("tags"), [OPENCLAW_SUB_AGENT_TAG]
+        ),
+    }
+    merged_spend_logs_metadata = copy.deepcopy(
+        existing_metadata.get("spend_logs_metadata")
+        if isinstance(existing_metadata.get("spend_logs_metadata"), dict)
+        else {}
+    )
+    for key, value in synthetic.items():
+        if key.startswith("openclaw_") and value is not None:
+            merged_spend_logs_metadata.setdefault(key, value)
+    synthetic["spend_logs_metadata"] = merged_spend_logs_metadata
+    return {key: value for key, value in synthetic.items() if value is not None}
+
+
 def _build_openclaw_observability_metadata(
     data: dict, existing_metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -797,21 +934,26 @@ def _build_openclaw_observability_metadata(
         ):
             return None
         if trusted_inbound_channel is not None and not is_heartbeat:
-            trusted_tags = [f"channel:{trusted_inbound_channel}"]
             if is_subagent_request:
-                trusted_tags.append(OPENCLAW_SUB_AGENT_TAG)
+                trusted_metadata = _build_openclaw_subagent_template_metadata(
+                    data,
+                    existing_metadata_dict,
+                )
+                trusted_metadata["tags"] = _merge_openclaw_tags(
+                    trusted_metadata.get("tags"),
+                    [f"channel:{trusted_inbound_channel}"],
+                )
+                return trusted_metadata
             return {
                 "tags": _merge_openclaw_tags(
                     existing_metadata_dict.get("tags"),
-                    trusted_tags,
+                    [f"channel:{trusted_inbound_channel}"],
                 )
             }
         if is_subagent_request and not is_heartbeat:
-            return {
-                "tags": _merge_openclaw_tags(
-                    existing_metadata_dict.get("tags"), [OPENCLAW_SUB_AGENT_TAG]
-                )
-            }
+            return _build_openclaw_subagent_template_metadata(
+                data, existing_metadata_dict
+            )
         synthetic: Dict[str, Any] = {}
         if not existing_metadata_dict.get("trace_user_id"):
             synthetic["trace_user_id"] = OPENCLAW_HEARTBEAT_USER_ID

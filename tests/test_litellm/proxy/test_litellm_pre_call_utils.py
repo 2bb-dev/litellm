@@ -1619,7 +1619,16 @@ async def test_add_litellm_data_to_request_tags_openclaw_subagent_template_witho
     assert metadata["session_id"] == requester_session_id
     assert updated_data["litellm_session_id"] == requester_session_id
     assert metadata["tags"] == ["0: User-Agent: OpenAI", "subagent"]
-    assert "openclaw_session_id" not in metadata
+    assert metadata["openclaw_session_id"] == requester_session_id
+    assert metadata["openclaw_conversation_id"] == requester_session_id
+    assert metadata["openclaw_parent_session_id"] == requester_session_id
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["spend_logs_metadata"]["openclaw_execution_type"] == "subagent"
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_parent_session_id"]
+        == requester_session_id
+    )
 
 
 @pytest.mark.asyncio
@@ -1666,6 +1675,79 @@ async def test_add_litellm_data_to_request_tags_openclaw_subagent_messages_templ
     assert metadata["tags"] == ["subagent"]
     assert "session_id" not in metadata
     assert "openclaw_session_id" not in metadata
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["spend_logs_metadata"]["openclaw_execution_type"] == "subagent"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_openclaw_current_subagent_template_links_parent_and_child_sessions():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/responses"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    parent_session_key = "agent:prometheus:mattermost:direct:cw8r1sen13nczfytc5ptgish3e"
+    child_session_key = "agent:prometheus:subagent:7fb5a22e"
+    data = {
+        "model": "gpt-4o-mini",
+        "input": [
+            {
+                "role": "developer",
+                "content": (
+                    "# Subagent Context\n\n"
+                    "You are a **subagent** spawned by the main agent for a specific task.\n\n"
+                    "## Session Context\n"
+                    f"- Requester session: {parent_session_key}.\n"
+                    f"- Your session: {child_session_key}.\n"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "[Subagent Context] You are running as a subagent (depth 1/1). "
+                    "Results auto-announce to your requester; do not busy-poll for status.\n\n"
+                    "Begin. Your assigned task is in the system prompt under **Your Role**; "
+                    "execute it to completion."
+                ),
+            },
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    assert metadata["session_id"] == parent_session_key
+    assert updated_data["litellm_session_id"] == parent_session_key
+    assert metadata["openclaw_conversation_id"] == parent_session_key
+    assert metadata["openclaw_parent_session_id"] == parent_session_key
+    assert metadata["openclaw_subagent_session_id"] == child_session_key
+    assert metadata["openclaw_sub_agent_id"] == child_session_key
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["tags"] == ["subagent"]
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_subagent_session_id"]
+        == child_session_key
+    )
 
 
 @pytest.mark.asyncio
