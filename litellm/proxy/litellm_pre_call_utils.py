@@ -637,6 +637,7 @@ def _resolve_openclaw_execution_type(
                 "subagent",
                 "agent_to_agent",
                 "heartbeat",
+                "cron",
                 "bot_only",
                 "system",
                 "unknown",
@@ -668,11 +669,66 @@ def _merge_openclaw_tags(existing_tags: Any, new_tags: List[str]) -> List[str]:
 
 
 def _generate_openclaw_heartbeat_session_id() -> str:
-    return f"{OPENCLAW_HEARTBEAT_SESSION_ID}:{uuid.uuid4()}"
+    return OPENCLAW_HEARTBEAT_SESSION_ID
 
 
 def _generate_openclaw_human_session_id() -> str:
     return f"{OPENCLAW_HUMAN_SESSION_ID}:{uuid.uuid4()}"
+
+
+def _first_openclaw_metadata_value(
+    keys: Tuple[str, ...],
+    *sources: Optional[dict],
+    max_length: int = 160,
+) -> Optional[str]:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = _normalize_openclaw_observability_string(
+                source.get(key), max_length=max_length
+            )
+            if value is not None:
+                return value
+    return None
+
+
+def _build_openclaw_cron_metadata(
+    existing_metadata: dict,
+    cron_id: str,
+    cron_name: Optional[str],
+    cron_run_id: Optional[str],
+) -> dict:
+    raw_session_id = (
+        f"{OPENCLAW_SESSION_PREFIX}:cron:{cron_id}:run:{cron_run_id}"
+        if cron_run_id
+        else f"{OPENCLAW_SESSION_PREFIX}:cron:{cron_id}"
+    )
+    session_id = _build_openclaw_bounded_identifier(
+        raw_session_id,
+        prefix=f"{OPENCLAW_SESSION_PREFIX}-session",
+    )
+    synthetic: Dict[str, Any] = {
+        "session_id": session_id,
+        "openclaw_session_id": session_id,
+        "openclaw_conversation_id": session_id,
+        "openclaw_session_id_raw": raw_session_id,
+        "openclaw_cron_id": cron_id,
+        "openclaw_cron_name": cron_name,
+        "openclaw_cron_run_id": cron_run_id,
+        "openclaw_execution_type": "cron",
+        "tags": _merge_openclaw_tags(existing_metadata.get("tags"), ["cron"]),
+    }
+    merged_spend_logs_metadata = copy.deepcopy(
+        existing_metadata.get("spend_logs_metadata")
+        if isinstance(existing_metadata.get("spend_logs_metadata"), dict)
+        else {}
+    )
+    for key, value in synthetic.items():
+        if key.startswith("openclaw_") and value is not None:
+            merged_spend_logs_metadata[key] = value
+    synthetic["spend_logs_metadata"] = merged_spend_logs_metadata
+    return {key: value for key, value in synthetic.items() if value is not None}
 
 
 def _build_openclaw_observability_metadata(
@@ -710,8 +766,30 @@ def _build_openclaw_observability_metadata(
     existing_metadata_dict: dict = (
         existing_metadata if isinstance(existing_metadata, dict) else {}
     )
+    metadata_cron_id = _first_openclaw_metadata_value(
+        ("openclaw_cron_id", "cron_id", "schedule_id"),
+        existing_metadata_dict,
+        max_length=120,
+    )
+    metadata_cron_name = _first_openclaw_metadata_value(
+        ("openclaw_cron_name", "cron_name", "schedule_name"),
+        existing_metadata_dict,
+        max_length=160,
+    )
+    metadata_cron_run_id = _first_openclaw_metadata_value(
+        ("openclaw_cron_run_id", "cron_run_id", "schedule_run_id"),
+        existing_metadata_dict,
+        max_length=160,
+    )
 
     if sender_info is None and conversation_info is None:
+        if metadata_cron_id is not None:
+            return _build_openclaw_cron_metadata(
+                existing_metadata=existing_metadata_dict,
+                cron_id=metadata_cron_id,
+                cron_name=metadata_cron_name,
+                cron_run_id=metadata_cron_run_id,
+            )
         if (
             not is_heartbeat
             and not is_subagent_request
@@ -790,8 +868,33 @@ def _build_openclaw_observability_metadata(
     actor_type = _resolve_openclaw_actor_type(
         sender_info, sub_agent_suffix, is_heartbeat
     )
-    human_session_id = (
-        _generate_openclaw_human_session_id() if actor_type == "human" else None
+    cron_id = _first_openclaw_metadata_value(
+        ("openclaw_cron_id", "cron_id", "schedule_id"),
+        sender_info,
+        conversation_info,
+        existing_metadata_dict,
+        max_length=120,
+    ) or metadata_cron_id
+    cron_name = _first_openclaw_metadata_value(
+        ("openclaw_cron_name", "cron_name", "schedule_name"),
+        sender_info,
+        conversation_info,
+        existing_metadata_dict,
+        max_length=160,
+    ) or metadata_cron_name
+    cron_run_id = _first_openclaw_metadata_value(
+        ("openclaw_cron_run_id", "cron_run_id", "schedule_run_id"),
+        sender_info,
+        conversation_info,
+        existing_metadata_dict,
+        max_length=160,
+    ) or metadata_cron_run_id
+    explicit_conversation_id = _first_openclaw_metadata_value(
+        ("openclaw_conversation_id", "conversation_id", "thread_id"),
+        sender_info,
+        conversation_info,
+        existing_metadata_dict,
+        max_length=200,
     )
 
     trace_user_id: Optional[str] = None
@@ -805,10 +908,16 @@ def _build_openclaw_observability_metadata(
             prefix=f"{inferred_channel}-user",
         )
 
-        if is_heartbeat:
+        if cron_id and cron_run_id:
+            raw_session_id = (
+                f"{OPENCLAW_SESSION_PREFIX}:cron:{cron_id}:run:{cron_run_id}"
+            )
+        elif cron_id:
+            raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:cron:{cron_id}"
+        elif is_heartbeat:
             raw_session_id = heartbeat_session_id
-        elif human_session_id is not None:
-            raw_session_id = human_session_id
+        elif explicit_conversation_id is not None:
+            raw_session_id = explicit_conversation_id
         elif group_channel and topic_id:
             raw_session_id = (
                 f"{OPENCLAW_SESSION_PREFIX}:{group_channel}:topic:{topic_id}"
@@ -821,10 +930,7 @@ def _build_openclaw_observability_metadata(
             )
 
         if sub_agent_suffix is not None and not is_heartbeat:
-            # Keep the parent's session id distinguishable so users can
-            # filter sub-agent traffic separately (issue 2BB-289, fix #3).
             parent_raw_session_id = raw_session_id
-            raw_session_id = f"{raw_session_id}:sub:{sub_agent_suffix}"
 
         openclaw_session_id = _build_openclaw_bounded_identifier(
             raw_session_id,
@@ -890,11 +996,15 @@ def _build_openclaw_observability_metadata(
         "openclaw_execution_type": execution_type,
         "openclaw_bot_id": bot_id,
         "openclaw_session_id": openclaw_session_id,
+        "openclaw_conversation_id": openclaw_session_id,
         "openclaw_channel": inferred_channel,
         "openclaw_session_id_raw": raw_session_id,
         "openclaw_parent_session_id": parent_session_id,
         "openclaw_sub_agent_id": sub_agent_suffix,
         "openclaw_heartbeat": True if is_heartbeat else None,
+        "openclaw_cron_id": cron_id,
+        "openclaw_cron_name": cron_name,
+        "openclaw_cron_run_id": cron_run_id,
         "openclaw_sender_id": sender_id,
         "openclaw_sender_name": _normalize_openclaw_observability_string(
             (sender_info or {}).get("name"),
@@ -968,11 +1078,15 @@ def _build_openclaw_observability_metadata(
         "openclaw_execution_type",
         "openclaw_bot_id",
         "openclaw_session_id",
+        "openclaw_conversation_id",
         "openclaw_channel",
         "openclaw_session_id_raw",
         "openclaw_parent_session_id",
         "openclaw_sub_agent_id",
         "openclaw_heartbeat",
+        "openclaw_cron_id",
+        "openclaw_cron_name",
+        "openclaw_cron_run_id",
         "openclaw_sender_id",
         "openclaw_sender_username",
         "openclaw_sender_label",
@@ -2062,10 +2176,8 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
             if isinstance(data[_metadata_variable_name], dict)
             else None
         )
-        should_override_litellm_session_id = (
-            openclaw_observability_metadata.get("openclaw_heartbeat") is True
-            or openclaw_observability_metadata.get("openclaw_actor_type")
-            == "human"
+        should_override_litellm_session_id = bool(
+            openclaw_observability_metadata.get("openclaw_conversation_id")
         )
         if resolved_session_id is not None and (
             data.get("litellm_session_id") is None
