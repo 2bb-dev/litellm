@@ -10,6 +10,7 @@ from fastapi import Request
 from starlette.datastructures import Headers
 
 import litellm
+from litellm._uuid import uuid
 from litellm._logging import verbose_logger, verbose_proxy_logger
 from litellm._service_logger import ServiceLogging
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
@@ -106,19 +107,16 @@ LITELLM_METADATA_ROUTES = (
 )
 OPENCLAW_CONVERSATION_INFO_LABEL = "Conversation info (untrusted metadata):"
 OPENCLAW_SENDER_INFO_LABEL = "Sender (untrusted metadata):"
+OPENCLAW_INBOUND_CONTEXT_LABEL = "## Inbound Context (trusted metadata)"
+OPENCLAW_INBOUND_SCHEMA = "openclaw.inbound_meta.v2"
 OPENCLAW_SESSION_PREFIX = "openclaw"
-OPENCLAW_HEARTBEAT_SESSION_ID = f"{OPENCLAW_SESSION_PREFIX}:heartbeats"
+OPENCLAW_HEARTBEAT_SESSION_ID = f"{OPENCLAW_SESSION_PREFIX}:heartbeat"
 OPENCLAW_HEARTBEAT_USER_ID = f"{OPENCLAW_SESSION_PREFIX}:heartbeat"
 OPENCLAW_HEARTBEAT_TAG = "heartbeat"
-OPENCLAW_SUB_AGENT_TAG = "sub-agent"
-# Content-level signals that mark a heartbeat request. Prometheus loads
-# HEARTBEAT.md into its workspace, so its literal content header
-# ("# HEARTBEAT.md") is present for every heartbeat call.
-_OPENCLAW_HEARTBEAT_CONTENT_MARKERS = (
-    "# HEARTBEAT.md",
-    "[heartbeat]",
-    "HEARTBEAT_OK",
-)
+OPENCLAW_HUMAN_SESSION_ID = f"{OPENCLAW_SESSION_PREFIX}:human"
+OPENCLAW_SUB_AGENT_TAG = "subagent"
+OPENCLAW_SUBAGENT_CONTEXT_MARKER = "[Subagent Context]"
+OPENCLAW_SUBAGENT_TASK_MARKER = "[Subagent Task]"
 
 
 def _get_metadata_variable_name(request: Request) -> str:
@@ -221,6 +219,33 @@ def _extract_openclaw_json_block(text: str, label: str) -> Optional[dict]:
         search_start = label_index + len(label)
 
 
+def _extract_openclaw_trusted_inbound_metadata(text: str) -> Optional[dict]:
+    label_index = text.find(OPENCLAW_INBOUND_CONTEXT_LABEL)
+    if label_index == -1:
+        return None
+
+    section = text[label_index + len(OPENCLAW_INBOUND_CONTEXT_LABEL) :]
+    next_heading = section.find("\n## ")
+    if next_heading != -1:
+        section = section[:next_heading]
+
+    fence_start = section.find("```")
+    if fence_start == -1:
+        return None
+
+    fenced = section[fence_start + 3 :]
+    if fenced[:4].lower() == "json":
+        fenced = fenced[4:]
+    fenced = fenced.lstrip()
+
+    fence_end = fenced.find("```")
+    if fence_end == -1:
+        return None
+
+    parsed = safe_json_loads(fenced[:fence_end].strip())
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _iter_openclaw_candidate_texts(
     value: Any,
     seen: Optional[set[int]] = None,
@@ -255,6 +280,39 @@ def _iter_openclaw_candidate_texts(
 
     for item in value.values():
         yield from _iter_openclaw_candidate_texts(item, seen=seen, depth=depth + 1)
+
+
+def _iter_openclaw_input_content_texts(
+    data: dict, allowed_roles: Optional[set] = None
+):
+    input_value = data.get("input")
+    if not isinstance(input_value, list):
+        return
+
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if allowed_roles is not None and role not in allowed_roles:
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            yield content
+            continue
+        if isinstance(content, dict):
+            text = content.get("text")
+            if isinstance(text, str):
+                yield text
+            continue
+        if not isinstance(content, list):
+            continue
+        for content_item in content:
+            if isinstance(content_item, str):
+                yield content_item
+            elif isinstance(content_item, dict):
+                text = content_item.get("text")
+                if isinstance(text, str):
+                    yield text
 
 
 def _infer_openclaw_channel(group_channel: Optional[str]) -> Optional[str]:
@@ -327,82 +385,46 @@ def _resolve_openclaw_channel(
     return None
 
 
-def _iter_openclaw_raw_texts(
-    value: Any, seen: Optional[set[int]] = None, depth: int = 0
-):
-    """
-    Yield every string found inside `value` (walking dicts/lists up to depth 8).
-
-    Unlike `_iter_openclaw_candidate_texts`, this does not filter for
-    OpenClaw metadata labels — used to scan for heartbeat content markers.
-    """
-    if depth > 8:
-        return
-
-    if seen is None:
-        seen = set()
-
-    if isinstance(value, str):
-        yield value
-        return
-
-    if not isinstance(value, (dict, list)):
-        return
-
-    object_id = id(value)
-    if object_id in seen:
-        return
-    seen.add(object_id)
-
-    if isinstance(value, list):
-        for item in value:
-            yield from _iter_openclaw_raw_texts(item, seen=seen, depth=depth + 1)
-        return
-
-    for item in value.values():
-        yield from _iter_openclaw_raw_texts(item, seen=seen, depth=depth + 1)
-
-
-def _has_openclaw_payload_signal(data: dict) -> bool:
-    """Return True if the request payload carries an OpenClaw-specific label.
-
-    Used to disambiguate generic heartbeat markers from genuine OpenClaw
-    heartbeat traffic when no sender/conversation JSON block was parsed.
-    """
-    for key in ("messages", "input", "prompt", "message"):
-        if key not in data:
-            continue
-        for text in _iter_openclaw_raw_texts(data[key]):
-            if (
-                OPENCLAW_SENDER_INFO_LABEL in text
-                or OPENCLAW_CONVERSATION_INFO_LABEL in text
-            ):
-                return True
-    return False
-
-
 def _is_openclaw_heartbeat(
     data: dict,
-    sender_info: Optional[dict],
-    conversation_info: Optional[dict],
 ) -> bool:
-    """Detect heartbeat signals from sender metadata or raw request content."""
-    for info in (sender_info, conversation_info):
-        if not isinstance(info, dict):
-            continue
-        if info.get("heartbeat") is True:
-            return True
-        kind = info.get("kind")
-        if isinstance(kind, str) and kind.strip().lower() == "heartbeat":
-            return True
+    """Detect OpenClaw heartbeats from trusted inbound metadata only."""
 
-    for key in ("messages", "input", "prompt", "message"):
-        if key not in data:
+    channel = _resolve_openclaw_trusted_inbound_channel(data)
+    return channel == "heartbeat"
+
+
+def _resolve_openclaw_trusted_inbound_channel(data: dict) -> Optional[str]:
+    """Resolve the OpenClaw channel from trusted inbound metadata."""
+
+    for text in _iter_openclaw_input_content_texts(
+        data, allowed_roles={"developer", "system"}
+    ):
+        inbound_metadata = _extract_openclaw_trusted_inbound_metadata(text)
+        if not isinstance(inbound_metadata, dict):
             continue
-        for text in _iter_openclaw_raw_texts(data[key]):
-            for marker in _OPENCLAW_HEARTBEAT_CONTENT_MARKERS:
-                if marker in text:
-                    return True
+        schema = inbound_metadata.get("schema")
+        channel = inbound_metadata.get("channel")
+        if (
+            schema == OPENCLAW_INBOUND_SCHEMA
+            and isinstance(channel, str)
+        ):
+            return _normalize_openclaw_channel_name(channel)
+    return None
+
+
+def _is_openclaw_subagent_request(data: dict) -> bool:
+    """Detect OpenClaw subagent task requests from the user input template."""
+
+    has_context_marker = False
+    has_task_marker = False
+    for text in _iter_openclaw_input_content_texts(data, allowed_roles={"user"}):
+        if OPENCLAW_SUBAGENT_CONTEXT_MARKER in text:
+            has_context_marker = True
+        if OPENCLAW_SUBAGENT_TASK_MARKER in text:
+            has_task_marker = True
+        if has_context_marker and has_task_marker:
+            return True
     return False
 
 
@@ -639,6 +661,14 @@ def _merge_openclaw_tags(existing_tags: Any, new_tags: List[str]) -> List[str]:
     return merged
 
 
+def _generate_openclaw_heartbeat_session_id() -> str:
+    return f"{OPENCLAW_HEARTBEAT_SESSION_ID}:{uuid.uuid4()}"
+
+
+def _generate_openclaw_human_session_id() -> str:
+    return f"{OPENCLAW_HUMAN_SESSION_ID}:{uuid.uuid4()}"
+
+
 def _build_openclaw_observability_metadata(
     data: dict, existing_metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -664,8 +694,11 @@ def _build_openclaw_observability_metadata(
         if sender_info is not None and conversation_info is not None:
             break
 
-    is_heartbeat = _is_openclaw_heartbeat(
-        data=data, sender_info=sender_info, conversation_info=conversation_info
+    trusted_inbound_channel = _resolve_openclaw_trusted_inbound_channel(data=data)
+    is_heartbeat = trusted_inbound_channel == OPENCLAW_HEARTBEAT_TAG
+    is_subagent_request = _is_openclaw_subagent_request(data=data)
+    heartbeat_session_id = (
+        _generate_openclaw_heartbeat_session_id() if is_heartbeat else None
     )
 
     existing_metadata_dict: dict = (
@@ -673,24 +706,56 @@ def _build_openclaw_observability_metadata(
     )
 
     if sender_info is None and conversation_info is None:
-        if not is_heartbeat:
+        if (
+            not is_heartbeat
+            and not is_subagent_request
+            and trusted_inbound_channel is None
+        ):
             return None
-        # Heartbeat request without parseable OpenClaw sender/conversation
-        # metadata: only synthesize a bucket if an OpenClaw-specific signal
-        # is present in the raw payload. Generic heartbeat markers alone
-        # (e.g. "# HEARTBEAT.md", "[heartbeat]") can appear in unrelated
-        # prompts and must not relabel them as OpenClaw traffic.
-        if not _has_openclaw_payload_signal(data):
-            return None
+        if trusted_inbound_channel is not None and not is_heartbeat:
+            trusted_tags = [f"channel:{trusted_inbound_channel}"]
+            if is_subagent_request:
+                trusted_tags.append(OPENCLAW_SUB_AGENT_TAG)
+            return {
+                "tags": _merge_openclaw_tags(
+                    existing_metadata_dict.get("tags"),
+                    trusted_tags,
+                )
+            }
+        if is_subagent_request and not is_heartbeat:
+            return {
+                "tags": _merge_openclaw_tags(
+                    existing_metadata_dict.get("tags"), [OPENCLAW_SUB_AGENT_TAG]
+                )
+            }
         synthetic: Dict[str, Any] = {}
         if not existing_metadata_dict.get("trace_user_id"):
             synthetic["trace_user_id"] = OPENCLAW_HEARTBEAT_USER_ID
-        if not existing_metadata_dict.get("session_id"):
-            synthetic["session_id"] = OPENCLAW_HEARTBEAT_SESSION_ID
+        synthetic["session_id"] = heartbeat_session_id
+        synthetic["user_name"] = OPENCLAW_HEARTBEAT_USER_ID
+        synthetic["channel"] = OPENCLAW_HEARTBEAT_TAG
+        synthetic["openclaw_user_id"] = OPENCLAW_HEARTBEAT_USER_ID
+        synthetic["openclaw_actor_id"] = OPENCLAW_HEARTBEAT_USER_ID
+        synthetic["openclaw_actor_type"] = "system"
+        synthetic["openclaw_execution_type"] = OPENCLAW_HEARTBEAT_TAG
+        synthetic["openclaw_session_id"] = heartbeat_session_id
+        synthetic["openclaw_channel"] = OPENCLAW_HEARTBEAT_TAG
+        synthetic["openclaw_session_id_raw"] = heartbeat_session_id
         synthetic["openclaw_heartbeat"] = True
         synthetic["tags"] = _merge_openclaw_tags(
-            existing_metadata_dict.get("tags"), [OPENCLAW_HEARTBEAT_TAG]
+            existing_metadata_dict.get("tags"),
+            [f"channel:{OPENCLAW_HEARTBEAT_TAG}", OPENCLAW_HEARTBEAT_TAG],
         )
+        spend_logs_metadata = existing_metadata_dict.get("spend_logs_metadata")
+        merged_spend_logs_metadata = (
+            copy.deepcopy(spend_logs_metadata)
+            if isinstance(spend_logs_metadata, dict)
+            else {}
+        )
+        for key, value in synthetic.items():
+            if key.startswith("openclaw_"):
+                merged_spend_logs_metadata[key] = value
+        synthetic["spend_logs_metadata"] = merged_spend_logs_metadata
         return synthetic or None
 
     sender_id = _normalize_openclaw_observability_string(
@@ -716,6 +781,12 @@ def _build_openclaw_observability_metadata(
         sender_info=sender_info, conversation_info=conversation_info
     )
     sub_agent_suffix = _resolve_openclaw_sub_agent_suffix(sender_info)
+    actor_type = _resolve_openclaw_actor_type(
+        sender_info, sub_agent_suffix, is_heartbeat
+    )
+    human_session_id = (
+        _generate_openclaw_human_session_id() if actor_type == "human" else None
+    )
 
     trace_user_id: Optional[str] = None
     raw_session_id: Optional[str] = None
@@ -729,11 +800,9 @@ def _build_openclaw_observability_metadata(
         )
 
         if is_heartbeat:
-            # Route heartbeats to a dedicated session bucket so they don't
-            # pollute user conversations (issue 2BB-289, fix #2).
-            raw_session_id = (
-                f"{OPENCLAW_SESSION_PREFIX}:heartbeats:{inferred_channel}:{sender_id}"
-            )
+            raw_session_id = heartbeat_session_id
+        elif human_session_id is not None:
+            raw_session_id = human_session_id
         elif group_channel and topic_id:
             raw_session_id = (
                 f"{OPENCLAW_SESSION_PREFIX}:{group_channel}:topic:{topic_id}"
@@ -760,7 +829,6 @@ def _build_openclaw_observability_metadata(
     parent_user_id = _resolve_openclaw_parent_user_id(
         sender_info, conversation_info, inferred_channel
     )
-    actor_type = _resolve_openclaw_actor_type(sender_info, sub_agent_suffix, is_heartbeat)
     execution_type = _resolve_openclaw_execution_type(
         sender_info,
         conversation_info,
@@ -852,7 +920,14 @@ def _build_openclaw_observability_metadata(
     for key, value in metadata_updates.items():
         if value is None:
             continue
-        if key in {"trace_user_id", "session_id"} and existing_metadata.get(key):
+        if (
+            key in {"trace_user_id", "session_id"}
+            and existing_metadata.get(key)
+            and not (
+                key == "session_id"
+                and (is_heartbeat or actor_type == "human")
+            )
+        ):
             continue
         resolved_metadata[key] = value
 
@@ -861,9 +936,11 @@ def _build_openclaw_observability_metadata(
     new_tags: List[str] = []
     if inferred_channel is not None:
         new_tags.append(f"channel:{inferred_channel}")
+    elif trusted_inbound_channel is not None:
+        new_tags.append(f"channel:{trusted_inbound_channel}")
     if is_heartbeat:
         new_tags.append(OPENCLAW_HEARTBEAT_TAG)
-    if sub_agent_suffix is not None and not is_heartbeat:
+    if (sub_agent_suffix is not None or is_subagent_request) and not is_heartbeat:
         new_tags.append(OPENCLAW_SUB_AGENT_TAG)
     if new_tags:
         resolved_metadata["tags"] = _merge_openclaw_tags(
@@ -1974,14 +2051,21 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
     )
     if openclaw_observability_metadata is not None:
         data[_metadata_variable_name].update(openclaw_observability_metadata)
-        if data.get("litellm_session_id") is None:
-            resolved_session_id = (
-                data[_metadata_variable_name].get("session_id")
-                if isinstance(data[_metadata_variable_name], dict)
-                else None
-            )
-            if resolved_session_id is not None:
-                data["litellm_session_id"] = resolved_session_id
+        resolved_session_id = (
+            data[_metadata_variable_name].get("session_id")
+            if isinstance(data[_metadata_variable_name], dict)
+            else None
+        )
+        should_override_litellm_session_id = (
+            openclaw_observability_metadata.get("openclaw_heartbeat") is True
+            or openclaw_observability_metadata.get("openclaw_actor_type")
+            == "human"
+        )
+        if resolved_session_id is not None and (
+            data.get("litellm_session_id") is None
+            or should_override_litellm_session_id
+        ):
+            data["litellm_session_id"] = resolved_session_id
 
     data = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
         data=data,
