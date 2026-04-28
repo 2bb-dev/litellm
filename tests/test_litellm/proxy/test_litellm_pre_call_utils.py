@@ -1729,6 +1729,130 @@ async def test_add_litellm_data_to_request_uses_subagent_tag_when_prompt_markers
 
 
 @pytest.mark.asyncio
+async def test_add_litellm_data_to_request_links_openclaw_session_send_without_subagent_prompt():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/responses"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {
+        "Content-Type": "application/json",
+        "user-agent": "OpenAI",
+    }
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    source_session_key = "agent:prometheus:mattermost:direct:human-source"
+    target_session_key = "agent:victor:mattermost:direct:human-target"
+    data = {
+        "model": "gpt-4o-mini",
+        "litellm_metadata": {"session_id": target_session_key},
+        "input": [
+            {
+                "role": "user",
+                "content": (
+                    "[Inter-session message] "
+                    f"sourceSession={source_session_key} "
+                    "sourceChannel=mattermost sourceTool=sessions_send isUser=false\n"
+                    "Please inspect this file and report back."
+                ),
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["session_id"] == source_session_key
+    assert updated_data["litellm_session_id"] == source_session_key
+    assert metadata["openclaw_conversation_id"] == source_session_key
+    assert metadata["openclaw_parent_session_id"] == source_session_key
+    assert metadata["openclaw_source_session_id"] == source_session_key
+    assert metadata["openclaw_target_session_id"] == target_session_key
+    assert metadata["openclaw_source_tool"] == "sessions_send"
+    assert metadata["openclaw_input_provenance_kind"] == "inter_session"
+    assert metadata["openclaw_execution_type"] == "agent_to_agent"
+    assert metadata["tags"] == ["inter_session", "agent_to_agent"]
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_source_session_id"]
+        == source_session_key
+    )
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_target_session_id"]
+        == target_session_key
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_marks_session_send_to_subagent_session():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/responses"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {
+        "Content-Type": "application/json",
+        "user-agent": "OpenAI",
+    }
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    source_session_key = "agent:prometheus:mattermost:direct:human-source"
+    child_session_key = "agent:prometheus:subagent:7fb5a22e"
+    data = {
+        "model": "gpt-4o-mini",
+        "litellm_metadata": {
+            "session_id": child_session_key,
+            "inputProvenance": {
+                "kind": "inter_session",
+                "sourceSessionKey": source_session_key,
+                "sourceChannel": "mattermost",
+                "sourceTool": "sessions_send",
+            },
+        },
+        "input": [{"role": "user", "content": "Continue the delegated task."}],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["openclaw_conversation_id"] == source_session_key
+    assert metadata["openclaw_parent_session_id"] == source_session_key
+    assert metadata["openclaw_target_session_id"] == child_session_key
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["tags"] == ["inter_session", "subagent"]
+
+
+@pytest.mark.asyncio
 async def test_add_litellm_data_to_request_openclaw_current_subagent_template_links_parent_and_child_sessions():
     request_mock = MagicMock(spec=Request)
     request_mock.url.path = "/responses"
