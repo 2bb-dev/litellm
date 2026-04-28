@@ -48,6 +48,28 @@ export interface PaginatedResponse {
   total_pages: number;
 }
 
+function openClawMetadataValue(log: LogEntry, key: string): unknown {
+  const metadata = log.metadata ?? {};
+  const spendMetadata = metadata.spend_logs_metadata;
+  if (
+    spendMetadata &&
+    typeof spendMetadata === "object" &&
+    !Array.isArray(spendMetadata) &&
+    (spendMetadata as Record<string, unknown>)[key] != null
+  ) {
+    return (spendMetadata as Record<string, unknown>)[key];
+  }
+  return (metadata as Record<string, unknown>)[key];
+}
+
+function hasOpenClawConversation(log: LogEntry): boolean {
+  return Boolean(openClawMetadataValue(log, "openclaw_session_id"));
+}
+
+function isUuidOnlySession(log: LogEntry): boolean {
+  return Boolean(log.session_id?.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) && !hasOpenClawConversation(log);
+}
+
 export default function SpendLogsTable({
   accessToken,
   token,
@@ -328,7 +350,7 @@ export default function SpendLogsTable({
   // Prefers an LLM row over an MCP row as the representative.
   const sessionRepresentativeMap = new Map<string, { requestId: string; isMcp: boolean }>();
   for (const log of searchedLogs) {
-    if (!log.session_id || (log.session_total_count || 1) <= 1) continue;
+    if (!log.session_id || isUuidOnlySession(log) || (log.session_total_count || 1) <= 1) continue;
     const isMcp = MCP_CALL_TYPES.includes(log.call_type);
     const existing = sessionRepresentativeMap.get(log.session_id);
     if (!existing || (existing.isMcp && !isMcp)) {
@@ -358,7 +380,7 @@ export default function SpendLogsTable({
       })
       // Deduplicate multi-call sessions using the pre-built map (O(1) per row).
       .filter((log) => {
-        if (!log.session_id || (log.session_total_count || 1) <= 1) return true;
+        if (!log.session_id || isUuidOnlySession(log) || (log.session_total_count || 1) <= 1) return true;
         return sessionRepresentativeMap.get(log.session_id)?.requestId === log.request_id;
       }) || [];
 
@@ -376,7 +398,7 @@ export default function SpendLogsTable({
 
   const handleRowClick = (log: LogEntry) => {
     // Multi-call session row: open in the same right-side drawer (session mode)
-    if (log.session_id && (log.session_total_count || 1) > 1) {
+    if (log.session_id && !isUuidOnlySession(log) && (log.session_total_count || 1) > 1) {
       setSelectedSessionId(log.session_id);
       setSelectedLog(log);
       setIsDrawerOpen(true);

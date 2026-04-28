@@ -4,7 +4,7 @@ import hashlib
 import re
 import time
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import Request
 from starlette.datastructures import Headers
@@ -456,6 +456,176 @@ def _resolve_openclaw_user_name(sender_info: Optional[dict]) -> Optional[str]:
     return None
 
 
+def _resolve_openclaw_actor_type(
+    sender_info: Optional[dict],
+    sub_agent_suffix: Optional[str],
+    is_heartbeat: bool,
+) -> Optional[str]:
+    if is_heartbeat:
+        return "system"
+    if sub_agent_suffix is not None:
+        return "subagent"
+    if not isinstance(sender_info, dict):
+        return None
+
+    for key in ("actor_type", "sender_type", "type", "role", "agent_role"):
+        value = sender_info.get(key)
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip().lower().replace("-", "_")
+        if normalized in {"human", "user"}:
+            return "human"
+        if normalized in {"bot", "agent", "assistant"}:
+            return "bot"
+        if normalized in {"subagent", "sub_agent"}:
+            return "subagent"
+        if normalized == "system":
+            return "system"
+
+    if sender_info.get("is_bot") is True or sender_info.get("bot") is True:
+        return "bot"
+    return "human"
+
+
+def _resolve_openclaw_parent_user_id(
+    sender_info: Optional[dict],
+    conversation_info: Optional[dict],
+    fallback_channel: Optional[str],
+) -> Optional[str]:
+    for info in (sender_info, conversation_info):
+        if not isinstance(info, dict):
+            continue
+        for key in (
+            "openclaw_parent_user_id",
+            "parent_user_id",
+            "parent_sender_id",
+            "human_user_id",
+            "root_user_id",
+        ):
+            value = _normalize_openclaw_observability_string(
+                info.get(key), max_length=160
+            )
+            if value is None:
+                continue
+            if ":" in value:
+                return _build_openclaw_bounded_identifier(
+                    value, prefix="openclaw-parent-user"
+                )
+            channel = _resolve_openclaw_channel(info, conversation_info) or fallback_channel
+            if channel is not None:
+                return _build_openclaw_bounded_identifier(
+                    f"{channel}:{value}", prefix=f"{channel}-user"
+                )
+    return None
+
+
+def _resolve_openclaw_actor_id(
+    sender_info: Optional[dict],
+    conversation_info: Optional[dict],
+    actor_type: Optional[str],
+    fallback_channel: Optional[str],
+    trace_user_id: Optional[str],
+    bot_id: Optional[str],
+) -> Optional[str]:
+    for info in (sender_info, conversation_info):
+        if not isinstance(info, dict):
+            continue
+        for key in ("openclaw_actor_id", "actor_id"):
+            value = _normalize_openclaw_observability_string(
+                info.get(key), max_length=160
+            )
+            if value is not None:
+                if ":" in value:
+                    return _build_openclaw_bounded_identifier(
+                        value, prefix="openclaw-actor"
+                    )
+                channel = (
+                    _resolve_openclaw_channel(info, conversation_info)
+                    or fallback_channel
+                )
+                if channel is not None:
+                    return _build_openclaw_bounded_identifier(
+                        f"{channel}:{value}", prefix=f"{channel}-actor"
+                    )
+                return _build_openclaw_bounded_identifier(
+                    f"actor:{value}", prefix="openclaw-actor"
+                )
+
+    actor_keys: Tuple[str, ...]
+    if actor_type == "subagent":
+        actor_keys = ("sub_agent_id", "subagent_id", "agent_id", "bot_id")
+    elif actor_type == "bot":
+        actor_keys = ("bot_id", "agent_id", "sub_agent_id", "subagent_id")
+    else:
+        actor_keys = ()
+
+    for info in (sender_info, conversation_info):
+        if not isinstance(info, dict):
+            continue
+        for key in actor_keys:
+            value = _normalize_openclaw_observability_string(
+                info.get(key), max_length=160
+            )
+            if value is not None:
+                if ":" in value:
+                    return _build_openclaw_bounded_identifier(
+                        value, prefix="openclaw-actor"
+                    )
+                prefix = "subagent" if actor_type == "subagent" else "bot"
+                return _build_openclaw_bounded_identifier(
+                    f"{prefix}:{value}", prefix=f"{prefix}-actor"
+                )
+
+    if actor_type == "bot" and bot_id is not None:
+        if ":" in bot_id:
+            return _build_openclaw_bounded_identifier(
+                bot_id, prefix="openclaw-actor"
+            )
+        return _build_openclaw_bounded_identifier(
+            f"bot:{bot_id}", prefix="bot-actor"
+        )
+    return trace_user_id
+
+
+def _resolve_openclaw_execution_type(
+    sender_info: Optional[dict],
+    conversation_info: Optional[dict],
+    actor_type: Optional[str],
+    parent_user_id: Optional[str],
+    is_heartbeat: bool,
+) -> str:
+    if is_heartbeat:
+        return "heartbeat"
+
+    for info in (sender_info, conversation_info):
+        if not isinstance(info, dict):
+            continue
+        value = info.get("openclaw_execution_type") or info.get("execution_type")
+        if isinstance(value, str):
+            normalized = value.strip().lower().replace("-", "_")
+            if normalized in {
+                "human",
+                "direct",
+                "subagent",
+                "agent_to_agent",
+                "heartbeat",
+                "bot_only",
+                "system",
+                "unknown",
+            }:
+                return "direct" if normalized == "human" else normalized
+
+    if actor_type == "subagent":
+        return "subagent"
+    if parent_user_id is not None and actor_type in {"bot", "system"}:
+        return "agent_to_agent"
+    if actor_type == "human":
+        return "direct"
+    if actor_type == "bot":
+        return "bot_only"
+    return "unknown"
+
+
 def _merge_openclaw_tags(existing_tags: Any, new_tags: List[str]) -> List[str]:
     """Append tags to the existing list (if any) without duplicates, preserving order."""
     merged: List[str] = []
@@ -587,6 +757,38 @@ def _build_openclaw_observability_metadata(
         )
 
     user_name = _resolve_openclaw_user_name(sender_info)
+    parent_user_id = _resolve_openclaw_parent_user_id(
+        sender_info, conversation_info, inferred_channel
+    )
+    actor_type = _resolve_openclaw_actor_type(sender_info, sub_agent_suffix, is_heartbeat)
+    execution_type = _resolve_openclaw_execution_type(
+        sender_info,
+        conversation_info,
+        actor_type,
+        parent_user_id,
+        is_heartbeat,
+    )
+    execution_id = _normalize_openclaw_observability_string(
+        (sender_info or {}).get("openclaw_execution_id")
+        or (sender_info or {}).get("execution_id")
+        or (conversation_info or {}).get("openclaw_execution_id")
+        or (conversation_info or {}).get("execution_id"),
+        max_length=180,
+    )
+    bot_id = _normalize_openclaw_observability_string(
+        (sender_info or {}).get("bot_id")
+        or (sender_info or {}).get("agent_id")
+        or (conversation_info or {}).get("bot_id"),
+        max_length=160,
+    )
+    actor_id = _resolve_openclaw_actor_id(
+        sender_info,
+        conversation_info,
+        actor_type,
+        inferred_channel,
+        trace_user_id,
+        bot_id,
+    )
     parent_session_id = (
         _build_openclaw_bounded_identifier(
             parent_raw_session_id,
@@ -607,6 +809,12 @@ def _build_openclaw_observability_metadata(
         "user_name": user_name,
         "channel": inferred_channel,
         "openclaw_user_id": trace_user_id,
+        "openclaw_parent_user_id": parent_user_id,
+        "openclaw_actor_id": actor_id,
+        "openclaw_actor_type": actor_type,
+        "openclaw_execution_id": execution_id,
+        "openclaw_execution_type": execution_type,
+        "openclaw_bot_id": bot_id,
         "openclaw_session_id": openclaw_session_id,
         "openclaw_channel": inferred_channel,
         "openclaw_session_id_raw": raw_session_id,
@@ -670,6 +878,12 @@ def _build_openclaw_observability_metadata(
     )
     for key in (
         "openclaw_user_id",
+        "openclaw_parent_user_id",
+        "openclaw_actor_id",
+        "openclaw_actor_type",
+        "openclaw_execution_id",
+        "openclaw_execution_type",
+        "openclaw_bot_id",
         "openclaw_session_id",
         "openclaw_channel",
         "openclaw_session_id_raw",

@@ -392,6 +392,63 @@ const menuGroups: MenuGroup[] = [
   },
 ];
 
+const openClawMenuGroups: MenuGroup[] = [
+  {
+    groupLabel: "OPENCLAW OPS",
+    items: [
+      {
+        key: "logs",
+        page: "logs",
+        label: "Logs",
+        icon: <LineChartOutlined />,
+      },
+      {
+        key: "new_usage",
+        page: "new_usage",
+        icon: <BarChartOutlined />,
+        roles: [...all_admin_roles, ...internalUserRoles],
+        label: "Usage",
+      },
+    ],
+  },
+  {
+    groupLabel: "GATEWAY",
+    items: [
+      {
+        key: "api-keys",
+        page: "api-keys",
+        label: "Virtual Keys",
+        icon: <KeyOutlined />,
+      },
+      {
+        key: "models",
+        page: "models",
+        label: "Models + Endpoints",
+        icon: <BlockOutlined />,
+        roles: rolesWithWriteAccess,
+      },
+    ],
+  },
+  {
+    groupLabel: "ACCESS",
+    items: [
+      {
+        key: "teams",
+        page: "teams",
+        label: "Teams",
+        icon: <TeamOutlined />,
+      },
+      {
+        key: "budgets",
+        page: "budgets",
+        label: "Budgets",
+        icon: <CreditCardOutlined />,
+        roles: all_admin_roles,
+      },
+    ],
+  },
+];
+
 const Sidebar: React.FC<SidebarProps> = ({ setPage, defaultSelectedKey, collapsed = false, enabledPagesInternalUsers, enableProjectsUI, disableAgentsForInternalUsers, allowAgentsForTeamAdmins, disableVectorStoresForInternalUsers, allowVectorStoresForTeamAdmins }) => {
   const { userId, accessToken, userRole } = useAuthorized();
   const { data: organizations } = useOrganizations();
@@ -533,7 +590,7 @@ const Sidebar: React.FC<SidebarProps> = ({ setPage, defaultSelectedKey, collapse
   const buildMenuItems = (): MenuProps["items"] => {
     const items: MenuProps["items"] = [];
 
-    menuGroups.forEach((group) => {
+    openClawMenuGroups.forEach((group) => {
       // Check if group has role restriction
       if (group.roles && !group.roles.includes(userRole)) {
         return;
@@ -594,7 +651,7 @@ const Sidebar: React.FC<SidebarProps> = ({ setPage, defaultSelectedKey, collapse
 
   // Find selected menu key
   const findMenuItemKey = (page: string): string => {
-    for (const group of menuGroups) {
+    for (const group of openClawMenuGroups) {
       for (const item of group.items) {
         if (item.page === page) return item.key;
         if (item.children) {
@@ -603,7 +660,7 @@ const Sidebar: React.FC<SidebarProps> = ({ setPage, defaultSelectedKey, collapse
         }
       }
     }
-    return "api-keys";
+    return "logs";
   };
 
   const selectedMenuKey = findMenuItemKey(defaultSelectedKey);

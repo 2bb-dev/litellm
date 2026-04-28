@@ -77,6 +77,15 @@ const LEGACY_REDIRECTS: Record<string, string> = {
   "api-reference": "api-reference",
 };
 
+const OPENCLAW_ALLOWED_PAGES = new Set([
+  "logs",
+  "new_usage",
+  "api-keys",
+  "models",
+  "teams",
+  "budgets",
+]);
+
 function CreateKeyPageContent() {
   const [userRole, setUserRole] = useState("");
   const [premiumUser, setPremiumUser] = useState(false);
@@ -169,10 +178,11 @@ function CreateKeyPageContent() {
     };
   }, [searchParams, autoOpenCreate]);
 
-  // Get page from URL, default to 'api-keys' if not present
+  // OpenClaw ops default: land on request logs, not key creation.
   const [page, setPage] = useState(() => {
-    return searchParams.get("page") || "api-keys";
+    return searchParams.get("page") || "logs";
   });
+  const activePage = OPENCLAW_ALLOWED_PAGES.has(page) ? page : "logs";
 
   // Custom setPage function that updates URL
   const updatePage = (newPage: string) => {
@@ -490,9 +500,9 @@ function CreateKeyPageContent() {
                 />
                 <div className="flex flex-1">
                   <div className="mt-2">
-                  <SidebarProvider setPage={updatePage} defaultSelectedKey={page} sidebarCollapsed={sidebarCollapsed} />
+                  <SidebarProvider setPage={updatePage} defaultSelectedKey={activePage} sidebarCollapsed={sidebarCollapsed} />
                 </div>
-                  {page == "api-keys" ? (
+                  {activePage == "api-keys" ? (
                     <UserDashboard
                       userID={userID}
                       userRole={userRole}
@@ -510,7 +520,7 @@ function CreateKeyPageContent() {
                       autoOpenCreate={autoOpenCreate}
                       prefillData={prefillData}
                     />
-                  ) : page == "models" ? (
+                  ) : activePage == "models" ? (
                     <OldModelDashboard
                       token={token}
                       keys={keys}
@@ -519,9 +529,9 @@ function CreateKeyPageContent() {
                       premiumUser={premiumUser}
                       teams={teams}
                     />
-                  ) : page == "llm-playground" ? (
+                  ) : activePage == "llm-playground" ? (
                     <PlaygroundPage />
-                  ) : page == "users" ? (
+                  ) : activePage == "users" ? (
                     <ViewUserDashboard
                       userID={userID}
                       userRole={userRole}
@@ -531,7 +541,7 @@ function CreateKeyPageContent() {
                       accessToken={accessToken}
                       setKeys={setKeys}
                     />
-                  ) : page == "teams" ? (
+                  ) : activePage == "teams" ? (
                     <OldTeams
                       teams={teams}
                       setTeams={setTeams}
@@ -542,7 +552,7 @@ function CreateKeyPageContent() {
                       premiumUser={premiumUser}
                       searchParams={searchParams}
                     />
-                  ) : page == "organizations" ? (
+                  ) : activePage == "organizations" ? (
                     <Organizations
                       organizations={organizations}
                       setOrganizations={setOrganizations}
@@ -551,36 +561,36 @@ function CreateKeyPageContent() {
                       userRole={userRole}
                       premiumUser={premiumUser}
                     />
-                  ) : page == "admin-panel" ? (
+                  ) : activePage == "admin-panel" ? (
                     <AdminPanel
                       proxySettings={proxySettings}
                     />
-                  ) : page == "logging-and-alerts" ? (
+                  ) : activePage == "logging-and-alerts" ? (
                     <Settings userID={userID} userRole={userRole} accessToken={accessToken} premiumUser={premiumUser} />
-                  ) : page == "budgets" ? (
+                  ) : activePage == "budgets" ? (
                     <BudgetPanel accessToken={accessToken} />
-                  ) : page == "guardrails" ? (
+                  ) : activePage == "guardrails" ? (
                     <GuardrailsPanel accessToken={accessToken} userRole={userRole} />
-                  ) : page == "policies" ? (
+                  ) : activePage == "policies" ? (
                     <PoliciesPanel accessToken={accessToken} userRole={userRole} />
-                  ) : page == "agents" ? (
+                  ) : activePage == "agents" ? (
                     <AgentsPanel accessToken={accessToken} userRole={userRole} teams={teams} />
-                  ) : page == "prompts" ? (
+                  ) : activePage == "prompts" ? (
                     <PromptsPanel accessToken={accessToken} userRole={userRole} />
-                  ) : page == "transform-request" ? (
+                  ) : activePage == "transform-request" ? (
                     <TransformRequestPanel accessToken={accessToken} />
-                  ) : page == "router-settings" ? (
+                  ) : activePage == "router-settings" ? (
                     <GeneralSettings
                       userID={userID}
                       userRole={userRole}
                       accessToken={accessToken}
                       modelData={modelData}
                     />
-                  ) : page == "ui-theme" ? (
+                  ) : activePage == "ui-theme" ? (
                     <UIThemeSettings userID={userID} userRole={userRole} accessToken={accessToken} />
-                  ) : page == "cost-tracking" ? (
+                  ) : activePage == "cost-tracking" ? (
                     <CostTrackingSettings userID={userID} userRole={userRole} accessToken={accessToken} />
-                  ) : page == "model-hub-table" ? (
+                  ) : activePage == "model-hub-table" ? (
                     isAdminRole(userRole) ? (
                       <ModelHubTable
                         accessToken={accessToken}
@@ -591,7 +601,7 @@ function CreateKeyPageContent() {
                     ) : (
                       <PublicModelHub accessToken={accessToken} isEmbedded={true} />
                     )
-                  ) : page == "caching" ? (
+                  ) : activePage == "caching" ? (
                     <CacheDashboard
                       userID={userID}
                       userRole={userRole}
@@ -599,7 +609,7 @@ function CreateKeyPageContent() {
                       accessToken={accessToken}
                       premiumUser={premiumUser}
                     />
-                  ) : page == "pass-through-settings" ? (
+                  ) : activePage == "pass-through-settings" ? (
                     <PassThroughSettings
                       userID={userID}
                       userRole={userRole}
@@ -607,7 +617,7 @@ function CreateKeyPageContent() {
                       modelData={modelData}
                       premiumUser={premiumUser}
                     />
-                  ) : page == "logs" ? (
+                  ) : activePage == "logs" ? (
                     <SpendLogsTable
                       userID={userID}
                       userRole={userRole}
@@ -615,31 +625,31 @@ function CreateKeyPageContent() {
                       accessToken={accessToken}
                       premiumUser={premiumUser}
                     />
-                  ) : page == "mcp-servers" ? (
+                  ) : activePage == "mcp-servers" ? (
                     <MCPServers accessToken={accessToken} userRole={userRole} userID={userID} />
-                  ) : page == "search-tools" ? (
+                  ) : activePage == "search-tools" ? (
                     <SearchTools accessToken={accessToken} userRole={userRole} userID={userID} />
-                  ) : page == "tag-management" ? (
+                  ) : activePage == "tag-management" ? (
                     <TagManagement accessToken={accessToken} userRole={userRole} userID={userID} />
-                  ) : page == "skills" || page == "claude-code-plugins" ? (
+                  ) : activePage == "skills" || activePage == "claude-code-plugins" ? (
                     <ClaudeCodePluginsPanel accessToken={accessToken} userRole={userRole} />
-                  ) : page == "access-groups" ? (
+                  ) : activePage == "access-groups" ? (
                     <AccessGroupsPage />
-                  ) : page == "projects" ? (
+                  ) : activePage == "projects" ? (
                     <ProjectsPage />
-                  ) : page == "vector-stores" ? (
+                  ) : activePage == "vector-stores" ? (
                     <VectorStoreManagement accessToken={accessToken} userRole={userRole} userID={userID} />
-                  ) : page == "tool-policies" ? (
+                  ) : activePage == "tool-policies" ? (
                     <ToolPoliciesView accessToken={accessToken} userRole={userRole} />
-                  ) : page == "memory" ? (
+                  ) : activePage == "memory" ? (
                     <MemoryView
                       accessToken={accessToken}
                       userID={userID}
                       userRole={userRole}
                     />
-                  ) : page == "guardrails-monitor" ? (
+                  ) : activePage == "guardrails-monitor" ? (
                     <GuardrailsMonitorView accessToken={accessToken} />
-                  ) : page == "new_usage" ? (
+                  ) : activePage == "new_usage" ? (
                     <NewUsagePage
                       teams={(teams as Team[]) ?? []}
                       organizations={(organizations as Organization[]) ?? []}
@@ -656,29 +666,30 @@ function CreateKeyPageContent() {
                   )}
                 </div>
 
-                {/* Survey Components */}
-                <SurveyPrompt
-                  isVisible={showSurveyPrompt}
-                  onOpen={handleOpenSurvey}
-                  onDismiss={handleDismissSurveyPrompt}
-                />
-                <SurveyModal
-                  isOpen={showSurveyModal}
-                  onClose={handleSurveyModalClose}
-                  onComplete={handleSurveyComplete}
-                />
-
-                {/* Claude Code Components */}
-                <ClaudeCodePrompt
-                  isVisible={showClaudeCodePrompt}
-                  onOpen={handleOpenClaudeCode}
-                  onDismiss={handleDismissClaudeCodePrompt}
-                />
-                <ClaudeCodeModal
-                  isOpen={showClaudeCodeModal}
-                  onClose={handleClaudeCodeModalClose}
-                  onComplete={handleClaudeCodeComplete}
-                />
+                {false && (
+                  <>
+                    <SurveyPrompt
+                      isVisible={showSurveyPrompt}
+                      onOpen={handleOpenSurvey}
+                      onDismiss={handleDismissSurveyPrompt}
+                    />
+                    <SurveyModal
+                      isOpen={showSurveyModal}
+                      onClose={handleSurveyModalClose}
+                      onComplete={handleSurveyComplete}
+                    />
+                    <ClaudeCodePrompt
+                      isVisible={showClaudeCodePrompt}
+                      onOpen={handleOpenClaudeCode}
+                      onDismiss={handleDismissClaudeCodePrompt}
+                    />
+                    <ClaudeCodeModal
+                      isOpen={showClaudeCodeModal}
+                      onClose={handleClaudeCodeModalClose}
+                      onComplete={handleClaudeCodeComplete}
+                    />
+                  </>
+                )}
               </div>
             )}
           </ThemeProvider>
