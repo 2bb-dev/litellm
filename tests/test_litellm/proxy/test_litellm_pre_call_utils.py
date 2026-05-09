@@ -1410,6 +1410,85 @@ async def test_add_litellm_data_to_request_groups_cron_metadata_without_sender_c
 
 
 @pytest.mark.asyncio
+async def test_add_litellm_data_to_request_groups_cron_metadata_with_sender_context():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    inbound_text = """Conversation info (untrusted metadata):
+```json
+{
+  "message_id": "msg-123",
+  "sender_id": "952754559",
+  "group_channel": "telegram:-1001234567890",
+  "topic_id": "777",
+  "conversation_label": "OpenClaw Chat"
+}
+```
+
+Sender (untrusted metadata):
+```json
+{
+  "label": "sashi (952754559)",
+  "id": "952754559",
+  "name": "sashi",
+  "username": "on_the_r0ad"
+}
+```
+
+Run the scheduled audit.
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "metadata": {
+            "openclaw_cron_id": "daily-price-audit",
+            "openclaw_cron_name": "Daily price audit",
+            "openclaw_cron_run_id": "2026-04-28T20:00:00Z",
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": inbound_text}],
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    expected_session = (
+        "openclaw:cron:daily-price-audit:run:2026-04-28T20:00:00Z"
+    )
+    assert metadata["session_id"] == expected_session
+    assert metadata["openclaw_conversation_id"] == expected_session
+    assert metadata["openclaw_execution_type"] == "cron"
+    assert updated_data["litellm_session_id"] == expected_session
+    assert "cron" in metadata["tags"]
+    assert metadata["spend_logs_metadata"]["openclaw_execution_type"] == "cron"
+    assert metadata["spend_logs_metadata"]["openclaw_cron_id"] == "daily-price-audit"
+
+
+@pytest.mark.asyncio
 async def test_add_litellm_data_to_request_tags_openclaw_channel_from_trusted_input_context():
     request_mock = MagicMock(spec=Request)
     request_mock.url.path = "/responses"

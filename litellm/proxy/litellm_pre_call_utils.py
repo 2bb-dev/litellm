@@ -809,9 +809,12 @@ def _resolve_openclaw_execution_type(
     actor_type: Optional[str],
     parent_user_id: Optional[str],
     is_heartbeat: bool,
+    cron_id: Optional[str],
 ) -> str:
     if is_heartbeat:
         return "heartbeat"
+    if cron_id is not None:
+        return "cron"
 
     for info in (sender_info, conversation_info):
         if not isinstance(info, dict):
@@ -1341,6 +1344,7 @@ def _build_openclaw_observability_metadata(
         actor_type,
         parent_user_id,
         is_heartbeat,
+        cron_id,
     )
     execution_type = _resolve_openclaw_inter_session_execution_type(
         inter_session_context,
@@ -1468,6 +1472,8 @@ def _build_openclaw_observability_metadata(
         new_tags.append(f"channel:{trusted_inbound_channel}")
     if is_heartbeat:
         new_tags.append(OPENCLAW_HEARTBEAT_TAG)
+    if execution_type == "cron":
+        new_tags.append("cron")
     if (sub_agent_suffix is not None or is_subagent_request) and not is_heartbeat:
         new_tags.append(OPENCLAW_SUB_AGENT_TAG)
     if inter_session_context and not is_heartbeat:
