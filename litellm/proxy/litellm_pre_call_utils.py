@@ -196,6 +196,31 @@ def _normalize_openclaw_observability_string(
     return normalized
 
 
+def _is_openclaw_request_like_session_id(value: Optional[str]) -> bool:
+    if not isinstance(value, str):
+        return True
+    normalized = value.strip()
+    if not normalized:
+        return True
+    if normalized.startswith(("resp_", "resp-")):
+        return True
+    if re.match(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.match(
+        r"^openclaw:(?:human|heartbeat):"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12}$",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
 def _build_openclaw_bounded_identifier(
     raw_value: str,
     prefix: str,
@@ -910,16 +935,53 @@ def _build_openclaw_subagent_template_metadata(
     prompt_parent_session_id = prompt_context.get("parent_session_id")
     prompt_subagent_session_id = prompt_context.get("subagent_session_id")
 
-    raw_session_id = _first_openclaw_metadata_value(
+    metadata_conversation_id_raw = _first_openclaw_metadata_value(
+        ("openclaw_conversation_id",),
+        existing_metadata,
+        max_length=200,
+    )
+    metadata_conversation_id = (
+        metadata_conversation_id_raw
+        if metadata_conversation_id_raw is not None
+        and not _is_openclaw_request_like_session_id(metadata_conversation_id_raw)
+        else None
+    )
+    metadata_parent_session_id_raw = _first_openclaw_metadata_value(
+        ("openclaw_parent_session_id", "parent_session_id"),
+        existing_metadata,
+        max_length=200,
+    )
+    metadata_parent_session_id = (
+        metadata_parent_session_id_raw
+        if metadata_parent_session_id_raw is not None
+        and not _is_openclaw_request_like_session_id(metadata_parent_session_id_raw)
+        else None
+    )
+    metadata_session_id = _first_openclaw_metadata_value(
         (
-            "openclaw_conversation_id",
             "openclaw_session_id",
             "session_id",
             "litellm_session_id",
         ),
         existing_metadata,
         max_length=200,
-    ) or prompt_parent_session_id
+    )
+    metadata_session_is_subagent = _is_openclaw_subagent_session_value(
+        metadata_session_id
+    )
+    stable_metadata_session_id = (
+        metadata_session_id
+        if metadata_session_id is not None
+        and not _is_openclaw_request_like_session_id(metadata_session_id)
+        and not metadata_session_is_subagent
+        else None
+    )
+    raw_session_id = (
+        metadata_conversation_id
+        or metadata_parent_session_id
+        or prompt_parent_session_id
+        or stable_metadata_session_id
+    )
     session_id = (
         _build_openclaw_bounded_identifier(
             raw_session_id,
@@ -928,11 +990,9 @@ def _build_openclaw_subagent_template_metadata(
         if raw_session_id is not None
         else None
     )
-    parent_session_id = _first_openclaw_metadata_value(
-        ("openclaw_parent_session_id", "parent_session_id"),
-        existing_metadata,
-        max_length=200,
-    ) or prompt_parent_session_id or session_id
+    parent_session_id = (
+        metadata_parent_session_id or prompt_parent_session_id or session_id
+    )
     subagent_session_id = _first_openclaw_metadata_value(
         (
             "openclaw_subagent_session_id",
@@ -941,7 +1001,9 @@ def _build_openclaw_subagent_template_metadata(
         ),
         existing_metadata,
         max_length=200,
-    ) or prompt_subagent_session_id
+    ) or prompt_subagent_session_id or (
+        metadata_session_id if metadata_session_is_subagent else None
+    )
     sub_agent_id = _first_openclaw_metadata_value(
         (
             "openclaw_sub_agent_id",

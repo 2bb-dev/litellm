@@ -1923,6 +1923,75 @@ async def test_add_litellm_data_to_request_openclaw_current_subagent_template_li
 
 
 @pytest.mark.asyncio
+async def test_add_litellm_data_to_request_subagent_template_ignores_response_session_id():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url = MagicMock()
+    request_mock.url.path = "/responses"
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    parent_session_key = "agent:prometheus:mattermost:direct:cw8r1sen13nczfytc5ptgish3e"
+    child_session_key = "agent:prometheus:subagent:7fb5a22e"
+    response_session_id = "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVy"
+    data = {
+        "model": "gpt-4o-mini",
+        "litellm_metadata": {
+            "session_id": response_session_id,
+            "response_id": response_session_id,
+        },
+        "input": [
+            {
+                "role": "developer",
+                "content": (
+                    "# Subagent Context\n\n"
+                    "You are a **subagent** spawned by the main agent for a specific task.\n\n"
+                    "## Session Context\n"
+                    f"- Requester session: {parent_session_key}.\n"
+                    f"- Your session: {child_session_key}.\n"
+                ),
+            },
+            {
+                "role": "user",
+                "content": "[Subagent Task]: inspect and report.",
+            },
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["session_id"] == parent_session_key
+    assert updated_data["litellm_session_id"] == parent_session_key
+    assert metadata["openclaw_session_id"] == parent_session_key
+    assert metadata["openclaw_conversation_id"] == parent_session_key
+    assert metadata["openclaw_session_id_raw"] == parent_session_key
+    assert metadata["openclaw_parent_session_id"] == parent_session_key
+    assert metadata["openclaw_subagent_session_id"] == child_session_key
+    assert metadata["openclaw_execution_id"] == response_session_id
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_session_id"]
+        == parent_session_key
+    )
+
+
+@pytest.mark.asyncio
 async def test_add_litellm_data_to_request_user_spend_and_budget():
     from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
 
