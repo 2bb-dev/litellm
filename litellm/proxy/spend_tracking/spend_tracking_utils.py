@@ -589,6 +589,20 @@ def _get_session_id_for_spend_log(
     from litellm._uuid import uuid
 
     if kwargs.get("litellm_session_id") is not None:
+        for metadata_candidate in (
+            (
+                standard_logging_payload.get("metadata")
+                if standard_logging_payload is not None
+                else None
+            ),
+            kwargs.get("metadata"),
+            get_litellm_metadata_from_kwargs(kwargs),
+        ):
+            heartbeat_session_id = _get_openclaw_heartbeat_session_id(
+                metadata_candidate
+            )
+            if heartbeat_session_id is not None:
+                return heartbeat_session_id
         return str(kwargs.get("litellm_session_id"))
 
     if standard_logging_payload is not None:

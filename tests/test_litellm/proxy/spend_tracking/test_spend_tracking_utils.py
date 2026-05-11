@@ -101,6 +101,18 @@ def test_get_session_id_for_spend_log_uses_stable_bucket_for_openclaw_heartbeat_
     assert session_id == "openclaw:heartbeat"
 
 
+def test_get_session_id_for_spend_log_prefers_openclaw_heartbeat_over_litellm_session_id():
+    session_id = _get_session_id_for_spend_log(
+        kwargs={
+            "litellm_session_id": "incoming-client-session",
+            "metadata": {"spend_logs_metadata": {"openclaw_heartbeat": True}},
+        },
+        standard_logging_payload=None,
+    )
+
+    assert session_id == "openclaw:heartbeat"
+
+
 def test_get_session_id_for_spend_log_preserves_metadata_session_id_for_openclaw_human():
     human_session_id = "openclaw:human:78e07fa4-487b-483a-857a-7684fdc3ad03"
     standard_logging_payload = cast(

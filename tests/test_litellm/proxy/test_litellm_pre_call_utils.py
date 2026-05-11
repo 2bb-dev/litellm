@@ -271,7 +271,7 @@ what can you do?
         version="test-version",
     )
 
-    metadata = updated_data.get("metadata", {})
+    metadata = updated_data.get("litellm_metadata", {})
     human_session_id = "openclaw:telegram:-1001234567890"
     assert metadata["trace_user_id"] == "telegram:952754559"
     assert metadata["session_id"] == human_session_id
@@ -294,6 +294,76 @@ what can you do?
     assert (
         metadata["spend_logs_metadata"]["openclaw_conversation_id"]
         == human_session_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_extracts_openclaw_agent_answer_metadata_without_sender_block():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url = MagicMock()
+    request_mock.url.path = "/responses"
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    direct_session_id = "agent:main:telegram:direct:952754559"
+    inbound_text = f"""Conversation info (untrusted metadata):
+```json
+{{
+  "chat_id": "telegram:952754559",
+  "message_id": "restart-sentinel:{direct_session_id}:agentTurn:1778264173393",
+  "timestamp": "Fri 2026-05-08 21:16 GMT+3"
+}}
+```
+
+[Fri 2026-05-08 21:16 GMT+3] The gateway restart completed successfully. Tell the user OpenClaw restarted successfully and continue any pending work.
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "input": [
+            {
+                "role": "developer",
+                "content": "You are a personal assistant running inside OpenClaw.",
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": inbound_text}],
+            },
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["trace_user_id"] == "telegram:952754559"
+    assert metadata["openclaw_user_id"] == "telegram:952754559"
+    assert metadata["session_id"] == direct_session_id
+    assert updated_data["litellm_session_id"] == direct_session_id
+    assert metadata["openclaw_session_id"] == direct_session_id
+    assert metadata["openclaw_conversation_id"] == direct_session_id
+    assert metadata["openclaw_session_id_raw"] == direct_session_id
+    assert metadata["openclaw_channel"] == "telegram"
+    assert metadata["openclaw_sender_id"] == "952754559"
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_session_id"]
+        == direct_session_id
     )
 
 
@@ -1410,6 +1480,58 @@ async def test_add_litellm_data_to_request_groups_cron_metadata_without_sender_c
 
 
 @pytest.mark.asyncio
+async def test_add_litellm_data_to_request_ignores_generic_cron_metadata_without_openclaw_signal():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    data = {
+        "model": "gpt-4o-mini",
+        "metadata": {
+            "cron_id": "external-maintenance",
+            "schedule_id": "external-schedule",
+            "cron_name": "External maintenance",
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": "Run the caller's scheduled task.",
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    assert metadata["cron_id"] == "external-maintenance"
+    assert "openclaw_cron_id" not in metadata
+    assert "openclaw_execution_type" not in metadata
+    assert updated_data.get("litellm_session_id") != (
+        "openclaw:cron:external-maintenance"
+    )
+    assert "cron" not in metadata.get("tags", [])
+
+
+@pytest.mark.asyncio
 async def test_add_litellm_data_to_request_groups_cron_metadata_with_sender_context():
     request_mock = MagicMock(spec=Request)
     request_mock.url.path = "/chat/completions"
@@ -1923,7 +2045,9 @@ async def test_add_litellm_data_to_request_marks_session_send_to_subagent_sessio
     )
 
     metadata = updated_data.get("litellm_metadata", {})
-    assert metadata["openclaw_conversation_id"] == source_session_key
+    assert metadata["session_id"] == child_session_key
+    assert updated_data["litellm_session_id"] == child_session_key
+    assert metadata["openclaw_conversation_id"] == child_session_key
     assert metadata["openclaw_parent_session_id"] == source_session_key
     assert metadata["openclaw_target_session_id"] == child_session_key
     assert metadata["openclaw_execution_type"] == "subagent"
@@ -1985,10 +2109,10 @@ async def test_add_litellm_data_to_request_openclaw_current_subagent_template_li
         version="test-version",
     )
 
-    metadata = updated_data.get("metadata", {})
-    assert metadata["session_id"] == parent_session_key
-    assert updated_data["litellm_session_id"] == parent_session_key
-    assert metadata["openclaw_conversation_id"] == parent_session_key
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["session_id"] == child_session_key
+    assert updated_data["litellm_session_id"] == child_session_key
+    assert metadata["openclaw_conversation_id"] == child_session_key
     assert metadata["openclaw_parent_session_id"] == parent_session_key
     assert metadata["openclaw_subagent_session_id"] == child_session_key
     assert metadata["openclaw_sub_agent_id"] == child_session_key
@@ -2056,17 +2180,17 @@ async def test_add_litellm_data_to_request_subagent_template_ignores_response_se
     )
 
     metadata = updated_data.get("litellm_metadata", {})
-    assert metadata["session_id"] == parent_session_key
-    assert updated_data["litellm_session_id"] == parent_session_key
-    assert metadata["openclaw_session_id"] == parent_session_key
-    assert metadata["openclaw_conversation_id"] == parent_session_key
-    assert metadata["openclaw_session_id_raw"] == parent_session_key
+    assert metadata["session_id"] == child_session_key
+    assert updated_data["litellm_session_id"] == child_session_key
+    assert metadata["openclaw_session_id"] == child_session_key
+    assert metadata["openclaw_conversation_id"] == child_session_key
+    assert metadata["openclaw_session_id_raw"] == child_session_key
     assert metadata["openclaw_parent_session_id"] == parent_session_key
     assert metadata["openclaw_subagent_session_id"] == child_session_key
     assert metadata["openclaw_execution_id"] == response_session_id
     assert (
         metadata["spend_logs_metadata"]["openclaw_session_id"]
-        == parent_session_key
+        == child_session_key
     )
 
 
