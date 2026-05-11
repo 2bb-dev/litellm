@@ -4,7 +4,6 @@ import json
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import UUID
 
 import pytest
 from fastapi import Request
@@ -272,14 +271,14 @@ what can you do?
         version="test-version",
     )
 
-    metadata = updated_data.get("metadata", {})
-    human_session_id = metadata["session_id"]
+    metadata = updated_data.get("litellm_metadata", {})
+    human_session_id = "openclaw:telegram:-1001234567890"
     assert metadata["trace_user_id"] == "telegram:952754559"
-    assert human_session_id.startswith("openclaw:human:")
-    UUID(human_session_id.rsplit(":", 1)[1])
+    assert metadata["session_id"] == human_session_id
     assert updated_data["litellm_session_id"] == human_session_id
     assert metadata["openclaw_session_id"] == human_session_id
     assert metadata["openclaw_session_id_raw"] == human_session_id
+    assert metadata["openclaw_conversation_id"] == human_session_id
     assert metadata["openclaw_sender_username"] == "on_the_r0ad"
     assert metadata["openclaw_sender_label"] == "sashi (952754559)"
     assert metadata["openclaw_actor_id"] == "telegram:952754559"
@@ -290,8 +289,81 @@ what can you do?
     assert metadata["spend_logs_metadata"]["openclaw_actor_type"] == "human"
     assert metadata["spend_logs_metadata"]["openclaw_execution_type"] == "direct"
     assert (
-        metadata["spend_logs_metadata"]["openclaw_session_id"]
+        metadata["spend_logs_metadata"]["openclaw_session_id"] == human_session_id
+    )
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_conversation_id"]
         == human_session_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_extracts_openclaw_agent_answer_metadata_without_sender_block():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url = MagicMock()
+    request_mock.url.path = "/responses"
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    direct_session_id = "agent:main:telegram:direct:952754559"
+    inbound_text = f"""Conversation info (untrusted metadata):
+```json
+{{
+  "chat_id": "telegram:952754559",
+  "message_id": "restart-sentinel:{direct_session_id}:agentTurn:1778264173393",
+  "timestamp": "Fri 2026-05-08 21:16 GMT+3"
+}}
+```
+
+[Fri 2026-05-08 21:16 GMT+3] The gateway restart completed successfully. Tell the user OpenClaw restarted successfully and continue any pending work.
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "input": [
+            {
+                "role": "developer",
+                "content": "You are a personal assistant running inside OpenClaw.",
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": inbound_text}],
+            },
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["trace_user_id"] == "telegram:952754559"
+    assert metadata["openclaw_user_id"] == "telegram:952754559"
+    assert metadata["session_id"] == direct_session_id
+    assert updated_data["litellm_session_id"] == direct_session_id
+    assert metadata["openclaw_session_id"] == direct_session_id
+    assert metadata["openclaw_conversation_id"] == direct_session_id
+    assert metadata["openclaw_session_id_raw"] == direct_session_id
+    assert metadata["openclaw_channel"] == "telegram"
+    assert metadata["openclaw_sender_id"] == "952754559"
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_session_id"]
+        == direct_session_id
     )
 
 
@@ -1055,11 +1127,13 @@ hello
     assert metadata["openclaw_channel"] == "mattermost"
     assert metadata["trace_user_id"] == "mattermost:pwanex3ne3fx58nr5oaxg4j54w"
     assert metadata["openclaw_user_id"] == "mattermost:pwanex3ne3fx58nr5oaxg4j54w"
-    human_session_id = metadata["session_id"]
-    assert human_session_id.startswith("openclaw:human:")
-    UUID(human_session_id.rsplit(":", 1)[1])
+    human_session_id = (
+        "openclaw:#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+    )
+    assert metadata["session_id"] == human_session_id
     assert metadata["openclaw_session_id"] == human_session_id
     assert metadata["openclaw_session_id_raw"] == human_session_id
+    assert metadata["openclaw_conversation_id"] == human_session_id
     assert metadata["openclaw_sender_id"] == "pwanex3ne3fx58nr5oaxg4j54w"
     assert metadata["openclaw_sender_name"] == "@ziabinartem"
     assert (
@@ -1089,9 +1163,7 @@ hello
     )
     second_metadata = second_updated_data.get("metadata", {})
     second_human_session_id = second_metadata["session_id"]
-    assert second_human_session_id.startswith("openclaw:human:")
-    UUID(second_human_session_id.rsplit(":", 1)[1])
-    assert second_human_session_id != human_session_id
+    assert second_human_session_id == human_session_id
 
 
 @pytest.mark.asyncio
@@ -1225,8 +1297,10 @@ Sender (untrusted metadata):
     )
     assert metadata["openclaw_channel"] == "mattermost"
     assert metadata["trace_user_id"] == "mattermost:pwanex3ne3fx58nr5oaxg4j54w"
-    assert metadata["session_id"].startswith("openclaw:human:")
-    UUID(metadata["session_id"].rsplit(":", 1)[1])
+    assert (
+        metadata["session_id"]
+        == "openclaw:#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+    )
     assert metadata["openclaw_sender_name"] == "@ziabinartem"
 
 
@@ -1285,8 +1359,7 @@ HEARTBEAT_OK
     metadata = updated_data.get("litellm_metadata", {})
     heartbeat_session_id = metadata["session_id"]
     assert metadata["openclaw_heartbeat"] is True
-    assert heartbeat_session_id.startswith("openclaw:heartbeat:")
-    UUID(heartbeat_session_id.rsplit(":", 1)[1])
+    assert heartbeat_session_id == "openclaw:heartbeat"
     assert updated_data["litellm_session_id"] == heartbeat_session_id
     assert metadata["openclaw_channel"] == "heartbeat"
     assert metadata["openclaw_actor_type"] == "system"
@@ -1350,7 +1423,191 @@ async def test_add_litellm_data_to_request_marks_openclaw_heartbeat_from_trusted
     assert metadata["openclaw_heartbeat"] is True
     assert metadata["openclaw_channel"] == "heartbeat"
     assert metadata["openclaw_execution_type"] == "heartbeat"
-    assert metadata["session_id"].startswith("openclaw:heartbeat:")
+    assert metadata["session_id"] == "openclaw:heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_groups_cron_metadata_without_sender_context():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    data = {
+        "model": "gpt-4o-mini",
+        "metadata": {
+            "openclaw_cron_id": "daily-price-audit",
+            "openclaw_cron_name": "Daily price audit",
+            "openclaw_cron_run_id": "2026-04-28T20:00:00Z",
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": "Run the scheduled audit.",
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    expected_session = (
+        "openclaw:cron:daily-price-audit:run:2026-04-28T20:00:00Z"
+    )
+    assert metadata["session_id"] == expected_session
+    assert metadata["openclaw_conversation_id"] == expected_session
+    assert metadata["openclaw_execution_type"] == "cron"
+    assert updated_data["litellm_session_id"] == expected_session
+    assert metadata["spend_logs_metadata"]["openclaw_cron_id"] == "daily-price-audit"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_ignores_generic_cron_metadata_without_openclaw_signal():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    data = {
+        "model": "gpt-4o-mini",
+        "metadata": {
+            "cron_id": "external-maintenance",
+            "schedule_id": "external-schedule",
+            "cron_name": "External maintenance",
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": "Run the caller's scheduled task.",
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    assert metadata["cron_id"] == "external-maintenance"
+    assert "openclaw_cron_id" not in metadata
+    assert "openclaw_execution_type" not in metadata
+    assert updated_data.get("litellm_session_id") != (
+        "openclaw:cron:external-maintenance"
+    )
+    assert "cron" not in metadata.get("tags", [])
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_groups_cron_metadata_with_sender_context():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    inbound_text = """Conversation info (untrusted metadata):
+```json
+{
+  "message_id": "msg-123",
+  "sender_id": "952754559",
+  "group_channel": "telegram:-1001234567890",
+  "topic_id": "777",
+  "conversation_label": "OpenClaw Chat"
+}
+```
+
+Sender (untrusted metadata):
+```json
+{
+  "label": "sashi (952754559)",
+  "id": "952754559",
+  "name": "sashi",
+  "username": "on_the_r0ad"
+}
+```
+
+Run the scheduled audit.
+"""
+
+    data = {
+        "model": "gpt-4o-mini",
+        "metadata": {
+            "openclaw_cron_id": "daily-price-audit",
+            "openclaw_cron_name": "Daily price audit",
+            "openclaw_cron_run_id": "2026-04-28T20:00:00Z",
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": inbound_text}],
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("metadata", {})
+    expected_session = (
+        "openclaw:cron:daily-price-audit:run:2026-04-28T20:00:00Z"
+    )
+    assert metadata["session_id"] == expected_session
+    assert metadata["openclaw_conversation_id"] == expected_session
+    assert metadata["openclaw_execution_type"] == "cron"
+    assert updated_data["litellm_session_id"] == expected_session
+    assert "cron" in metadata["tags"]
+    assert metadata["spend_logs_metadata"]["openclaw_execution_type"] == "cron"
+    assert metadata["spend_logs_metadata"]["openclaw_cron_id"] == "daily-price-audit"
 
 
 @pytest.mark.asyncio
@@ -1492,8 +1749,10 @@ Sender (untrusted metadata):
     metadata = updated_data.get("litellm_metadata", {})
     assert "openclaw_heartbeat" not in metadata
     assert metadata["openclaw_channel"] == "mattermost"
-    assert metadata["session_id"].startswith("openclaw:human:")
-    UUID(metadata["session_id"].rsplit(":", 1)[1])
+    assert (
+        metadata["session_id"]
+        == "openclaw:#k44wj45fg3rixj63dsm9py5agr__pwanex3ne3fx58nr5oaxg4j54w"
+    )
 
 
 @pytest.mark.asyncio
@@ -1561,7 +1820,16 @@ async def test_add_litellm_data_to_request_tags_openclaw_subagent_template_witho
     assert metadata["session_id"] == requester_session_id
     assert updated_data["litellm_session_id"] == requester_session_id
     assert metadata["tags"] == ["0: User-Agent: OpenAI", "subagent"]
-    assert "openclaw_session_id" not in metadata
+    assert metadata["openclaw_session_id"] == requester_session_id
+    assert metadata["openclaw_conversation_id"] == requester_session_id
+    assert metadata["openclaw_parent_session_id"] == requester_session_id
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["spend_logs_metadata"]["openclaw_execution_type"] == "subagent"
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_parent_session_id"]
+        == requester_session_id
+    )
 
 
 @pytest.mark.asyncio
@@ -1608,6 +1876,322 @@ async def test_add_litellm_data_to_request_tags_openclaw_subagent_messages_templ
     assert metadata["tags"] == ["subagent"]
     assert "session_id" not in metadata
     assert "openclaw_session_id" not in metadata
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["spend_logs_metadata"]["openclaw_execution_type"] == "subagent"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_uses_subagent_tag_when_prompt_markers_absent():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/responses"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {
+        "Content-Type": "application/json",
+        "user-agent": "OpenAI",
+    }
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    data = {
+        "model": "gpt-4o-mini",
+        "litellm_metadata": {"tags": ["subagent"]},
+        "input": [
+            {
+                "role": "user",
+                "content": "Summarize current task state.",
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={"allow_client_tags": True},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["tags"] == ["subagent"]
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["spend_logs_metadata"]["openclaw_execution_type"] == "subagent"
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_links_openclaw_session_send_without_subagent_prompt():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/responses"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {
+        "Content-Type": "application/json",
+        "user-agent": "OpenAI",
+    }
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    source_session_key = "agent:prometheus:mattermost:direct:human-source"
+    target_session_key = "agent:victor:mattermost:direct:human-target"
+    data = {
+        "model": "gpt-4o-mini",
+        "litellm_metadata": {"session_id": target_session_key},
+        "input": [
+            {
+                "role": "user",
+                "content": (
+                    "[Inter-session message] "
+                    f"sourceSession={source_session_key} "
+                    "sourceChannel=mattermost sourceTool=sessions_send isUser=false\n"
+                    "Please inspect this file and report back."
+                ),
+            }
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["session_id"] == source_session_key
+    assert updated_data["litellm_session_id"] == source_session_key
+    assert metadata["openclaw_conversation_id"] == source_session_key
+    assert metadata["openclaw_parent_session_id"] == source_session_key
+    assert metadata["openclaw_source_session_id"] == source_session_key
+    assert metadata["openclaw_target_session_id"] == target_session_key
+    assert metadata["openclaw_source_tool"] == "sessions_send"
+    assert metadata["openclaw_input_provenance_kind"] == "inter_session"
+    assert metadata["openclaw_execution_type"] == "agent_to_agent"
+    assert metadata["tags"] == ["inter_session", "agent_to_agent"]
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_source_session_id"]
+        == source_session_key
+    )
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_target_session_id"]
+        == target_session_key
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_marks_session_send_to_subagent_session():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/responses"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {
+        "Content-Type": "application/json",
+        "user-agent": "OpenAI",
+    }
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    source_session_key = "agent:prometheus:mattermost:direct:human-source"
+    child_session_key = "agent:prometheus:subagent:7fb5a22e"
+    data = {
+        "model": "gpt-4o-mini",
+        "litellm_metadata": {
+            "session_id": child_session_key,
+            "inputProvenance": {
+                "kind": "inter_session",
+                "sourceSessionKey": source_session_key,
+                "sourceChannel": "mattermost",
+                "sourceTool": "sessions_send",
+            },
+        },
+        "input": [{"role": "user", "content": "Continue the delegated task."}],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["session_id"] == child_session_key
+    assert updated_data["litellm_session_id"] == child_session_key
+    assert metadata["openclaw_conversation_id"] == child_session_key
+    assert metadata["openclaw_parent_session_id"] == source_session_key
+    assert metadata["openclaw_target_session_id"] == child_session_key
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["tags"] == ["inter_session", "subagent"]
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_openclaw_current_subagent_template_links_parent_and_child_sessions():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/responses"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    parent_session_key = "agent:prometheus:mattermost:direct:cw8r1sen13nczfytc5ptgish3e"
+    child_session_key = "agent:prometheus:subagent:7fb5a22e"
+    data = {
+        "model": "gpt-4o-mini",
+        "input": [
+            {
+                "role": "developer",
+                "content": (
+                    "# Subagent Context\n\n"
+                    "You are a **subagent** spawned by the main agent for a specific task.\n\n"
+                    "## Session Context\n"
+                    f"- Requester session: {parent_session_key}.\n"
+                    f"- Your session: {child_session_key}.\n"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "[Subagent Context] You are running as a subagent (depth 1/1). "
+                    "Results auto-announce to your requester; do not busy-poll for status.\n\n"
+                    "Begin. Your assigned task is in the system prompt under **Your Role**; "
+                    "execute it to completion."
+                ),
+            },
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["session_id"] == child_session_key
+    assert updated_data["litellm_session_id"] == child_session_key
+    assert metadata["openclaw_conversation_id"] == child_session_key
+    assert metadata["openclaw_parent_session_id"] == parent_session_key
+    assert metadata["openclaw_subagent_session_id"] == child_session_key
+    assert metadata["openclaw_sub_agent_id"] == child_session_key
+    assert metadata["openclaw_execution_type"] == "subagent"
+    assert metadata["openclaw_actor_type"] == "subagent"
+    assert metadata["tags"] == ["subagent"]
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_subagent_session_id"]
+        == child_session_key
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_subagent_template_ignores_response_session_id():
+    request_mock = MagicMock(spec=Request)
+    request_mock.url = MagicMock()
+    request_mock.url.path = "/responses"
+    request_mock.url.__str__.return_value = "http://localhost/responses"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    parent_session_key = "agent:prometheus:mattermost:direct:cw8r1sen13nczfytc5ptgish3e"
+    child_session_key = "agent:prometheus:subagent:7fb5a22e"
+    response_session_id = "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVy"
+    data = {
+        "model": "gpt-4o-mini",
+        "litellm_metadata": {
+            "session_id": response_session_id,
+            "response_id": response_session_id,
+        },
+        "input": [
+            {
+                "role": "developer",
+                "content": (
+                    "# Subagent Context\n\n"
+                    "You are a **subagent** spawned by the main agent for a specific task.\n\n"
+                    "## Session Context\n"
+                    f"- Requester session: {parent_session_key}.\n"
+                    f"- Your session: {child_session_key}.\n"
+                ),
+            },
+            {
+                "role": "user",
+                "content": "[Subagent Task]: inspect and report.",
+            },
+        ],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={},
+        team_metadata={},
+    )
+
+    updated_data = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    metadata = updated_data.get("litellm_metadata", {})
+    assert metadata["session_id"] == child_session_key
+    assert updated_data["litellm_session_id"] == child_session_key
+    assert metadata["openclaw_session_id"] == child_session_key
+    assert metadata["openclaw_conversation_id"] == child_session_key
+    assert metadata["openclaw_session_id_raw"] == child_session_key
+    assert metadata["openclaw_parent_session_id"] == parent_session_key
+    assert metadata["openclaw_subagent_session_id"] == child_session_key
+    assert metadata["openclaw_execution_id"] == response_session_id
+    assert (
+        metadata["spend_logs_metadata"]["openclaw_session_id"]
+        == child_session_key
+    )
 
 
 @pytest.mark.asyncio

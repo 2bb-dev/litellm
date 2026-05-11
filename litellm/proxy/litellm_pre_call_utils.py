@@ -117,6 +117,29 @@ OPENCLAW_HUMAN_SESSION_ID = f"{OPENCLAW_SESSION_PREFIX}:human"
 OPENCLAW_SUB_AGENT_TAG = "subagent"
 OPENCLAW_SUBAGENT_CONTEXT_MARKER = "[Subagent Context]"
 OPENCLAW_SUBAGENT_TASK_MARKER = "[Subagent Task]"
+OPENCLAW_SUBAGENT_SYSTEM_HEADING = "# Subagent Context"
+OPENCLAW_SUBAGENT_SPAWNED_MARKER = "You are a **subagent** spawned"
+OPENCLAW_INTER_SESSION_PROMPT_PREFIX = "[Inter-session message]"
+_OPENCLAW_SUBAGENT_REQUESTER_SESSION_RE = re.compile(
+    r"^\s*-\s*Requester session:\s*([^\n.]+)\.?\s*$",
+    re.MULTILINE,
+)
+_OPENCLAW_SUBAGENT_CHILD_SESSION_RE = re.compile(
+    r"^\s*-\s*Your session:\s*([^\n.]+)\.?\s*$",
+    re.MULTILINE,
+)
+_OPENCLAW_INTER_SESSION_PREFIX_RE = re.compile(
+    r"\[Inter-session message\](?P<header>[^\n]*)",
+)
+_OPENCLAW_INTER_SESSION_FIELD_RE = re.compile(
+    r"(?P<key>sourceSession|sourceChannel|sourceTool|isUser)=(?P<value>\S+)"
+)
+_OPENCLAW_DIRECT_SESSION_IN_MESSAGE_ID_RE = re.compile(
+    r"(?P<session>agent:[^:\s]+:"
+    r"(?P<channel>mattermost|telegram):direct:"
+    r"(?P<peer>[^:\s]+))(?::agentTurn(?::|$)|$)",
+    re.IGNORECASE,
+)
 
 
 def _get_metadata_variable_name(request: Request) -> str:
@@ -128,6 +151,8 @@ def _get_metadata_variable_name(request: Request) -> str:
     For ALL other endpoints we call this "metadata"
     """
     path = request.url.path
+    if not isinstance(path, str):
+        path = str(request.url)
 
     if "thread" in path or "assistant" in path:
         return "litellm_metadata"
@@ -177,6 +202,31 @@ def _normalize_openclaw_observability_string(
         return normalized[:max_length]
 
     return normalized
+
+
+def _is_openclaw_request_like_session_id(value: Optional[str]) -> bool:
+    if not isinstance(value, str):
+        return True
+    normalized = value.strip()
+    if not normalized:
+        return True
+    if normalized.startswith(("resp_", "resp-")):
+        return True
+    if re.match(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.match(
+        r"^openclaw:(?:human|heartbeat):"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12}$",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
 
 
 def _build_openclaw_bounded_identifier(
@@ -370,7 +420,9 @@ def _resolve_openclaw_channel(
 ) -> Optional[str]:
     candidate_values = [
         (conversation_info or {}).get("group_channel"),
+        (conversation_info or {}).get("chat_id"),
         (sender_info or {}).get("group_channel"),
+        (sender_info or {}).get("chat_id"),
         (conversation_info or {}).get("channel"),
         (sender_info or {}).get("channel"),
         (conversation_info or {}).get("provider"),
@@ -389,6 +441,58 @@ def _resolve_openclaw_channel(
             return normalized_channel
 
     return None
+
+
+def _resolve_openclaw_chat_peer(
+    conversation_info: Optional[dict],
+) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(conversation_info, dict):
+        return None, None
+
+    chat_id = _normalize_openclaw_observability_string(
+        conversation_info.get("chat_id"), max_length=160
+    )
+    if chat_id is None or ":" not in chat_id:
+        return None, None
+
+    raw_channel, _, raw_peer_id = chat_id.partition(":")
+    channel = _normalize_openclaw_channel_name(raw_channel)
+    peer_id = _normalize_openclaw_observability_string(raw_peer_id, max_length=120)
+    if channel is None or peer_id is None:
+        return None, None
+
+    if channel == "telegram" and peer_id.isdigit():
+        return channel, peer_id
+    if channel == "mattermost":
+        return channel, peer_id
+    return None, None
+
+
+def _resolve_openclaw_direct_session_from_message_id(
+    conversation_info: Optional[dict],
+    inferred_channel: Optional[str],
+    sender_id: Optional[str],
+) -> Optional[str]:
+    if not isinstance(conversation_info, dict):
+        return None
+
+    message_id = _normalize_openclaw_observability_string(
+        conversation_info.get("message_id"), max_length=240
+    )
+    if message_id is None:
+        return None
+
+    match = _OPENCLAW_DIRECT_SESSION_IN_MESSAGE_ID_RE.search(message_id)
+    if not match:
+        return None
+
+    channel = match.group("channel").lower()
+    peer_id = match.group("peer")
+    if inferred_channel is not None and channel != inferred_channel:
+        return None
+    if sender_id is not None and peer_id != sender_id:
+        return None
+    return match.group("session")
 
 
 def _is_openclaw_heartbeat(
@@ -420,11 +524,32 @@ def _resolve_openclaw_trusted_inbound_channel(data: dict) -> Optional[str]:
 
 
 def _is_openclaw_subagent_request(data: dict) -> bool:
-    """Detect OpenClaw subagent task requests from the user input template."""
+    """Detect OpenClaw subagent requests from current and legacy templates."""
+
+    for metadata_key in ("metadata", "litellm_metadata"):
+        metadata = data.get(metadata_key)
+        if not isinstance(metadata, dict):
+            continue
+        tags = metadata.get("tags")
+        if not isinstance(tags, list):
+            continue
+        for tag in tags:
+            if isinstance(tag, str) and tag.lower() == OPENCLAW_SUB_AGENT_TAG:
+                return True
 
     has_context_marker = False
     has_task_marker = False
-    for text in _iter_openclaw_input_content_texts(data, allowed_roles={"user"}):
+    for text in _iter_openclaw_input_content_texts(data):
+        if (
+            OPENCLAW_SUBAGENT_SYSTEM_HEADING in text
+            and OPENCLAW_SUBAGENT_SPAWNED_MARKER in text
+        ):
+            return True
+        if (
+            OPENCLAW_SUBAGENT_CONTEXT_MARKER in text
+            and "running as a subagent" in text.lower()
+        ):
+            return True
         if OPENCLAW_SUBAGENT_CONTEXT_MARKER in text:
             has_context_marker = True
         if OPENCLAW_SUBAGENT_TASK_MARKER in text:
@@ -432,6 +557,131 @@ def _is_openclaw_subagent_request(data: dict) -> bool:
         if has_context_marker and has_task_marker:
             return True
     return False
+
+
+def _extract_openclaw_inter_session_context(data: dict) -> dict:
+    """Extract OpenClaw inter-session provenance from metadata or prompt prefix."""
+
+    for metadata_key in ("metadata", "litellm_metadata"):
+        metadata = data.get(metadata_key)
+        if not isinstance(metadata, dict):
+            continue
+        provenance = metadata.get("inputProvenance") or metadata.get("input_provenance")
+        if isinstance(provenance, str):
+            try:
+                parsed = safe_json_loads(provenance)
+            except Exception:
+                parsed = None
+            provenance = parsed
+        if not isinstance(provenance, dict):
+            continue
+        if provenance.get("kind") != "inter_session":
+            continue
+        context: Dict[str, str] = {"kind": "inter_session"}
+        source_session = _normalize_openclaw_observability_string(
+            provenance.get("sourceSessionKey") or provenance.get("source_session_key"),
+            max_length=200,
+        )
+        source_channel = _normalize_openclaw_observability_string(
+            provenance.get("sourceChannel") or provenance.get("source_channel"),
+            max_length=120,
+        )
+        source_tool = _normalize_openclaw_observability_string(
+            provenance.get("sourceTool") or provenance.get("source_tool"),
+            max_length=120,
+        )
+        if source_session is not None:
+            context["source_session_id"] = source_session
+        if source_channel is not None:
+            context["source_channel"] = source_channel
+        if source_tool is not None:
+            context["source_tool"] = source_tool
+        return context
+
+    for text in _iter_openclaw_input_content_texts(data):
+        prefix_match = _OPENCLAW_INTER_SESSION_PREFIX_RE.search(text)
+        if not prefix_match:
+            continue
+        context = {"kind": "inter_session"}
+        for field_match in _OPENCLAW_INTER_SESSION_FIELD_RE.finditer(
+            prefix_match.group("header")
+        ):
+            key = field_match.group("key")
+            value = _normalize_openclaw_observability_string(
+                field_match.group("value"), max_length=200
+            )
+            if value is None:
+                continue
+            if key == "sourceSession":
+                context["source_session_id"] = value
+            elif key == "sourceChannel":
+                context["source_channel"] = value
+            elif key == "sourceTool":
+                context["source_tool"] = value
+        return context
+
+    return {}
+
+
+def _is_openclaw_subagent_session_value(value: Optional[str]) -> bool:
+    normalized = _normalize_openclaw_observability_string(value, max_length=240)
+    if normalized is None:
+        return False
+    return ":subagent:" in normalized.lower()
+
+
+def _resolve_openclaw_inter_session_execution_type(
+    inter_session_context: dict,
+    fallback_execution_type: str,
+    *,
+    source_session_id: Optional[str],
+    target_session_id: Optional[str],
+    is_subagent_request: bool,
+) -> str:
+    if not inter_session_context:
+        return fallback_execution_type
+
+    source_tool = (
+        inter_session_context.get("source_tool", "").strip().lower().replace("-", "_")
+    )
+    if (
+        is_subagent_request
+        or source_tool.startswith("subagent")
+        or _is_openclaw_subagent_session_value(source_session_id)
+        or _is_openclaw_subagent_session_value(target_session_id)
+    ):
+        return "subagent"
+
+    if fallback_execution_type in {"heartbeat", "cron", "system"}:
+        return fallback_execution_type
+    return "agent_to_agent"
+
+
+def _extract_openclaw_subagent_session_context(data: dict) -> dict:
+    """Extract parent/child session keys from OpenClaw subagent prompt text."""
+
+    context: Dict[str, str] = {}
+    for text in _iter_openclaw_input_content_texts(data):
+        requester_match = _OPENCLAW_SUBAGENT_REQUESTER_SESSION_RE.search(text)
+        if requester_match and "parent_session_id" not in context:
+            parent_session_id = _normalize_openclaw_observability_string(
+                requester_match.group(1), max_length=200
+            )
+            if parent_session_id is not None:
+                context["parent_session_id"] = parent_session_id
+
+        child_match = _OPENCLAW_SUBAGENT_CHILD_SESSION_RE.search(text)
+        if child_match and "subagent_session_id" not in context:
+            subagent_session_id = _normalize_openclaw_observability_string(
+                child_match.group(1), max_length=200
+            )
+            if subagent_session_id is not None:
+                context["subagent_session_id"] = subagent_session_id
+
+        if "parent_session_id" in context and "subagent_session_id" in context:
+            break
+
+    return context
 
 
 def _resolve_openclaw_sub_agent_suffix(sender_info: Optional[dict]) -> Optional[str]:
@@ -621,9 +871,12 @@ def _resolve_openclaw_execution_type(
     actor_type: Optional[str],
     parent_user_id: Optional[str],
     is_heartbeat: bool,
+    cron_id: Optional[str],
 ) -> str:
     if is_heartbeat:
         return "heartbeat"
+    if cron_id is not None:
+        return "cron"
 
     for info in (sender_info, conversation_info):
         if not isinstance(info, dict):
@@ -637,6 +890,7 @@ def _resolve_openclaw_execution_type(
                 "subagent",
                 "agent_to_agent",
                 "heartbeat",
+                "cron",
                 "bot_only",
                 "system",
                 "unknown",
@@ -668,11 +922,255 @@ def _merge_openclaw_tags(existing_tags: Any, new_tags: List[str]) -> List[str]:
 
 
 def _generate_openclaw_heartbeat_session_id() -> str:
-    return f"{OPENCLAW_HEARTBEAT_SESSION_ID}:{uuid.uuid4()}"
+    return OPENCLAW_HEARTBEAT_SESSION_ID
 
 
 def _generate_openclaw_human_session_id() -> str:
     return f"{OPENCLAW_HUMAN_SESSION_ID}:{uuid.uuid4()}"
+
+
+def _first_openclaw_metadata_value(
+    keys: Tuple[str, ...],
+    *sources: Optional[dict],
+    max_length: int = 160,
+) -> Optional[str]:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = _normalize_openclaw_observability_string(
+                source.get(key), max_length=max_length
+            )
+            if value is not None:
+                return value
+    return None
+
+
+def _has_openclaw_metadata_signal(source: Optional[dict]) -> bool:
+    signal_keys = {
+        "openclaw_user_id",
+        "openclaw_actor_id",
+        "openclaw_actor_type",
+        "openclaw_channel",
+        "openclaw_conversation_id",
+        "openclaw_session_id",
+        "openclaw_parent_session_id",
+        "openclaw_sub_agent_id",
+        "openclaw_subagent_session_id",
+        "openclaw_heartbeat",
+        "openclaw_input_provenance_kind",
+        "openclaw_source_tool",
+        "openclaw_source_session_id",
+        "openclaw_target_session_id",
+    }
+
+    def has_signal_key(candidate: dict) -> bool:
+        return any(key in candidate for key in signal_keys)
+
+    if not isinstance(source, dict):
+        return False
+    if has_signal_key(source):
+        return True
+    spend_logs_metadata = source.get("spend_logs_metadata")
+    return isinstance(spend_logs_metadata, dict) and has_signal_key(
+        spend_logs_metadata
+    )
+
+
+def _build_openclaw_cron_metadata(
+    existing_metadata: dict,
+    cron_id: str,
+    cron_name: Optional[str],
+    cron_run_id: Optional[str],
+) -> dict:
+    raw_session_id = (
+        f"{OPENCLAW_SESSION_PREFIX}:cron:{cron_id}:run:{cron_run_id}"
+        if cron_run_id
+        else f"{OPENCLAW_SESSION_PREFIX}:cron:{cron_id}"
+    )
+    session_id = _build_openclaw_bounded_identifier(
+        raw_session_id,
+        prefix=f"{OPENCLAW_SESSION_PREFIX}-session",
+    )
+    synthetic: Dict[str, Any] = {
+        "session_id": session_id,
+        "openclaw_session_id": session_id,
+        "openclaw_conversation_id": session_id,
+        "openclaw_session_id_raw": raw_session_id,
+        "openclaw_cron_id": cron_id,
+        "openclaw_cron_name": cron_name,
+        "openclaw_cron_run_id": cron_run_id,
+        "openclaw_execution_type": "cron",
+        "tags": _merge_openclaw_tags(existing_metadata.get("tags"), ["cron"]),
+    }
+    merged_spend_logs_metadata = copy.deepcopy(
+        existing_metadata.get("spend_logs_metadata")
+        if isinstance(existing_metadata.get("spend_logs_metadata"), dict)
+        else {}
+    )
+    for key, value in synthetic.items():
+        if key.startswith("openclaw_") and value is not None:
+            merged_spend_logs_metadata[key] = value
+    synthetic["spend_logs_metadata"] = merged_spend_logs_metadata
+    return {key: value for key, value in synthetic.items() if value is not None}
+
+
+def _build_openclaw_subagent_template_metadata(
+    data: dict, existing_metadata: dict
+) -> dict:
+    """
+    Build metadata for legacy OpenClaw subagent requests that only include the
+    prompt template markers, not the newer sender/conversation JSON blocks.
+
+    Preserve the child session as the LiteLLM/OpenClaw session when callers
+    provide one. The parent conversation remains available through
+    openclaw_parent_session_id so dashboards can show a combined timeline
+    without erasing the per-run subagent boundary.
+    """
+
+    prompt_context = _extract_openclaw_subagent_session_context(data)
+    prompt_parent_session_id = prompt_context.get("parent_session_id")
+    prompt_subagent_session_id = prompt_context.get("subagent_session_id")
+
+    metadata_conversation_id_raw = _first_openclaw_metadata_value(
+        ("openclaw_conversation_id",),
+        existing_metadata,
+        max_length=200,
+    )
+    metadata_conversation_id = (
+        metadata_conversation_id_raw
+        if metadata_conversation_id_raw is not None
+        and not _is_openclaw_request_like_session_id(metadata_conversation_id_raw)
+        else None
+    )
+    metadata_parent_session_id_raw = _first_openclaw_metadata_value(
+        ("openclaw_parent_session_id", "parent_session_id"),
+        existing_metadata,
+        max_length=200,
+    )
+    metadata_parent_session_id = (
+        metadata_parent_session_id_raw
+        if metadata_parent_session_id_raw is not None
+        and not _is_openclaw_request_like_session_id(metadata_parent_session_id_raw)
+        else None
+    )
+    metadata_session_id = _first_openclaw_metadata_value(
+        (
+            "openclaw_session_id",
+            "session_id",
+            "litellm_session_id",
+        ),
+        existing_metadata,
+        max_length=200,
+    )
+    metadata_session_is_subagent = _is_openclaw_subagent_session_value(
+        metadata_session_id
+    )
+    stable_metadata_session_id = (
+        metadata_session_id
+        if metadata_session_id is not None
+        and not _is_openclaw_request_like_session_id(metadata_session_id)
+        and not metadata_session_is_subagent
+        else None
+    )
+    subagent_session_id = _first_openclaw_metadata_value(
+        (
+            "openclaw_subagent_session_id",
+            "openclaw_child_session_id",
+            "child_session_id",
+        ),
+        existing_metadata,
+        max_length=200,
+    ) or prompt_subagent_session_id or (
+        metadata_session_id if metadata_session_is_subagent else None
+    )
+    sub_agent_id = _first_openclaw_metadata_value(
+        (
+            "openclaw_sub_agent_id",
+            "openclaw_subagent_id",
+            "sub_agent_id",
+            "subagent_id",
+        ),
+        existing_metadata,
+        max_length=120,
+    ) or subagent_session_id
+    subagent_session_id = subagent_session_id or (
+        sub_agent_id if _is_openclaw_subagent_session_value(sub_agent_id) else None
+    )
+    raw_session_id = (
+        subagent_session_id
+        or (metadata_session_id if metadata_session_is_subagent else None)
+        or stable_metadata_session_id
+        or metadata_conversation_id
+        or metadata_parent_session_id
+        or prompt_parent_session_id
+    )
+    session_id = (
+        _build_openclaw_bounded_identifier(
+            raw_session_id,
+            prefix=f"{OPENCLAW_SESSION_PREFIX}-session",
+        )
+        if raw_session_id is not None
+        else None
+    )
+    parent_session_id = (
+        metadata_parent_session_id
+        or prompt_parent_session_id
+        or (
+            metadata_conversation_id
+            if metadata_conversation_id is not None
+            and metadata_conversation_id != raw_session_id
+            else None
+        )
+        or (
+            stable_metadata_session_id
+            if subagent_session_id is not None
+            and stable_metadata_session_id is not None
+            and stable_metadata_session_id != raw_session_id
+            else None
+        )
+    )
+    execution_id = _first_openclaw_metadata_value(
+        ("openclaw_execution_id", "execution_id", "response_id", "request_id"),
+        existing_metadata,
+        max_length=180,
+    )
+    synthetic: Dict[str, Any] = {
+        "session_id": session_id,
+        "openclaw_session_id": session_id,
+        "openclaw_conversation_id": session_id,
+        "openclaw_session_id_raw": raw_session_id,
+        "openclaw_parent_session_id": parent_session_id,
+        "openclaw_execution_id": execution_id,
+        "openclaw_execution_type": "subagent",
+        "openclaw_actor_type": "subagent",
+        "openclaw_sub_agent_id": sub_agent_id,
+        "openclaw_subagent_session_id": subagent_session_id,
+        "tags": _merge_openclaw_tags(
+            existing_metadata.get("tags"), [OPENCLAW_SUB_AGENT_TAG]
+        ),
+    }
+    merged_spend_logs_metadata = copy.deepcopy(
+        existing_metadata.get("spend_logs_metadata")
+        if isinstance(existing_metadata.get("spend_logs_metadata"), dict)
+        else {}
+    )
+    child_session_spend_keys = {
+        "openclaw_session_id",
+        "openclaw_conversation_id",
+        "openclaw_session_id_raw",
+        "openclaw_subagent_session_id",
+        "openclaw_execution_type",
+        "openclaw_actor_type",
+    }
+    for key, value in synthetic.items():
+        if key.startswith("openclaw_") and value is not None:
+            if key in child_session_spend_keys:
+                merged_spend_logs_metadata[key] = value
+            else:
+                merged_spend_logs_metadata.setdefault(key, value)
+    synthetic["spend_logs_metadata"] = merged_spend_logs_metadata
+    return {key: value for key, value in synthetic.items() if value is not None}
 
 
 def _build_openclaw_observability_metadata(
@@ -703,6 +1201,7 @@ def _build_openclaw_observability_metadata(
     trusted_inbound_channel = _resolve_openclaw_trusted_inbound_channel(data=data)
     is_heartbeat = trusted_inbound_channel == OPENCLAW_HEARTBEAT_TAG
     is_subagent_request = _is_openclaw_subagent_request(data=data)
+    inter_session_context = _extract_openclaw_inter_session_context(data=data)
     heartbeat_session_id = (
         _generate_openclaw_heartbeat_session_id() if is_heartbeat else None
     )
@@ -710,30 +1209,184 @@ def _build_openclaw_observability_metadata(
     existing_metadata_dict: dict = (
         existing_metadata if isinstance(existing_metadata, dict) else {}
     )
+    has_openclaw_signal = (
+        sender_info is not None
+        or conversation_info is not None
+        or trusted_inbound_channel is not None
+        or is_heartbeat
+        or is_subagent_request
+        or bool(inter_session_context)
+        or _has_openclaw_metadata_signal(existing_metadata_dict)
+    )
+    generic_metadata_cron_id = _first_openclaw_metadata_value(
+        ("cron_id", "schedule_id"),
+        existing_metadata_dict,
+        max_length=120,
+    )
+    generic_metadata_cron_name = _first_openclaw_metadata_value(
+        ("cron_name", "schedule_name"),
+        existing_metadata_dict,
+        max_length=160,
+    )
+    generic_metadata_cron_run_id = _first_openclaw_metadata_value(
+        ("cron_run_id", "schedule_run_id"),
+        existing_metadata_dict,
+        max_length=160,
+    )
+    metadata_cron_id = _first_openclaw_metadata_value(
+        ("openclaw_cron_id",),
+        existing_metadata_dict,
+        max_length=120,
+    ) or (generic_metadata_cron_id if has_openclaw_signal else None)
+    metadata_cron_name = _first_openclaw_metadata_value(
+        ("openclaw_cron_name",),
+        existing_metadata_dict,
+        max_length=160,
+    ) or (generic_metadata_cron_name if has_openclaw_signal else None)
+    metadata_cron_run_id = _first_openclaw_metadata_value(
+        ("openclaw_cron_run_id",),
+        existing_metadata_dict,
+        max_length=160,
+    ) or (generic_metadata_cron_run_id if has_openclaw_signal else None)
 
     if sender_info is None and conversation_info is None:
+        if metadata_cron_id is not None:
+            return _build_openclaw_cron_metadata(
+                existing_metadata=existing_metadata_dict,
+                cron_id=metadata_cron_id,
+                cron_name=metadata_cron_name,
+                cron_run_id=metadata_cron_run_id,
+            )
         if (
             not is_heartbeat
             and not is_subagent_request
+            and not inter_session_context
             and trusted_inbound_channel is None
         ):
             return None
         if trusted_inbound_channel is not None and not is_heartbeat:
-            trusted_tags = [f"channel:{trusted_inbound_channel}"]
             if is_subagent_request:
-                trusted_tags.append(OPENCLAW_SUB_AGENT_TAG)
+                trusted_metadata = _build_openclaw_subagent_template_metadata(
+                    data,
+                    existing_metadata_dict,
+                )
+                trusted_metadata["tags"] = _merge_openclaw_tags(
+                    trusted_metadata.get("tags"),
+                    [f"channel:{trusted_inbound_channel}"],
+                )
+                return trusted_metadata
             return {
                 "tags": _merge_openclaw_tags(
                     existing_metadata_dict.get("tags"),
-                    trusted_tags,
+                    [f"channel:{trusted_inbound_channel}"],
                 )
             }
         if is_subagent_request and not is_heartbeat:
-            return {
-                "tags": _merge_openclaw_tags(
-                    existing_metadata_dict.get("tags"), [OPENCLAW_SUB_AGENT_TAG]
+            return _build_openclaw_subagent_template_metadata(
+                data, existing_metadata_dict
+            )
+        if inter_session_context and not is_heartbeat:
+            raw_source_session_id = inter_session_context.get("source_session_id")
+            raw_sub_agent_id = _first_openclaw_metadata_value(
+                ("openclaw_sub_agent_id",),
+                existing_metadata_dict,
+                max_length=200,
+            )
+            sub_agent_session_id = (
+                raw_sub_agent_id
+                if _is_openclaw_subagent_session_value(raw_sub_agent_id)
+                else None
+            )
+            raw_target_session_id = _first_openclaw_metadata_value(
+                (
+                    "openclaw_target_session_id",
+                    "openclaw_subagent_session_id",
+                    "openclaw_child_session_id",
+                ),
+                existing_metadata_dict,
+                max_length=200,
+            ) or sub_agent_session_id or _first_openclaw_metadata_value(
+                (
+                    "openclaw_session_id",
+                    "session_id",
+                    "litellm_session_id",
+                    "openclaw_conversation_id",
+                ),
+                existing_metadata_dict,
+                max_length=200,
+            )
+            execution_type = _resolve_openclaw_inter_session_execution_type(
+                inter_session_context,
+                "agent_to_agent",
+                source_session_id=raw_source_session_id,
+                target_session_id=raw_target_session_id,
+                is_subagent_request=is_subagent_request,
+            )
+            raw_session_id = (
+                raw_target_session_id
+                if execution_type == "subagent" and raw_target_session_id is not None
+                else raw_source_session_id or raw_target_session_id
+            )
+            session_id = (
+                _build_openclaw_bounded_identifier(
+                    raw_session_id,
+                    prefix=f"{OPENCLAW_SESSION_PREFIX}-session",
                 )
+                if raw_session_id is not None
+                else None
+            )
+            synthetic: Dict[str, Any] = {
+                "session_id": session_id,
+                "openclaw_session_id": session_id,
+                "openclaw_conversation_id": session_id,
+                "openclaw_session_id_raw": raw_session_id,
+                "openclaw_parent_session_id": raw_source_session_id,
+                "openclaw_source_session_id": raw_source_session_id,
+                "openclaw_source_channel": inter_session_context.get("source_channel"),
+                "openclaw_source_tool": inter_session_context.get("source_tool"),
+                "openclaw_target_session_id": raw_target_session_id,
+                "openclaw_input_provenance_kind": "inter_session",
+                "openclaw_execution_type": execution_type,
+                "openclaw_actor_type": (
+                    "subagent" if execution_type == "subagent" else "bot"
+                ),
+                "tags": _merge_openclaw_tags(
+                    existing_metadata_dict.get("tags"),
+                    [
+                        "inter_session",
+                        (
+                            OPENCLAW_SUB_AGENT_TAG
+                            if execution_type == "subagent"
+                            else "agent_to_agent"
+                        ),
+                    ],
+                ),
             }
+            merged_spend_logs_metadata = copy.deepcopy(
+                existing_metadata_dict.get("spend_logs_metadata")
+                if isinstance(existing_metadata_dict.get("spend_logs_metadata"), dict)
+                else {}
+            )
+            child_session_spend_keys = (
+                {
+                    "openclaw_session_id",
+                    "openclaw_conversation_id",
+                    "openclaw_session_id_raw",
+                    "openclaw_target_session_id",
+                    "openclaw_execution_type",
+                    "openclaw_actor_type",
+                }
+                if execution_type == "subagent"
+                else set()
+            )
+            for key, value in synthetic.items():
+                if key.startswith("openclaw_") and value is not None:
+                    if key in child_session_spend_keys:
+                        merged_spend_logs_metadata[key] = value
+                    else:
+                        merged_spend_logs_metadata.setdefault(key, value)
+            synthetic["spend_logs_metadata"] = merged_spend_logs_metadata
+            return {key: value for key, value in synthetic.items() if value is not None}
         synthetic: Dict[str, Any] = {}
         if not existing_metadata_dict.get("trace_user_id"):
             synthetic["trace_user_id"] = OPENCLAW_HEARTBEAT_USER_ID
@@ -764,13 +1417,6 @@ def _build_openclaw_observability_metadata(
         synthetic["spend_logs_metadata"] = merged_spend_logs_metadata
         return synthetic or None
 
-    sender_id = _normalize_openclaw_observability_string(
-        (sender_info or {}).get("id") or (conversation_info or {}).get("sender_id"),
-        max_length=120,
-    )
-    if sender_id is None:
-        return None
-
     group_channel = _normalize_openclaw_observability_string(
         (conversation_info or {}).get("group_channel"),
         max_length=160,
@@ -786,16 +1432,59 @@ def _build_openclaw_observability_metadata(
     inferred_channel = _resolve_openclaw_channel(
         sender_info=sender_info, conversation_info=conversation_info
     )
+    chat_channel, chat_peer_id = _resolve_openclaw_chat_peer(conversation_info)
+    sender_id = _normalize_openclaw_observability_string(
+        (sender_info or {}).get("id") or (conversation_info or {}).get("sender_id"),
+        max_length=120,
+    )
+    if sender_id is None and chat_channel is not None:
+        if inferred_channel is None or inferred_channel == chat_channel:
+            sender_id = chat_peer_id
+            inferred_channel = inferred_channel or chat_channel
+    if sender_id is None:
+        return None
+
+    direct_session_id = _resolve_openclaw_direct_session_from_message_id(
+        conversation_info=conversation_info,
+        inferred_channel=inferred_channel,
+        sender_id=sender_id,
+    )
     sub_agent_suffix = _resolve_openclaw_sub_agent_suffix(sender_info)
     actor_type = _resolve_openclaw_actor_type(
         sender_info, sub_agent_suffix, is_heartbeat
     )
-    human_session_id = (
-        _generate_openclaw_human_session_id() if actor_type == "human" else None
+    cron_id = _first_openclaw_metadata_value(
+        ("openclaw_cron_id", "cron_id", "schedule_id"),
+        sender_info,
+        conversation_info,
+        existing_metadata_dict,
+        max_length=120,
+    ) or metadata_cron_id
+    cron_name = _first_openclaw_metadata_value(
+        ("openclaw_cron_name", "cron_name", "schedule_name"),
+        sender_info,
+        conversation_info,
+        existing_metadata_dict,
+        max_length=160,
+    ) or metadata_cron_name
+    cron_run_id = _first_openclaw_metadata_value(
+        ("openclaw_cron_run_id", "cron_run_id", "schedule_run_id"),
+        sender_info,
+        conversation_info,
+        existing_metadata_dict,
+        max_length=160,
+    ) or metadata_cron_run_id
+    explicit_conversation_id = _first_openclaw_metadata_value(
+        ("openclaw_conversation_id", "conversation_id", "thread_id"),
+        sender_info,
+        conversation_info,
+        existing_metadata_dict,
+        max_length=200,
     )
 
     trace_user_id: Optional[str] = None
     raw_session_id: Optional[str] = None
+    target_raw_session_id: Optional[str] = None
     parent_raw_session_id: Optional[str] = None
     openclaw_session_id: Optional[str] = None
     if inferred_channel is not None:
@@ -805,26 +1494,37 @@ def _build_openclaw_observability_metadata(
             prefix=f"{inferred_channel}-user",
         )
 
-        if is_heartbeat:
+        if cron_id and cron_run_id:
+            raw_session_id = (
+                f"{OPENCLAW_SESSION_PREFIX}:cron:{cron_id}:run:{cron_run_id}"
+            )
+        elif cron_id:
+            raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:cron:{cron_id}"
+        elif is_heartbeat:
             raw_session_id = heartbeat_session_id
-        elif human_session_id is not None:
-            raw_session_id = human_session_id
+        elif explicit_conversation_id is not None:
+            raw_session_id = explicit_conversation_id
         elif group_channel and topic_id:
             raw_session_id = (
                 f"{OPENCLAW_SESSION_PREFIX}:{group_channel}:topic:{topic_id}"
             )
         elif group_channel:
             raw_session_id = f"{OPENCLAW_SESSION_PREFIX}:{group_channel}"
+        elif direct_session_id is not None:
+            raw_session_id = direct_session_id
         else:
             raw_session_id = (
                 f"{OPENCLAW_SESSION_PREFIX}:{inferred_channel}:dm:{sender_id}"
             )
 
         if sub_agent_suffix is not None and not is_heartbeat:
-            # Keep the parent's session id distinguishable so users can
-            # filter sub-agent traffic separately (issue 2BB-289, fix #3).
             parent_raw_session_id = raw_session_id
-            raw_session_id = f"{raw_session_id}:sub:{sub_agent_suffix}"
+        if inter_session_context and not is_heartbeat:
+            target_raw_session_id = raw_session_id
+            source_session_id = inter_session_context.get("source_session_id")
+            if source_session_id is not None:
+                parent_raw_session_id = source_session_id
+                raw_session_id = source_session_id
 
         openclaw_session_id = _build_openclaw_bounded_identifier(
             raw_session_id,
@@ -841,7 +1541,19 @@ def _build_openclaw_observability_metadata(
         actor_type,
         parent_user_id,
         is_heartbeat,
+        cron_id,
     )
+    execution_type = _resolve_openclaw_inter_session_execution_type(
+        inter_session_context,
+        execution_type,
+        source_session_id=parent_raw_session_id,
+        target_session_id=target_raw_session_id or raw_session_id,
+        is_subagent_request=is_subagent_request,
+    )
+    if inter_session_context and execution_type == "subagent":
+        actor_type = "subagent"
+    elif inter_session_context and actor_type == "human":
+        actor_type = "bot"
     execution_id = _normalize_openclaw_observability_string(
         (sender_info or {}).get("openclaw_execution_id")
         or (sender_info or {}).get("execution_id")
@@ -890,11 +1602,22 @@ def _build_openclaw_observability_metadata(
         "openclaw_execution_type": execution_type,
         "openclaw_bot_id": bot_id,
         "openclaw_session_id": openclaw_session_id,
+        "openclaw_conversation_id": openclaw_session_id,
         "openclaw_channel": inferred_channel,
         "openclaw_session_id_raw": raw_session_id,
         "openclaw_parent_session_id": parent_session_id,
         "openclaw_sub_agent_id": sub_agent_suffix,
+        "openclaw_source_session_id": inter_session_context.get("source_session_id"),
+        "openclaw_source_channel": inter_session_context.get("source_channel"),
+        "openclaw_source_tool": inter_session_context.get("source_tool"),
+        "openclaw_target_session_id": target_raw_session_id,
+        "openclaw_input_provenance_kind": (
+            "inter_session" if inter_session_context else None
+        ),
         "openclaw_heartbeat": True if is_heartbeat else None,
+        "openclaw_cron_id": cron_id,
+        "openclaw_cron_name": cron_name,
+        "openclaw_cron_run_id": cron_run_id,
         "openclaw_sender_id": sender_id,
         "openclaw_sender_name": _normalize_openclaw_observability_string(
             (sender_info or {}).get("name"),
@@ -946,8 +1669,17 @@ def _build_openclaw_observability_metadata(
         new_tags.append(f"channel:{trusted_inbound_channel}")
     if is_heartbeat:
         new_tags.append(OPENCLAW_HEARTBEAT_TAG)
+    if execution_type == "cron":
+        new_tags.append("cron")
     if (sub_agent_suffix is not None or is_subagent_request) and not is_heartbeat:
         new_tags.append(OPENCLAW_SUB_AGENT_TAG)
+    if inter_session_context and not is_heartbeat:
+        new_tags.append("inter_session")
+        new_tags.append(
+            OPENCLAW_SUB_AGENT_TAG
+            if execution_type == "subagent"
+            else "agent_to_agent"
+        )
     if new_tags:
         resolved_metadata["tags"] = _merge_openclaw_tags(
             existing_metadata.get("tags"), new_tags
@@ -968,11 +1700,20 @@ def _build_openclaw_observability_metadata(
         "openclaw_execution_type",
         "openclaw_bot_id",
         "openclaw_session_id",
+        "openclaw_conversation_id",
         "openclaw_channel",
         "openclaw_session_id_raw",
         "openclaw_parent_session_id",
         "openclaw_sub_agent_id",
+        "openclaw_source_session_id",
+        "openclaw_source_channel",
+        "openclaw_source_tool",
+        "openclaw_target_session_id",
+        "openclaw_input_provenance_kind",
         "openclaw_heartbeat",
+        "openclaw_cron_id",
+        "openclaw_cron_name",
+        "openclaw_cron_run_id",
         "openclaw_sender_id",
         "openclaw_sender_username",
         "openclaw_sender_label",
@@ -2062,10 +2803,8 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
             if isinstance(data[_metadata_variable_name], dict)
             else None
         )
-        should_override_litellm_session_id = (
-            openclaw_observability_metadata.get("openclaw_heartbeat") is True
-            or openclaw_observability_metadata.get("openclaw_actor_type")
-            == "human"
+        should_override_litellm_session_id = bool(
+            openclaw_observability_metadata.get("openclaw_conversation_id")
         )
         if resolved_session_id is not None and (
             data.get("litellm_session_id") is None

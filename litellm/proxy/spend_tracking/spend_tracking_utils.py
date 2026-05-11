@@ -567,25 +567,13 @@ def _get_openclaw_heartbeat_session_id(metadata: Any) -> Optional[str]:
         metadata, OPENCLAW_HEARTBEAT_SESSION_PREFIX
     )
     if existing_session_id is not None:
-        return existing_session_id
+        return OPENCLAW_HEARTBEAT_SESSION_PREFIX
 
-    from litellm._uuid import uuid
-
-    return f"{OPENCLAW_HEARTBEAT_SESSION_PREFIX}:{uuid.uuid4()}"
+    return OPENCLAW_HEARTBEAT_SESSION_PREFIX
 
 
 def _get_openclaw_human_session_id(metadata: Any) -> Optional[str]:
-    if not _metadata_has_openclaw_human_actor(metadata):
-        return None
-    existing_session_id = _get_existing_openclaw_uuid_session_id(
-        metadata, OPENCLAW_HUMAN_SESSION_PREFIX
-    )
-    if existing_session_id is not None:
-        return existing_session_id
-
-    from litellm._uuid import uuid
-
-    return f"{OPENCLAW_HUMAN_SESSION_PREFIX}:{uuid.uuid4()}"
+    return None
 
 
 def _get_session_id_for_spend_log(
@@ -600,39 +588,44 @@ def _get_session_id_for_spend_log(
     """
     from litellm._uuid import uuid
 
+    if kwargs.get("litellm_session_id") is not None:
+        for metadata_candidate in (
+            (
+                standard_logging_payload.get("metadata")
+                if standard_logging_payload is not None
+                else None
+            ),
+            kwargs.get("metadata"),
+            get_litellm_metadata_from_kwargs(kwargs),
+        ):
+            heartbeat_session_id = _get_openclaw_heartbeat_session_id(
+                metadata_candidate
+            )
+            if heartbeat_session_id is not None:
+                return heartbeat_session_id
+        return str(kwargs.get("litellm_session_id"))
+
     if standard_logging_payload is not None:
         metadata = standard_logging_payload.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("session_id") is not None:
+            return str(metadata.get("session_id"))
         heartbeat_session_id = _get_openclaw_heartbeat_session_id(metadata)
         if heartbeat_session_id is not None:
             return heartbeat_session_id
-        human_session_id = _get_openclaw_human_session_id(metadata)
-        if human_session_id is not None:
-            return human_session_id
-        if isinstance(metadata, dict) and metadata.get("session_id") is not None:
-            return str(metadata.get("session_id"))
 
     metadata = kwargs.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("session_id") is not None:
+        return str(metadata.get("session_id"))
     heartbeat_session_id = _get_openclaw_heartbeat_session_id(metadata)
     if heartbeat_session_id is not None:
         return heartbeat_session_id
-    human_session_id = _get_openclaw_human_session_id(metadata)
-    if human_session_id is not None:
-        return human_session_id
-    if isinstance(metadata, dict) and metadata.get("session_id") is not None:
-        return str(metadata.get("session_id"))
 
     litellm_metadata = get_litellm_metadata_from_kwargs(kwargs)
+    if litellm_metadata.get("session_id") is not None:
+        return str(litellm_metadata.get("session_id"))
     heartbeat_session_id = _get_openclaw_heartbeat_session_id(litellm_metadata)
     if heartbeat_session_id is not None:
         return heartbeat_session_id
-    human_session_id = _get_openclaw_human_session_id(litellm_metadata)
-    if human_session_id is not None:
-        return human_session_id
-    if litellm_metadata.get("session_id") is not None:
-        return str(litellm_metadata.get("session_id"))
-
-    if kwargs.get("litellm_session_id") is not None:
-        return str(kwargs.get("litellm_session_id"))
 
     if (
         standard_logging_payload is not None
