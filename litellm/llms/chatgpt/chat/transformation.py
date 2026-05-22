@@ -4,20 +4,13 @@ from litellm.exceptions import AuthenticationError
 from litellm.llms.openai.openai import OpenAIConfig
 from litellm.types.llms.openai import AllMessageValues
 
-from ..authenticator import get_authenticator
+from ..authenticator import extract_auth_slot, get_authenticator
 from ..common_utils import (
     GetAccessTokenError,
     ensure_chatgpt_session_id,
     get_chatgpt_default_headers,
 )
 from .streaming_utils import ChatGPTToolCallNormalizer
-
-
-def _extract_slot(api_key: Optional[str]) -> Optional[str]:
-    """Extract the ChatGPT subscription slot from api_key."""
-    if api_key and not api_key.startswith("sk-"):
-        return api_key
-    return None
 
 
 class ChatGPTConfig(OpenAIConfig):
@@ -36,7 +29,7 @@ class ChatGPTConfig(OpenAIConfig):
         api_key: Optional[str],
         custom_llm_provider: str,
     ) -> Tuple[Optional[str], Optional[str], str]:
-        slot = _extract_slot(api_key)
+        slot = extract_auth_slot(api_key)
         authenticator = get_authenticator(slot)
         dynamic_api_base = authenticator.get_api_base()
         try:
@@ -63,7 +56,7 @@ class ChatGPTConfig(OpenAIConfig):
             headers, model, messages, optional_params, litellm_params, api_key, api_base
         )
 
-        slot = _extract_slot(api_key)
+        slot = extract_auth_slot(api_key)
         authenticator = get_authenticator(slot)
         account_id = authenticator.get_account_id()
         session_id = ensure_chatgpt_session_id(litellm_params)

@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 import time
 from typing import Any, Dict, Optional
 
@@ -29,6 +30,25 @@ DEVICE_CODE_POLL_SLEEP_SECONDS = 5
 
 # Registry of authenticators keyed by slot name.
 _authenticator_registry: Dict[Optional[str], "Authenticator"] = {}
+_SLOT_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def extract_auth_slot(api_key: Optional[str]) -> Optional[str]:
+    """Extract an explicit ChatGPT auth slot from a deployment api_key value.
+
+    The runtime access token also flows through fields named ``api_key`` later
+    in the request lifecycle. Treating any non-``sk-`` value as a slot can leak
+    a bearer token into filenames/logs and trigger a new device-code flow.
+    Slots therefore must be explicit, short, and filename-safe:
+    ``slot:cgpt1`` or ``chatgpt-slot:cgpt1``.
+    """
+    if not api_key:
+        return None
+    for prefix in ("slot:", "chatgpt-slot:"):
+        if api_key.startswith(prefix):
+            slot = api_key[len(prefix) :]
+            return slot if _SLOT_PATTERN.fullmatch(slot) else None
+    return None
 
 
 def get_authenticator(slot: Optional[str] = None) -> "Authenticator":

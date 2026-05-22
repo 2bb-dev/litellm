@@ -17,7 +17,7 @@ from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
 from litellm.utils import CustomStreamWrapper
 
-from ..authenticator import get_authenticator
+from ..authenticator import extract_auth_slot, get_authenticator
 from ..common_utils import (
     CHATGPT_API_BASE,
     GetAccessTokenError,
@@ -28,13 +28,10 @@ from ..common_utils import (
 
 
 def _extract_slot(litellm_params: Optional[GenericLiteLLMParams]) -> Optional[str]:
-    """Extract the ChatGPT subscription slot from api_key in litellm_params."""
+    """Extract the explicit ChatGPT subscription slot from litellm_params."""
     if litellm_params is None:
         return None
-    api_key = getattr(litellm_params, "api_key", None)
-    if api_key and not api_key.startswith("sk-"):
-        return api_key
-    return None
+    return extract_auth_slot(getattr(litellm_params, "api_key", None))
 
 
 class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
