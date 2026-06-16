@@ -1,11 +1,12 @@
 """
 Encrypted-content-aware deployment affinity for the Router.
 
-When Codex or other models use `store: false` with `include: ["reasoning.encrypted_content"]`,
-the response output items contain encrypted reasoning tokens tied to the originating
-organization's API key. If a follow-up request containing those items is routed to a
-different deployment (different org), OpenAI rejects it with an `invalid_encrypted_content`
-error because the organization_id doesn't match.
+When Codex or other models use `include: ["reasoning.encrypted_content"]`, the
+response output items can contain encrypted reasoning tokens tied to the
+originating organization's API key. If a follow-up request containing those
+items is routed to a different deployment (different org), OpenAI rejects it
+with an `invalid_encrypted_content` error because the organization_id doesn't
+match.
 
 This callback solves the problem by encoding the originating deployment's ``model_id``
 into the response output items that carry ``encrypted_content``. Two encoding strategies:

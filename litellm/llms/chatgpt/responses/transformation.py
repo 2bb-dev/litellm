@@ -82,7 +82,9 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 )
         else:
             request["instructions"] = base_instructions
-        request["store"] = False
+        # OpenClaw continues sessions with previous_response_id / encrypted
+        # reasoning items, so ChatGPT Responses must persist response state.
+        request["store"] = True
         request["stream"] = True
         include = list(request.get("include") or [])
         if "reasoning.encrypted_content" not in include:

@@ -92,7 +92,7 @@ class TestChatGPTResponsesAPITransformation:
             "chatgpt/gpt-5.3-codex",
         ],
     )
-    def test_chatgpt_forces_streaming_and_reasoning_include(self, model_name):
+    def test_chatgpt_forces_streaming_store_and_reasoning_include(self, model_name):
         config = ChatGPTResponsesAPIConfig()
         request = config.transform_responses_api_request(
             model=model_name,
@@ -103,6 +103,7 @@ class TestChatGPTResponsesAPITransformation:
         )
 
         assert request["stream"] is True
+        assert request["store"] is True
         assert "reasoning.encrypted_content" in request["include"]
         assert request["instructions"].startswith("You are Codex, based on GPT-5.")
 
@@ -135,6 +136,7 @@ class TestChatGPTResponsesAPITransformation:
                 "reasoning": {"effort": "medium"},
                 "tools": [{"type": "function", "function": {"name": "hello"}}],
                 "tool_choice": {"type": "function", "function": {"name": "hello"}},
+                "store": False,
             },
             litellm_params=GenericLiteLLMParams(),
             headers={},
@@ -156,6 +158,7 @@ class TestChatGPTResponsesAPITransformation:
             "type": "function",
             "function": {"name": "hello"},
         }
+        assert request["store"] is True
 
     @pytest.mark.parametrize(
         ("model_name", "response_model"),
