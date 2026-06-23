@@ -136,6 +136,8 @@ class TestChatGPTResponsesAPITransformation:
                 "reasoning": {"effort": "medium"},
                 "tools": [{"type": "function", "function": {"name": "hello"}}],
                 "tool_choice": {"type": "function", "function": {"name": "hello"}},
+                "prompt_cache_key": "agent:operator:thread-1",
+                "prompt_cache_retention": "24h",
                 "store": False,
             },
             litellm_params=GenericLiteLLMParams(),
@@ -158,6 +160,8 @@ class TestChatGPTResponsesAPITransformation:
             "type": "function",
             "function": {"name": "hello"},
         }
+        assert request["prompt_cache_key"] == "agent:operator:thread-1"
+        assert request["prompt_cache_retention"] == "24h"
         assert request["store"] is True
 
     @pytest.mark.parametrize(
