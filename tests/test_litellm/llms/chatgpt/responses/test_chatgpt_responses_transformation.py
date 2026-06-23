@@ -139,6 +139,7 @@ class TestChatGPTResponsesAPITransformation:
                 "tools": [{"type": "function", "function": {"name": "hello"}}],
                 "tool_choice": {"type": "function", "function": {"name": "hello"}},
                 "prompt_cache_key": "agent:operator:thread-1",
+                # unsupported by ChatGPT Codex
                 "prompt_cache_retention": "24h",
                 "store": False,
             },
@@ -163,7 +164,7 @@ class TestChatGPTResponsesAPITransformation:
             "function": {"name": "hello"},
         }
         assert request["prompt_cache_key"] == "agent:operator:thread-1"
-        assert request["prompt_cache_retention"] == "24h"
+        assert "prompt_cache_retention" not in request
         assert request["store"] is False
 
     @pytest.mark.parametrize(
