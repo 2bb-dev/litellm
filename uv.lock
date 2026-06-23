@@ -15,7 +15,6 @@ exclude-newer-span = "P3D"
 [manifest]
 members = [
     "litellm",
-    "litellm-enterprise",
     "litellm-proxy-extras",
 ]
 
@@ -3135,7 +3134,6 @@ proxy = [
     { name = "fastapi" },
     { name = "fastapi-sso" },
     { name = "gunicorn" },
-    { name = "litellm-enterprise" },
     { name = "litellm-proxy-extras" },
     { name = "mcp" },
     { name = "orjson" },
@@ -3294,7 +3292,6 @@ requires-dist = [
     { name = "jinja2", specifier = "==3.1.6" },
     { name = "jsonschema", specifier = "==4.23.0" },
     { name = "langfuse", marker = "extra == 'proxy-runtime'", specifier = "==2.59.7" },
-    { name = "litellm-enterprise", marker = "extra == 'proxy'", editable = "enterprise" },
     { name = "litellm-proxy-extras", marker = "extra == 'proxy'", editable = "litellm-proxy-extras" },
     { name = "llm-sandbox", marker = "extra == 'proxy-runtime'", specifier = "==0.3.39" },
     { name = "mangum", marker = "extra == 'proxy-runtime'", specifier = "==0.17.0" },
@@ -3410,11 +3407,6 @@ proxy-dev = [
     { name = "prisma", specifier = "==0.11.0" },
     { name = "prometheus-client", specifier = "==0.20.0" },
 ]
-
-[[package]]
-name = "litellm-enterprise"
-version = "0.1.39"
-source = { editable = "enterprise" }
 
 [[package]]
 name = "litellm-proxy-extras"

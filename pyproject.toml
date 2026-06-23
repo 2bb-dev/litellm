@@ -53,7 +53,6 @@ proxy = [
     "azure-storage-blob==12.28.0",
     "mcp==1.26.0",
     "litellm-proxy-extras==0.4.69",
-    "litellm-enterprise==0.1.39",
     "RestrictedPython==8.1",
     "rich==13.9.4",
     "polars==1.38.1",
@@ -213,10 +212,9 @@ exclude-newer = "3 days"
 
 [tool.uv.sources]
 litellm-proxy-extras = { workspace = true }
-litellm-enterprise = { workspace = true }
 
 [tool.uv.workspace]
-members = ["enterprise", "litellm-proxy-extras"]
+members = ["litellm-proxy-extras"]
 
 [tool.uv.build-backend]
 module-root = ""
