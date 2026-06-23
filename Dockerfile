@@ -33,7 +33,6 @@ ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
 
 # Copy dependency metadata first for layer caching
 COPY pyproject.toml uv.lock ./
-COPY enterprise/pyproject.toml enterprise/
 COPY litellm-proxy-extras/pyproject.toml litellm-proxy-extras/
 
 # Install third-party dependencies (cached unless pyproject.toml/uv.lock change)
