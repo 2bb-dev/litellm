@@ -82,9 +82,10 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 )
         else:
             request["instructions"] = base_instructions
-        # OpenClaw continues sessions with previous_response_id / encrypted
-        # reasoning items, so ChatGPT Responses must persist response state.
-        request["store"] = True
+        # ChatGPT's Codex Responses backend rejects stored responses. OpenClaw
+        # keeps its own session state and passes encrypted reasoning items back
+        # explicitly, so force the backend request to remain stateless.
+        request["store"] = False
         request["stream"] = True
         include = list(request.get("include") or [])
         if "reasoning.encrypted_content" not in include:
