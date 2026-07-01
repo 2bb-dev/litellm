@@ -379,9 +379,10 @@ def test_sanitize_error_information_redacts_prompt_leaks_when_prompt_storage_dis
     serialized = json.dumps(sanitized)
 
     assert secret_prompt not in serialized
-    assert REDACTED_BY_LITELM_STRING in serialized
     assert sanitized is not None
     assert sanitized["error_class"] == "BadRequestError"
+    assert sanitized["error_message"] == REDACTED_BY_LITELM_STRING
+    assert sanitized["traceback"] == REDACTED_BY_LITELM_STRING
 
 
 @patch(

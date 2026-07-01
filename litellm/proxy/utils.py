@@ -32,7 +32,6 @@ from litellm.constants import (
     MAX_TEAM_LIST_LIMIT,
     SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL,
     SPEND_LOG_DB_WRITE_BATCH_SIZE,
-    SPEND_LOG_DB_WRITE_TIMEOUT_SECONDS,
 )
 from litellm.proxy._types import (
     DB_CONNECTION_ERROR_TYPES,
@@ -4853,16 +4852,9 @@ class ProxyUpdateSpend:
                                 prisma_client.jsonify_object({**entry})
                                 for entry in batch
                             ]
-                            write_coro = prisma_client.db.litellm_spendlogs.create_many(
+                            await prisma_client.db.litellm_spendlogs.create_many(
                                 data=batch_with_dates, skip_duplicates=True
                             )
-                            if SPEND_LOG_DB_WRITE_TIMEOUT_SECONDS > 0:
-                                await asyncio.wait_for(
-                                    write_coro,
-                                    timeout=SPEND_LOG_DB_WRITE_TIMEOUT_SECONDS,
-                                )
-                            else:
-                                await write_coro
                             verbose_proxy_logger.debug(
                                 f"Flushed {len(batch)} logs to the DB."
                             )
