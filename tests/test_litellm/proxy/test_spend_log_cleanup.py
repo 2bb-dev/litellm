@@ -331,6 +331,70 @@ async def test_delete_old_logs_continues_on_valid_int_return():
     assert total_deleted == 800
 
 
+@pytest.mark.asyncio
+async def test_delete_old_logs_retries_transient_batch_errors(monkeypatch):
+    """A transient batch failure should not abort the whole cleanup run."""
+    import litellm.proxy.db.db_transaction_queue.spend_log_cleanup as cleanup_module
+
+    monkeypatch.setattr(
+        cleanup_module,
+        "SPEND_LOG_CLEANUP_MAX_CONSECUTIVE_BATCH_FAILURES",
+        2,
+    )
+    monkeypatch.setattr(
+        cleanup_module,
+        "SPEND_LOG_CLEANUP_BATCH_FAILURE_BACKOFF_SECONDS",
+        0,
+    )
+
+    mock_prisma_client = MagicMock()
+    mock_db = MagicMock()
+    mock_db.execute_raw = AsyncMock(side_effect=[RuntimeError("deadlock"), 25, 0])
+    mock_prisma_client.db = mock_db
+
+    cleaner = SpendLogCleanup(
+        general_settings={"maximum_spend_logs_retention_period": "7d"}
+    )
+
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=7)
+    total_deleted = await cleaner._delete_old_logs(mock_prisma_client, cutoff_date)
+
+    assert mock_db.execute_raw.call_count == 3
+    assert total_deleted == 25
+
+
+@pytest.mark.asyncio
+async def test_delete_old_logs_aborts_after_consecutive_batch_errors(monkeypatch):
+    """Repeated DB failures should stop cleanup instead of looping forever."""
+    import litellm.proxy.db.db_transaction_queue.spend_log_cleanup as cleanup_module
+
+    monkeypatch.setattr(
+        cleanup_module,
+        "SPEND_LOG_CLEANUP_MAX_CONSECUTIVE_BATCH_FAILURES",
+        2,
+    )
+    monkeypatch.setattr(
+        cleanup_module,
+        "SPEND_LOG_CLEANUP_BATCH_FAILURE_BACKOFF_SECONDS",
+        0,
+    )
+
+    mock_prisma_client = MagicMock()
+    mock_db = MagicMock()
+    mock_db.execute_raw = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    mock_prisma_client.db = mock_db
+
+    cleaner = SpendLogCleanup(
+        general_settings={"maximum_spend_logs_retention_period": "7d"}
+    )
+
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=7)
+    total_deleted = await cleaner._delete_old_logs(mock_prisma_client, cutoff_date)
+
+    assert mock_db.execute_raw.call_count == 2
+    assert total_deleted == 0
+
+
 def test_cleanup_batch_size_env_var(monkeypatch):
     """Ensure batch size is configurable via environment variable"""
     import importlib

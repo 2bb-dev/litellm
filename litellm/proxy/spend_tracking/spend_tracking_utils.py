@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 from datetime import datetime
 from datetime import datetime as dt
@@ -36,6 +37,7 @@ from litellm.types.utils import (
     StandardLoggingMCPToolCall,
     StandardLoggingModelInformation,
     StandardLoggingPayload,
+    StandardLoggingPayloadErrorInformation,
     StandardLoggingVectorStoreRequest,
     VectorStoreSearchResponse,
 )
@@ -144,6 +146,9 @@ def _get_spend_logs_metadata(
     clean_metadata["cold_storage_object_key"] = cold_storage_object_key
     clean_metadata["litellm_overhead_time_ms"] = litellm_overhead_time_ms
     clean_metadata["cost_breakdown"] = cost_breakdown
+    clean_metadata["error_information"] = _sanitize_error_information_for_spend_logs(
+        clean_metadata.get("error_information")
+    )
 
     return clean_metadata
 
@@ -749,6 +754,9 @@ def _get_messages_for_spend_logs_payload(
     return "{}"
 
 
+_SENSITIVE_REQUEST_BODY_KEYS = frozenset({"secret_fields"})
+
+
 def _sanitize_request_body_for_spend_logs_payload(
     request_body: dict,
     visited: Optional[set] = None,
@@ -757,6 +765,9 @@ def _sanitize_request_body_for_spend_logs_payload(
     """
     Recursively sanitize request body to prevent logging large base64 strings or other large values.
     Truncates strings longer than MAX_STRING_LENGTH_PROMPT_IN_DB characters and handles nested dictionaries.
+
+    Also strips sensitive transport/helper fields that can contain credentials,
+    such as raw HTTP headers in secret_fields.
     """
     from litellm.constants import (
         LITELLM_TRUNCATED_PAYLOAD_FIELD,
@@ -815,7 +826,116 @@ def _sanitize_request_body_for_spend_logs_payload(
             return value
         return value
 
-    return {k: _sanitize_value(v) for k, v in request_body.items()}
+    return {
+        k: _sanitize_value(v)
+        for k, v in request_body.items()
+        if k not in _SENSITIVE_REQUEST_BODY_KEYS
+    }
+
+
+_ERROR_MESSAGE_PROMPT_LEAK_KEYS = ("input", "messages", "prompt")
+_ERROR_MESSAGE_ASSIGN_LEAK_KEYS = ("input_value",)
+_SENSITIVE_KEY_START_PATTERN = re.compile(
+    r"(?:"
+    r"['\"](?:" + "|".join(_ERROR_MESSAGE_PROMPT_LEAK_KEYS) + r")['\"]\s*:\s*"
+    r"|"
+    r"\b(?:" + "|".join(_ERROR_MESSAGE_ASSIGN_LEAK_KEYS) + r")\s*=\s*"
+    r")"
+)
+
+
+def _scan_quoted_string_end(text: str, start: int, quote: str) -> int:
+    n = len(text)
+    i = start + 1
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == quote:
+            return i + 1
+        i += 1
+    return -1
+
+
+def _scan_balanced_value_end(text: str, start: int) -> int:
+    n = len(text)
+    if start >= n:
+        return -1
+    first = text[start]
+    if first in ("'", '"'):
+        return _scan_quoted_string_end(text, start, first)
+    if first == "[":
+        close = "]"
+    elif first == "{":
+        close = "}"
+    else:
+        return -1
+    depth = 0
+    i = start
+    while i < n:
+        c = text[i]
+        if c in ("'", '"'):
+            end = _scan_quoted_string_end(text, i, c)
+            if end == -1:
+                return -1
+            i = end
+            continue
+        if c == first:
+            depth += 1
+        elif c == close:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def _redact_prompt_leaks_in_error_string(text: str) -> str:
+    if not text:
+        return text
+    redaction = f'"{REDACTED_BY_LITELM_STRING}"'
+    out: List[str] = []
+    n = len(text)
+    pos = 0
+    while pos < n:
+        match = _SENSITIVE_KEY_START_PATTERN.search(text, pos)
+        if not match:
+            out.append(text[pos:])
+            break
+        out.append(text[pos : match.end()])
+        value_start = match.end()
+        if value_start >= n:
+            break
+        first = text[value_start]
+        if first in ("[", "{", "'", '"'):
+            value_end = _scan_balanced_value_end(text, value_start)
+            if value_end == -1:
+                out.append(redaction)
+                pos = n
+                break
+            out.append(redaction)
+            pos = value_end
+        else:
+            pos = value_start
+    return "".join(out)
+
+
+def _sanitize_error_information_for_spend_logs(
+    error_information: Optional[StandardLoggingPayloadErrorInformation],
+) -> Optional[StandardLoggingPayloadErrorInformation]:
+    if error_information is None:
+        return None
+
+    sanitized = cast(dict, {**error_information})
+    if not _should_store_prompts_and_responses_in_spend_logs():
+        for field in ("error_message", "traceback"):
+            value = sanitized.get(field)
+            if isinstance(value, str):
+                sanitized[field] = _redact_prompt_leaks_in_error_string(value)
+
+    sanitized = _sanitize_request_body_for_spend_logs_payload(sanitized)
+    return cast(StandardLoggingPayloadErrorInformation, sanitized)
 
 
 def _convert_to_json_serializable_dict(

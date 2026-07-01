@@ -31,6 +31,7 @@ from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _get_spend_logs_metadata,
     _get_vector_store_request_for_spend_logs_payload,
     _is_master_key,
+    _sanitize_error_information_for_spend_logs,
     _sanitize_request_body_for_spend_logs_payload,
     _should_store_prompts_and_responses_in_spend_logs,
     get_logging_payload,
@@ -332,6 +333,55 @@ def test_sanitize_request_body_for_spend_logs_payload_circular_reference():
     assert sanitized == {
         "b": {"a": {}}
     }  # Should return empty dict for circular reference
+
+
+def test_sanitize_request_body_for_spend_logs_payload_strips_secret_fields():
+    request_body = {
+        "messages": [{"role": "user", "content": "Hello"}],
+        "secret_fields": {"authorization": "Bearer should-not-be-stored"},
+        "nested": {
+            "secret_fields": {"x-api-key": "should-not-be-stored-either"},
+            "safe": "value",
+        },
+    }
+
+    sanitized = _sanitize_request_body_for_spend_logs_payload(request_body)
+
+    assert "secret_fields" not in sanitized
+    assert "secret_fields" not in sanitized["nested"]
+    assert sanitized["messages"] == request_body["messages"]
+    assert sanitized["nested"]["safe"] == "value"
+
+
+@patch(
+    "litellm.proxy.spend_tracking.spend_tracking_utils._should_store_prompts_and_responses_in_spend_logs"
+)
+def test_sanitize_error_information_redacts_prompt_leaks_when_prompt_storage_disabled(
+    mock_should_store,
+):
+    mock_should_store.return_value = False
+    secret_prompt = "customer-secret-prompt-123"
+    error_information = {
+        "error_class": "BadRequestError",
+        "error_message": (
+            "upstream rejected payload {'input': "
+            f"[{{'role': 'user', 'content': '{secret_prompt}'}}], "
+            "'metadata': 'safe'} and "
+            f"input_value=[{{'messages': '{secret_prompt}'}}]"
+        ),
+        "traceback": (
+            'Traceback: "messages": '
+            f'[{{"role": "user", "content": "{secret_prompt}"}}]'
+        ),
+    }
+
+    sanitized = _sanitize_error_information_for_spend_logs(error_information)
+    serialized = json.dumps(sanitized)
+
+    assert secret_prompt not in serialized
+    assert REDACTED_BY_LITELM_STRING in serialized
+    assert sanitized is not None
+    assert sanitized["error_class"] == "BadRequestError"
 
 
 @patch(

@@ -27,7 +27,13 @@ from typing import (
 )
 
 from litellm import _custom_logger_compatible_callbacks_literal
-from litellm.constants import DEFAULT_MODEL_CREATED_AT_TIME, MAX_TEAM_LIST_LIMIT
+from litellm.constants import (
+    DEFAULT_MODEL_CREATED_AT_TIME,
+    MAX_TEAM_LIST_LIMIT,
+    SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL,
+    SPEND_LOG_DB_WRITE_BATCH_SIZE,
+    SPEND_LOG_DB_WRITE_TIMEOUT_SECONDS,
+)
 from litellm.proxy._types import (
     DB_CONNECTION_ERROR_TYPES,
     CommonProxyErrors,
@@ -4798,10 +4804,8 @@ class ProxyUpdateSpend:
         proxy_logging_obj: ProxyLogging,
         logs_to_process: Optional[List[Dict[str, Any]]] = None,
     ):
-        BATCH_SIZE = 1000  # Preferred size of each batch to write to the database
-        MAX_LOGS_PER_INTERVAL = (
-            10000  # Maximum number of logs to flush in a single interval
-        )
+        BATCH_SIZE = SPEND_LOG_DB_WRITE_BATCH_SIZE
+        MAX_LOGS_PER_INTERVAL = SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL
         popped_batch = False
         if logs_to_process is None:
             # Atomically read and remove logs to process (protected by lock)
@@ -4849,9 +4853,16 @@ class ProxyUpdateSpend:
                                 prisma_client.jsonify_object({**entry})
                                 for entry in batch
                             ]
-                            await prisma_client.db.litellm_spendlogs.create_many(
+                            write_coro = prisma_client.db.litellm_spendlogs.create_many(
                                 data=batch_with_dates, skip_duplicates=True
                             )
+                            if SPEND_LOG_DB_WRITE_TIMEOUT_SECONDS > 0:
+                                await asyncio.wait_for(
+                                    write_coro,
+                                    timeout=SPEND_LOG_DB_WRITE_TIMEOUT_SECONDS,
+                                )
+                            else:
+                                await write_coro
                             verbose_proxy_logger.debug(
                                 f"Flushed {len(batch)} logs to the DB."
                             )
@@ -5002,7 +5013,7 @@ async def update_spend_logs_job(
     Pops the batch once, writes spend logs, then runs guardrail usage tracking.
     """
     n_retry_times = 3
-    MAX_LOGS_PER_INTERVAL = 10000
+    MAX_LOGS_PER_INTERVAL = SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL
 
     # Atomically pop batch from queue
     async with prisma_client._spend_log_transactions_lock:
