@@ -12,6 +12,8 @@ def strip_null_characters(value: str) -> str:
     return them in raw payload text, so remove them before spend-log inserts.
     """
 
+    if "\x00" not in value:
+        return value
     return value.replace("\x00", "")
 
 

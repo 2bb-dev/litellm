@@ -36,6 +36,7 @@ from litellm.types.utils import (
     StandardLoggingMCPToolCall,
     StandardLoggingModelInformation,
     StandardLoggingPayload,
+    StandardLoggingPayloadErrorInformation,
     StandardLoggingVectorStoreRequest,
     VectorStoreSearchResponse,
 )
@@ -144,6 +145,9 @@ def _get_spend_logs_metadata(
     clean_metadata["cold_storage_object_key"] = cold_storage_object_key
     clean_metadata["litellm_overhead_time_ms"] = litellm_overhead_time_ms
     clean_metadata["cost_breakdown"] = cost_breakdown
+    clean_metadata["error_information"] = _sanitize_error_information_for_spend_logs(
+        clean_metadata.get("error_information")
+    )
 
     return clean_metadata
 
@@ -749,6 +753,9 @@ def _get_messages_for_spend_logs_payload(
     return "{}"
 
 
+_SENSITIVE_REQUEST_BODY_KEYS = frozenset({"secret_fields"})
+
+
 def _sanitize_request_body_for_spend_logs_payload(
     request_body: dict,
     visited: Optional[set] = None,
@@ -757,6 +764,9 @@ def _sanitize_request_body_for_spend_logs_payload(
     """
     Recursively sanitize request body to prevent logging large base64 strings or other large values.
     Truncates strings longer than MAX_STRING_LENGTH_PROMPT_IN_DB characters and handles nested dictionaries.
+
+    Also strips sensitive transport/helper fields that can contain credentials,
+    such as raw HTTP headers in secret_fields.
     """
     from litellm.constants import (
         LITELLM_TRUNCATED_PAYLOAD_FIELD,
@@ -815,7 +825,30 @@ def _sanitize_request_body_for_spend_logs_payload(
             return value
         return value
 
-    return {k: _sanitize_value(v) for k, v in request_body.items()}
+    return {
+        k: _sanitize_value(v)
+        for k, v in request_body.items()
+        if k not in _SENSITIVE_REQUEST_BODY_KEYS
+    }
+
+
+_ERROR_INFORMATION_PROMPT_FIELDS = frozenset({"error_message", "traceback"})
+
+
+def _sanitize_error_information_for_spend_logs(
+    error_information: Optional[StandardLoggingPayloadErrorInformation],
+) -> Optional[StandardLoggingPayloadErrorInformation]:
+    if error_information is None:
+        return None
+
+    sanitized = cast(dict, {**error_information})
+    if not _should_store_prompts_and_responses_in_spend_logs():
+        for field in _ERROR_INFORMATION_PROMPT_FIELDS:
+            if sanitized.get(field):
+                sanitized[field] = REDACTED_BY_LITELM_STRING
+
+    sanitized = _sanitize_request_body_for_spend_logs_payload(sanitized)
+    return cast(StandardLoggingPayloadErrorInformation, sanitized)
 
 
 def _convert_to_json_serializable_dict(

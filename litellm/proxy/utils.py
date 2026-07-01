@@ -27,7 +27,12 @@ from typing import (
 )
 
 from litellm import _custom_logger_compatible_callbacks_literal
-from litellm.constants import DEFAULT_MODEL_CREATED_AT_TIME, MAX_TEAM_LIST_LIMIT
+from litellm.constants import (
+    DEFAULT_MODEL_CREATED_AT_TIME,
+    MAX_TEAM_LIST_LIMIT,
+    SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL,
+    SPEND_LOG_DB_WRITE_BATCH_SIZE,
+)
 from litellm.proxy._types import (
     DB_CONNECTION_ERROR_TYPES,
     CommonProxyErrors,
@@ -4759,10 +4764,10 @@ class ProxyUpdateSpend:
                     timeout=timedelta(seconds=60)
                 ) as transaction:
                     async with transaction.batch_() as batcher:
-                        for (
-                            end_user_id,
-                            response_cost,
-                        ) in end_user_list_transactions.items():
+                        # Sort by end_user_id for consistent lock ordering across pods to prevent deadlocks.
+                        for end_user_id, response_cost in sorted(
+                            end_user_list_transactions.items()
+                        ):
                             if litellm.max_end_user_budget is not None:
                                 pass
                             batcher.litellm_endusertable.upsert(
@@ -4798,10 +4803,8 @@ class ProxyUpdateSpend:
         proxy_logging_obj: ProxyLogging,
         logs_to_process: Optional[List[Dict[str, Any]]] = None,
     ):
-        BATCH_SIZE = 1000  # Preferred size of each batch to write to the database
-        MAX_LOGS_PER_INTERVAL = (
-            10000  # Maximum number of logs to flush in a single interval
-        )
+        BATCH_SIZE = SPEND_LOG_DB_WRITE_BATCH_SIZE
+        MAX_LOGS_PER_INTERVAL = SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL
         popped_batch = False
         if logs_to_process is None:
             # Atomically read and remove logs to process (protected by lock)
@@ -5002,7 +5005,7 @@ async def update_spend_logs_job(
     Pops the batch once, writes spend logs, then runs guardrail usage tracking.
     """
     n_retry_times = 3
-    MAX_LOGS_PER_INTERVAL = 10000
+    MAX_LOGS_PER_INTERVAL = SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL
 
     # Atomically pop batch from queue
     async with prisma_client._spend_log_transactions_lock:
