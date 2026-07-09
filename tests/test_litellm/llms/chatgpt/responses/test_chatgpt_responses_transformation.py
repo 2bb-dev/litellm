@@ -85,6 +85,63 @@ class TestChatGPTResponsesAPITransformation:
         assert headers["accept"] == "text/event-stream"
         assert headers["session_id"] == "session-123"
 
+    @patch("litellm.llms.chatgpt.responses.transformation.Authenticator")
+    def test_prompt_cache_key_sets_session_id_header(self, mock_authenticator_class):
+        mock_auth_instance = MagicMock()
+        mock_auth_instance.get_access_token.return_value = "access-123"
+        mock_auth_instance.get_account_id.return_value = "acct-123"
+        mock_authenticator_class.return_value = mock_auth_instance
+
+        config = ChatGPTResponsesAPIConfig()
+        prompt_cache_key = "conversation-123"
+
+        for call_id in ("call-1", "call-2"):
+            litellm_params = GenericLiteLLMParams(litellm_call_id=call_id)
+            headers = config.validate_environment(
+                headers={"session_id": f"explicit-{call_id}"},
+                model="gpt-5.4",
+                litellm_params=litellm_params,
+            )
+            request = config.transform_responses_api_request(
+                model="gpt-5.4",
+                input="hi",
+                response_api_optional_request_params={
+                    "prompt_cache_key": prompt_cache_key
+                },
+                litellm_params=litellm_params,
+                headers=headers,
+            )
+
+            assert request["prompt_cache_key"] == prompt_cache_key
+            assert headers["session_id"] == prompt_cache_key
+
+    @patch("litellm.llms.chatgpt.responses.transformation.Authenticator")
+    def test_without_prompt_cache_key_preserves_session_id_header(
+        self, mock_authenticator_class
+    ):
+        mock_auth_instance = MagicMock()
+        mock_auth_instance.get_access_token.return_value = "access-123"
+        mock_auth_instance.get_account_id.return_value = "acct-123"
+        mock_authenticator_class.return_value = mock_auth_instance
+
+        config = ChatGPTResponsesAPIConfig()
+        litellm_params = GenericLiteLLMParams(litellm_session_id="fallback-session")
+        headers = config.validate_environment(
+            headers={"session_id": "explicit-session"},
+            model="gpt-5.4",
+            litellm_params=litellm_params,
+        )
+        request = config.transform_responses_api_request(
+            model="gpt-5.4",
+            input="hi",
+            response_api_optional_request_params={},
+            litellm_params=litellm_params,
+            headers=headers,
+        )
+
+        assert "prompt_cache_key" not in request
+        assert headers["session_id"] == "explicit-session"
+
     @pytest.mark.parametrize(
         "model_name",
         [
@@ -92,9 +149,7 @@ class TestChatGPTResponsesAPITransformation:
             "chatgpt/gpt-5.3-codex",
         ],
     )
-    def test_chatgpt_forces_streaming_stateless_and_reasoning_include(
-        self, model_name
-    ):
+    def test_chatgpt_forces_streaming_stateless_and_reasoning_include(self, model_name):
         config = ChatGPTResponsesAPIConfig()
         request = config.transform_responses_api_request(
             model=model_name,

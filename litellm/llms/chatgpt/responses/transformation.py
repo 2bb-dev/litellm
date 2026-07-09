@@ -73,6 +73,10 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             litellm_params,
             headers,
         )
+        prompt_cache_key = request.get("prompt_cache_key")
+        if prompt_cache_key:
+            headers["session_id"] = prompt_cache_key
+
         base_instructions = get_chatgpt_default_instructions()
         existing_instructions = request.get("instructions")
         if existing_instructions:
