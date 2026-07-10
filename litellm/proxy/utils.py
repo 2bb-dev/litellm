@@ -2478,6 +2478,7 @@ class PrismaClient:
                 ),
             )  # Client to connect to Prisma db
         self._db_reconnect_lock = asyncio.Lock()
+        self._spend_log_write_lock = asyncio.Lock()
         self._db_health_watchdog_task: Optional[asyncio.Task] = None
         self._db_last_reconnect_attempt_ts: float = 0.0
         self._db_reconnect_cooldown_seconds: int = max(
@@ -4995,25 +4996,30 @@ async def update_spend_logs_job(
     n_retry_times = 3
     MAX_LOGS_PER_INTERVAL = 10000
 
-    # Atomically pop batch from queue
-    async with prisma_client._spend_log_transactions_lock:
-        queue_size = len(prisma_client.spend_log_transactions)
-    if queue_size == 0:
-        return
+    # The queue monitor and interval job both call this function. Serialize the
+    # flush, but keep the queue lock short so producers can enqueue while a DB
+    # write is in progress.
+    async with prisma_client._spend_log_write_lock:
+        async with prisma_client._spend_log_transactions_lock:
+            queue_size = len(prisma_client.spend_log_transactions)
+        if queue_size == 0:
+            return
 
-    async with prisma_client._spend_log_transactions_lock:
-        logs_to_process = prisma_client.spend_log_transactions[:MAX_LOGS_PER_INTERVAL]
-        prisma_client.spend_log_transactions = prisma_client.spend_log_transactions[
-            len(logs_to_process) :
-        ]
+        async with prisma_client._spend_log_transactions_lock:
+            logs_to_process = prisma_client.spend_log_transactions[
+                :MAX_LOGS_PER_INTERVAL
+            ]
+            prisma_client.spend_log_transactions = prisma_client.spend_log_transactions[
+                len(logs_to_process) :
+            ]
 
-    await ProxyUpdateSpend.update_spend_logs(
-        n_retry_times=n_retry_times,
-        prisma_client=prisma_client,
-        proxy_logging_obj=proxy_logging_obj,
-        db_writer_client=db_writer_client,
-        logs_to_process=logs_to_process,
-    )
+        await ProxyUpdateSpend.update_spend_logs(
+            n_retry_times=n_retry_times,
+            prisma_client=prisma_client,
+            proxy_logging_obj=proxy_logging_obj,
+            db_writer_client=db_writer_client,
+            logs_to_process=logs_to_process,
+        )
 
     # Guardrail/policy usage tracking (same batch, outside spend-logs update)
     try:
