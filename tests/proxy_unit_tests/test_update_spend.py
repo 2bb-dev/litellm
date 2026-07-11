@@ -15,7 +15,11 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 
 import httpx
-from litellm.proxy.utils import update_spend, DB_CONNECTION_ERROR_TYPES
+from litellm.proxy.utils import (
+    DB_CONNECTION_ERROR_TYPES,
+    update_spend,
+    update_spend_logs_job,
+)
 
 
 class MockPrismaClient:
@@ -33,6 +37,7 @@ class MockPrismaClient:
         import asyncio
 
         self._spend_log_transactions_lock = asyncio.Lock()
+        self._spend_log_write_lock = asyncio.Lock()
 
     def jsonify_object(self, obj):
         return obj
@@ -52,6 +57,58 @@ def create_mock_proxy_logging():
     )
     print("returning proxy logging obj")
     return proxy_logging_obj
+
+
+@pytest.mark.asyncio
+async def test_update_spend_logs_job_serializes_concurrent_writers():
+    """The interval job and queue monitor must not write spend logs concurrently."""
+    prisma_client = MockPrismaClient()
+    proxy_logging_obj = create_mock_proxy_logging()
+    prisma_client.spend_log_transactions = [{"request_id": "first"}]
+
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    active_writes = 0
+    max_active_writes = 0
+    written_request_ids = []
+
+    async def create_many_side_effect(**kwargs):
+        nonlocal active_writes, max_active_writes
+
+        request_id = kwargs["data"][0]["request_id"]
+        active_writes += 1
+        max_active_writes = max(max_active_writes, active_writes)
+        written_request_ids.append(request_id)
+        if request_id == "first":
+            first_write_started.set()
+            await release_first_write.wait()
+        active_writes -= 1
+
+    prisma_client.db.litellm_spendlogs.create_many = AsyncMock(
+        side_effect=create_many_side_effect
+    )
+
+    first_job = asyncio.create_task(
+        update_spend_logs_job(prisma_client, None, proxy_logging_obj)
+    )
+    await first_write_started.wait()
+
+    async with prisma_client._spend_log_transactions_lock:
+        prisma_client.spend_log_transactions.append({"request_id": "second"})
+
+    second_job = asyncio.create_task(
+        update_spend_logs_job(prisma_client, None, proxy_logging_obj)
+    )
+    await asyncio.sleep(0)
+
+    assert max_active_writes == 1
+    assert written_request_ids == ["first"]
+
+    release_first_write.set()
+    await asyncio.gather(first_job, second_job)
+
+    assert max_active_writes == 1
+    assert written_request_ids == ["first", "second"]
 
 
 @pytest.mark.asyncio
