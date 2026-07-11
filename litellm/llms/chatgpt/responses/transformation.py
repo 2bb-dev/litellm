@@ -73,6 +73,13 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             litellm_params,
             headers,
         )
+        if isinstance(request.get("input"), str):
+            request["input"] = [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": request["input"]}],
+                }
+            ]
         prompt_cache_key = request.get("prompt_cache_key")
         if prompt_cache_key:
             headers["session_id"] = prompt_cache_key

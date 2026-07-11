@@ -162,6 +162,12 @@ class TestChatGPTResponsesAPITransformation:
 
         assert request["stream"] is True
         assert request["store"] is False
+        assert request["input"] == [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}],
+            }
+        ]
         assert "reasoning.encrypted_content" in request["include"]
         assert request["instructions"].startswith("You are Codex, based on GPT-5.")
 
