@@ -336,6 +336,35 @@ def _key_or_team_allows_client_pricing_override(
     )
 
 
+def _key_or_team_allows_client_tags(
+    user_api_key_dict: UserAPIKeyAuth,
+) -> bool:
+    return _key_or_team_metadata_flag_is_true(
+        user_api_key_dict=user_api_key_dict,
+        metadata_key="allow_client_tags",
+    )
+
+
+def _strip_client_tags(data: Dict[str, Any]) -> None:
+    """Remove caller-controlled tags before routing metadata is assembled."""
+    stripped_from: List[str] = []
+    for metadata_key in ("metadata", "litellm_metadata"):
+        metadata = data.get(metadata_key)
+        if isinstance(metadata, dict) and "tags" in metadata:
+            metadata.pop("tags", None)
+            stripped_from.append(metadata_key)
+
+    if "tags" in data:
+        data.pop("tags", None)
+        stripped_from.append("request body")
+
+    if stripped_from:
+        verbose_proxy_logger.debug(
+            "Stripped caller-supplied tags from %s because the key/team does not enable `allow_client_tags`.",
+            ", ".join(stripped_from),
+        )
+
+
 def _strip_client_pricing_overrides(data: Dict[str, Any]) -> None:
     """Drop pricing overrides from the request body and any metadata variant.
 
@@ -2650,16 +2679,18 @@ class LiteLLMProxyRequestSetup:
         Why: ``add_litellm_data_to_request`` runs the equivalent merge
         post-auth, after ``_tag_max_budget_check`` has already executed.
         Header-supplied tags merged there are invisible to that check.
-        Running the merge here closes that gap; the post-auth merge in
-        ``add_litellm_data_to_request`` remains as defense-in-depth.
+        Running the merge here closes that gap. After the budget check,
+        ``add_litellm_data_to_request`` strips caller tags unless the key or
+        team explicitly enables ``allow_client_tags``; this prevents the same
+        untrusted values from selecting restricted deployments.
 
         How to apply: invoked from the auth chain just before
         ``common_checks``. Mutates ``request_data`` in place; idempotent
         when followed by ``add_litellm_data_to_request``.
         """
-        # No allow_client_tags opt-in: caller-supplied tags always flow
-        # into metadata.tags (see add_litellm_data_to_request). The pre-auth
-        # merge mirrors that so _tag_max_budget_check sees the same tags.
+        # This propagation is intentionally independent of allow_client_tags:
+        # every caller tag must be budget-checked. The post-auth request setup
+        # later removes it from routing metadata unless the key/team opts in.
         headers = _safe_get_request_headers(request=request)
         raw_header_tags = headers.get("x-litellm-tags")
         if not raw_header_tags:
@@ -2932,6 +2963,14 @@ async def add_litellm_data_to_request(
     if not _key_or_team_allows_client_pricing_override(user_api_key_dict):
         _strip_client_pricing_overrides(data)
 
+    # Client tags participate in the pre-auth tag-budget check, but they must
+    # not become routing inputs unless an administrator explicitly opts the
+    # key or team in. Static key/team/project tags and OpenClaw-derived tags
+    # are added later, after this untrusted-input boundary.
+    _allow_client_tags = _key_or_team_allows_client_tags(user_api_key_dict)
+    if not _allow_client_tags:
+        _strip_client_tags(data)
+
     # Fill in the proxy_server_request body snapshot now that metadata has
     # been parsed. Consumers (standard_logging_payload, lago,
     # spend_tracking_utils, streaming_iterator) read `body` to audit the
@@ -3116,19 +3155,19 @@ async def add_litellm_data_to_request(
     if should_auto_drop_params_for_claude_code(user_agent, data, proxy_config):
         data["drop_params"] = True
 
-    # Merge caller-supplied tags (x-litellm-tags header, data["tags"] root-level)
-    # into request metadata for tag-based routing and spend attribution.
-    tags = LiteLLMProxyRequestSetup.add_request_tag_to_metadata(
-        llm_router=llm_router,
-        headers=_headers,
-        data=data,
-    )
-
-    if tags is not None:
-        data[_metadata_variable_name]["tags"] = LiteLLMProxyRequestSetup._merge_tags(
-            request_tags=data[_metadata_variable_name].get("tags"),
-            tags_to_add=tags,
+    # Caller-supplied tags may select deployments, so merge them into routing
+    # metadata only for explicitly opted-in keys or teams.
+    if _allow_client_tags:
+        tags = LiteLLMProxyRequestSetup.add_request_tag_to_metadata(
+            llm_router=llm_router,
+            headers=_headers,
+            data=data,
         )
+        if tags is not None:
+            data[_metadata_variable_name]["tags"] = LiteLLMProxyRequestSetup._merge_tags(
+                request_tags=data[_metadata_variable_name].get("tags"),
+                tags_to_add=tags,
+            )
 
     # Team Callbacks controls
     callback_settings_obj = _get_dynamic_logging_metadata(

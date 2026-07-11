@@ -1241,7 +1241,7 @@ async def test_add_litellm_data_to_request_honors_header_tags():
 
     user_api_key_dict = UserAPIKeyAuth(
         api_key="hashed-key",
-        metadata={},
+        metadata={"allow_client_tags": True},
         team_metadata={},
         spend=0.0,
         max_budget=100.0,
@@ -1284,7 +1284,7 @@ async def test_add_litellm_data_to_request_preserves_caller_metadata_tags():
 
     user_api_key_dict = UserAPIKeyAuth(
         api_key="hashed-key",
-        metadata={},
+        metadata={"allow_client_tags": True},
         team_metadata={},
         spend=0.0,
         max_budget=100.0,
@@ -1328,7 +1328,10 @@ async def test_add_litellm_data_to_request_unions_caller_header_tags_with_static
 
     user_api_key_dict = UserAPIKeyAuth(
         api_key="hashed-key",
-        metadata={"tags": ["team:platform", "env:prod"]},
+        metadata={
+            "allow_client_tags": True,
+            "tags": ["team:platform", "env:prod"],
+        },
         team_metadata={},
         spend=0.0,
         max_budget=100.0,
@@ -1375,7 +1378,10 @@ async def test_add_litellm_data_to_request_unions_caller_header_tags_with_static
     user_api_key_dict = UserAPIKeyAuth(
         api_key="hashed-key",
         metadata={},
-        team_metadata={"tags": ["team:eng", "owner:platform"]},
+        team_metadata={
+            "allow_client_tags": True,
+            "tags": ["team:eng", "owner:platform"],
+        },
         spend=0.0,
         max_budget=100.0,
         model_max_budget={},
@@ -1421,7 +1427,10 @@ async def test_add_litellm_data_to_request_unions_dedups_overlapping_caller_and_
 
     user_api_key_dict = UserAPIKeyAuth(
         api_key="hashed-key",
-        metadata={"tags": ["env:prod", "team:platform"]},
+        metadata={
+            "allow_client_tags": True,
+            "tags": ["env:prod", "team:platform"],
+        },
         team_metadata={},
         spend=0.0,
         max_budget=100.0,
@@ -1443,6 +1452,69 @@ async def test_add_litellm_data_to_request_unions_dedups_overlapping_caller_and_
     assert final_tags.count("env:prod") == 1
     assert "team:platform" in final_tags
     assert "tenant:7" in final_tags
+
+
+@pytest.mark.asyncio
+async def test_add_litellm_data_to_request_blocks_untrusted_routing_tags():
+    """Caller tags must not select deployments without an admin opt-in."""
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/v1/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/v1/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {
+        "Content-Type": "application/json",
+        "x-litellm-tags": "restricted-deployment",
+    }
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    data = {
+        "model": "gpt-3.5-turbo",
+        "tags": ["root-tag"],
+        "metadata": {"tags": ["metadata-tag"]},
+        "litellm_metadata": {"tags": ["litellm-metadata-tag"]},
+    }
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={"tags": ["key-tag"]},
+        team_metadata={"tags": ["team-tag"]},
+        spend=0.0,
+        max_budget=100.0,
+        model_max_budget={},
+        team_spend=0.0,
+        team_max_budget=200.0,
+    )
+
+    # The auth chain temporarily propagates header tags so tag-budget checks
+    # can enforce them before request setup decides whether they may route.
+    LiteLLMProxyRequestSetup.apply_client_tag_policy_pre_auth(
+        request=request_mock,
+        request_data=data,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+    updated = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=user_api_key_dict,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert updated["metadata"]["tags"] == ["key-tag", "team-tag"]
+    assert "tags" not in updated
+    assert "tags" not in updated["metadata"]["requester_metadata"]
+    assert "tags" not in updated["proxy_server_request"]["body"]
+    assert updated["proxy_server_request"]["body"]["metadata"]["tags"] == [
+        "key-tag",
+        "team-tag",
+    ]
+    assert "tags" not in updated["proxy_server_request"]["body"]["litellm_metadata"]
 
 
 def test_infer_openclaw_channel_mattermost_group_channel():
@@ -2668,7 +2740,7 @@ async def test_add_litellm_data_to_request_audio_transcription_multipart():
 
     user_api_key_dict = UserAPIKeyAuth(
         api_key="hashed-key",
-        metadata={},
+        metadata={"allow_client_tags": True},
         team_metadata={},
         spend=0.0,
         max_budget=100.0,
