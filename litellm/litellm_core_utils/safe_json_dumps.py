@@ -6,14 +6,8 @@ from pydantic import BaseModel
 from litellm.constants import DEFAULT_MAX_RECURSE_DEPTH
 
 
-def strip_null_characters(value: str) -> str:
-    """
-    PostgreSQL jsonb/text cannot store NUL bytes. Providers can occasionally
-    return them in raw payload text, so remove them before spend-log inserts.
-    """
-
-    if "\x00" not in value:
-        return value
+def strip_null_bytes(value: str) -> str:
+    """Strip NUL bytes, which PostgreSQL text/jsonb columns reject (error 22P05)."""
     return value.replace("\x00", "")
 
 
@@ -21,6 +15,7 @@ def safe_dumps(data: Any, max_depth: int = DEFAULT_MAX_RECURSE_DEPTH) -> str:
     """
     Recursively serialize data while detecting circular references.
     If a circular reference is detected then a marker string is returned.
+    NUL bytes are stripped from strings to prevent PostgreSQL 22P05 errors.
     """
 
     def _serialize(obj: Any, seen: set, depth: int) -> Any:
@@ -29,7 +24,7 @@ def safe_dumps(data: Any, max_depth: int = DEFAULT_MAX_RECURSE_DEPTH) -> str:
             return "MaxDepthExceeded"
         # Base-case: if it is a primitive, simply return it.
         if isinstance(obj, str):
-            return strip_null_characters(obj)
+            return obj.replace("\x00", "") if "\x00" in obj else obj
         if isinstance(obj, (int, float, bool, type(None))):
             return obj
         # Check for circular reference.
@@ -41,7 +36,8 @@ def safe_dumps(data: Any, max_depth: int = DEFAULT_MAX_RECURSE_DEPTH) -> str:
             result = {}
             for k, v in obj.items():
                 if isinstance(k, (str)):
-                    result[strip_null_characters(k)] = _serialize(v, seen, depth + 1)
+                    clean_k = k.replace("\x00", "") if "\x00" in k else k
+                    result[clean_k] = _serialize(v, seen, depth + 1)
             seen.remove(id(obj))
             return result
         elif isinstance(obj, list):
@@ -64,7 +60,7 @@ def safe_dumps(data: Any, max_depth: int = DEFAULT_MAX_RECURSE_DEPTH) -> str:
         else:
             # Fall back to string conversion for non-serializable objects.
             try:
-                return strip_null_characters(str(obj))
+                return strip_null_bytes(str(obj))
             except Exception:
                 return "Unserializable Object"
 

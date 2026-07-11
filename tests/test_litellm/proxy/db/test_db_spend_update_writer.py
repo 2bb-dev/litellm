@@ -240,6 +240,54 @@ async def test_update_daily_spend_sorting():
 
 
 @pytest.mark.asyncio
+async def test_update_daily_spend_drains_all_batches_over_batch_size():
+    """
+    Regression for #30281: >BATCH_SIZE (100) unique entities in one flush must all
+    be written and the in-memory dict fully drained within a single call. Pre-fix,
+    only the first 100 sorted items were upserted then the method returned, silently
+    dropping the remaining entities.
+    """
+    mock_prisma_client = MagicMock()
+    mock_batcher = MagicMock()
+    mock_table = MagicMock()
+    mock_prisma_client.db.batch_.return_value.__aenter__.return_value = mock_batcher
+    mock_batcher.litellm_dailyuserspend = mock_table
+
+    num_entities = 250
+    daily_spend_transactions = {
+        f"test_key_{i}": {
+            "user_id": f"user{i:04d}",
+            "date": "2024-01-01",
+            "api_key": "test-api-key",
+            "model": "gpt-4",
+            "custom_llm_provider": "openai",
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "spend": 0.1,
+            "api_requests": 1,
+            "successful_requests": 1,
+            "failed_requests": 0,
+        }
+        for i in range(num_entities)
+    }
+
+    await DBSpendUpdateWriter._update_daily_spend(
+        n_retry_times=1,
+        prisma_client=mock_prisma_client,
+        proxy_logging_obj=MagicMock(),
+        daily_spend_transactions=daily_spend_transactions,
+        entity_type="user",
+        entity_id_field="user_id",
+        table_name="litellm_dailyuserspend",
+        unique_constraint_name="user_id_date_api_key_model_custom_llm_provider_mcp_namespaced_tool_name_endpoint",
+    )
+
+    assert mock_table.upsert.call_count == num_entities
+    assert mock_prisma_client.db.batch_.call_count == 3
+    assert daily_spend_transactions == {}
+
+
+@pytest.mark.asyncio
 async def test_update_daily_spend_tag_with_request_id():
     """
     Test that request_id is included in update_data when updating tag transactions.
@@ -1133,8 +1181,10 @@ async def test_update_daily_spend_logs_detailed_error_on_batch_upsert_failure():
     mock_proxy_logging = MagicMock()
     mock_proxy_logging.failure_handler = AsyncMock()
 
-    # Mock the logger to capture exception calls
-    with patch.object(verbose_proxy_logger, "exception") as mock_exception_logger:
+    # Capture the ERROR-level log emitted by the spend_log_error helper.
+    # We assert against the formatted message instead of patching a specific
+    # logger method so the test stays valid as the helper evolves.
+    with patch.object(verbose_proxy_logger, "error") as mock_error_logger:
         # Call the method and expect it to raise the exception
         with pytest.raises(Exception, match="Unique constraint violation"):
             await DBSpendUpdateWriter._update_daily_spend(
@@ -1148,17 +1198,20 @@ async def test_update_daily_spend_logs_detailed_error_on_batch_upsert_failure():
                 unique_constraint_name="user_id_date_api_key_model_custom_llm_provider_mcp_namespaced_tool_name_endpoint",
             )
 
-        # Verify that exception was logged with detailed information
-        assert mock_exception_logger.called
-        call_args = mock_exception_logger.call_args[0][0]
-        assert "Daily user spend batch upsert failed" in call_args
-        assert "Table: litellm_dailyuserspend" in call_args
+        # Verify that the error was logged with detailed information.
+        # spend_log_error formats the message via ``%`` interpolation, so
+        # render the call args before asserting on substrings.
+        assert mock_error_logger.called
+        call = mock_error_logger.call_args
+        formatted = call.args[0] % call.args[1:]
+        assert "Daily user spend batch upsert failed" in formatted
+        assert "Table: litellm_dailyuserspend" in formatted
         assert (
             "Constraint: user_id_date_api_key_model_custom_llm_provider_mcp_namespaced_tool_name_endpoint"
-            in call_args
+            in formatted
         )
-        assert "Batch size: 1" in call_args
-        assert "Unique constraint violation" in call_args
+        assert "Batch size: 1" in formatted
+        assert "Unique constraint violation" in formatted
 
 
 @pytest.mark.asyncio

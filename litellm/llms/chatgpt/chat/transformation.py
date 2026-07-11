@@ -57,9 +57,7 @@ class ChatGPTConfig(OpenAIConfig):
 
         account_id = self.authenticator.get_account_id()
         session_id = ensure_chatgpt_session_id(litellm_params)
-        default_headers = get_chatgpt_default_headers(
-            api_key or "", account_id, session_id
-        )
+        default_headers = get_chatgpt_default_headers(api_key or "", account_id, session_id)
         final_headers = {**default_headers, **validated_headers}
         prompt_cache_key = optional_params.get("prompt_cache_key")
         if prompt_cache_key:
@@ -76,8 +74,6 @@ class ChatGPTConfig(OpenAIConfig):
         model: str,
         drop_params: bool,
     ) -> dict:
-        optional_params = super().map_openai_params(
-            non_default_params, optional_params, model, drop_params
-        )
+        optional_params = super().map_openai_params(non_default_params, optional_params, model, drop_params)
         optional_params.setdefault("stream", False)
         return optional_params
