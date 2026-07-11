@@ -60,7 +60,11 @@ class ChatGPTConfig(OpenAIConfig):
         default_headers = get_chatgpt_default_headers(
             api_key or "", account_id, session_id
         )
-        return {**default_headers, **validated_headers}
+        final_headers = {**default_headers, **validated_headers}
+        prompt_cache_key = optional_params.get("prompt_cache_key")
+        if prompt_cache_key:
+            final_headers["session_id"] = prompt_cache_key
+        return final_headers
 
     def post_stream_processing(self, stream: Any) -> Any:
         return ChatGPTToolCallNormalizer(stream)
