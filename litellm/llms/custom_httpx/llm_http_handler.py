@@ -2259,13 +2259,21 @@ class BaseLLMHTTPHandler:
         )
 
     @staticmethod
+    def _provider_stream_error_message(error: Any) -> Optional[str]:
+        if isinstance(error, dict):
+            message = error.get("message")
+        else:
+            message = getattr(error, "message", None)
+        return message if isinstance(message, str) and message else None
+
+    @staticmethod
     def _completed_response_from_provider_stream(
         iterator: BaseResponsesAPIStreamingIterator,
     ) -> ResponsesAPIResponse:
         terminal_error = iterator.terminal_error
         if terminal_error is not None:
             error = getattr(terminal_error, "error", None)
-            message = error.get("message") if isinstance(error, dict) else None
+            message = BaseLLMHTTPHandler._provider_stream_error_message(error)
             raise ValueError(message or "Provider stream failed")
 
         completed = iterator.completed_response
@@ -2279,7 +2287,7 @@ class BaseLLMHTTPHandler:
 
         if getattr(completed, "type", None) == ResponsesAPIStreamEvents.RESPONSE_FAILED:
             error = getattr(response_obj, "error", None)
-            message = error.get("message") if isinstance(error, dict) else None
+            message = BaseLLMHTTPHandler._provider_stream_error_message(error)
             raise ValueError(message or "Provider response failed")
 
         hidden_params = getattr(iterator, "_hidden_params", None)
