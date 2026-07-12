@@ -120,8 +120,10 @@ def test_provider_forced_stream_raises_failed_terminal_message():
 
 
 def test_provider_forced_stream_preserves_terminal_error_message():
+    provider_error = Mock()
+    provider_error.message = "upstream stream error"
     terminal_error = Mock()
-    terminal_error.error = {"message": "upstream stream error"}
+    terminal_error.error = provider_error
     iterator = Mock()
     iterator.terminal_error = terminal_error
     iterator.completed_response = None
