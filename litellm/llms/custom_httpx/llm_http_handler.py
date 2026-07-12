@@ -108,6 +108,7 @@ from litellm.types.llms.openai import (
     ResponseInputParam,
     ResponsesAPIOptionalRequestParams,
     ResponsesAPIResponse,
+    ResponsesAPIStreamEvents,
 )
 from litellm.types.realtime import RealtimeQueryParams
 from litellm.types.rerank import RerankResponse
@@ -2257,6 +2258,35 @@ class BaseLLMHTTPHandler:
             updated_litellm_params,
         )
 
+    @staticmethod
+    def _completed_response_from_provider_stream(
+        iterator: BaseResponsesAPIStreamingIterator,
+    ) -> ResponsesAPIResponse:
+        terminal_error = iterator.terminal_error
+        if terminal_error is not None:
+            error = getattr(terminal_error, "error", None)
+            message = error.get("message") if isinstance(error, dict) else None
+            raise ValueError(message or "Provider stream failed")
+
+        completed = iterator.completed_response
+        response_obj = (
+            completed
+            if isinstance(completed, ResponsesAPIResponse)
+            else getattr(completed, "response", None)
+        )
+        if not isinstance(response_obj, ResponsesAPIResponse):
+            raise ValueError("Provider stream ended without a completed response")
+
+        if getattr(completed, "type", None) == ResponsesAPIStreamEvents.RESPONSE_FAILED:
+            error = getattr(response_obj, "error", None)
+            message = error.get("message") if isinstance(error, dict) else None
+            raise ValueError(message or "Provider response failed")
+
+        hidden_params = getattr(iterator, "_hidden_params", None)
+        if isinstance(hidden_params, dict):
+            response_obj._hidden_params.update(hidden_params)
+        return response_obj
+
     def response_api_handler(
         self,
         model: str,
@@ -2443,18 +2473,33 @@ class BaseLLMHTTPHandler:
                     **body_kwargs,
                 )
                 if stream:
-                    response.read()
+                    iterator = SyncResponsesAPIStreamingIterator(
+                        response=response,
+                        model=model,
+                        logging_obj=logging_obj,
+                        responses_api_provider_config=responses_api_provider_config,
+                        litellm_metadata=litellm_metadata,
+                        custom_llm_provider=custom_llm_provider,
+                        request_data=request_context,
+                        call_type=CallTypes.responses.value,
+                        manage_stream_lifecycle=False,
+                    )
+                    for _ in iterator:
+                        pass
+                    initial_response = self._completed_response_from_provider_stream(
+                        iterator
+                    )
+                else:
+                    initial_response = responses_api_provider_config.transform_response_api_response(
+                        model=model,
+                        raw_response=response,
+                        logging_obj=logging_obj,
+                    )
         except Exception as e:
             raise self._handle_error(
                 e=e,
                 provider_config=responses_api_provider_config,
             )
-
-        initial_response = responses_api_provider_config.transform_response_api_response(
-            model=model,
-            raw_response=response,
-            logging_obj=logging_obj,
-        )
 
         if self._has_agentic_completion_hook(logging_obj):
             final_response = run_async_function(
@@ -2622,19 +2667,34 @@ class BaseLLMHTTPHandler:
                     **body_kwargs,
                 )
                 if stream:
-                    await response.aread()
+                    iterator = ResponsesAPIStreamingIterator(
+                        response=response,
+                        model=model,
+                        logging_obj=logging_obj,
+                        responses_api_provider_config=responses_api_provider_config,
+                        litellm_metadata=litellm_metadata,
+                        custom_llm_provider=custom_llm_provider,
+                        request_data=request_context,
+                        call_type=CallTypes.responses.value,
+                        manage_stream_lifecycle=False,
+                    )
+                    async for _ in iterator:
+                        pass
+                    initial_response = self._completed_response_from_provider_stream(
+                        iterator
+                    )
+                else:
+                    initial_response = responses_api_provider_config.transform_response_api_response(
+                        model=model,
+                        raw_response=response,
+                        logging_obj=logging_obj,
+                    )
 
         except Exception as e:
             raise self._handle_error(
                 e=e,
                 provider_config=responses_api_provider_config,
             )
-
-        initial_response = responses_api_provider_config.transform_response_api_response(
-            model=model,
-            raw_response=response,
-            logging_obj=logging_obj,
-        )
 
         final_response = await self._call_agentic_completion_hooks(
             response=initial_response,

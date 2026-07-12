@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 from unittest.mock import AsyncMock, Mock, patch
@@ -19,11 +20,114 @@ from litellm.llms.custom_httpx.llm_http_handler import (
     BaseLLMHTTPHandler,
     _google_genai_streaming_hidden_params,
 )
-from litellm.types.llms.openai import ResponsesAPIResponse
+from litellm.types.llms.openai import ResponsesAPIResponse, ResponsesAPIStreamEvents
 from litellm.types.router import GenericLiteLLMParams
 
 _ACTIVE_KEY = "_code_interpreter_interception_active"
 _SANDBOX_KEY = "_code_interpreter_interception_sandbox_key"
+
+
+def _provider_forced_sse_fixture():
+    config = Mock()
+    config.validate_environment.return_value = {}
+    config.get_complete_url.return_value = "https://chatgpt.example.com/responses"
+    config.transform_responses_api_request.return_value = {
+        "model": "gpt-5.3-codex",
+        "input": "hi",
+        "stream": True,
+    }
+    config.sign_request.return_value = ({}, None)
+
+    completed_response = ResponsesAPIResponse(
+        id="resp_test",
+        created_at=1700000000,
+        status="completed",
+        model="gpt-5.3-codex",
+        output=[],
+    )
+
+    def transform_streaming_response(*, parsed_chunk, **_kwargs):
+        event = Mock()
+        event.type = parsed_chunk["type"]
+        if event.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE:
+            event.output_index = parsed_chunk["output_index"]
+            event.item = parsed_chunk["item"]
+        elif event.type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
+            event.response = completed_response
+        return event
+
+    config.transform_streaming_response.side_effect = transform_streaming_response
+    output_item = {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+            {
+                "type": "output_text",
+                "text": "ok",
+                "annotations": [],
+            }
+        ],
+    }
+    sse_body = (
+        "\n\n".join(
+            [
+                "data: "
+                + json.dumps(
+                    {
+                        "type": ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+                        "output_index": 0,
+                        "item": output_item,
+                    }
+                ),
+                "data: "
+                + json.dumps(
+                    {
+                        "type": ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+                        "response": completed_response.model_dump(),
+                    }
+                ),
+                "data: [DONE]",
+            ]
+        )
+        + "\n\n"
+    )
+    logging_obj = Mock()
+    logging_obj.dynamic_success_callbacks = []
+    logging_obj.model_call_details = {"litellm_params": {}}
+    return config, logging_obj, sse_body
+
+
+def test_provider_forced_stream_raises_failed_terminal_message():
+    failed_response = ResponsesAPIResponse(
+        id="resp_failed",
+        created_at=1700000000,
+        status="failed",
+        model="gpt-5.3-codex",
+        output=[],
+        error={"message": "upstream response failed", "type": "server_error"},
+    )
+    completed = Mock()
+    completed.type = ResponsesAPIStreamEvents.RESPONSE_FAILED
+    completed.response = failed_response
+    iterator = Mock()
+    iterator.terminal_error = None
+    iterator.completed_response = completed
+
+    with pytest.raises(ValueError, match="upstream response failed"):
+        BaseLLMHTTPHandler._completed_response_from_provider_stream(iterator)
+
+
+def test_provider_forced_stream_preserves_terminal_error_message():
+    terminal_error = Mock()
+    terminal_error.error = {"message": "upstream stream error"}
+    iterator = Mock()
+    iterator.terminal_error = terminal_error
+    iterator.completed_response = None
+
+    with pytest.raises(ValueError, match="upstream stream error"):
+        BaseLLMHTTPHandler._completed_response_from_provider_stream(iterator)
 
 
 def test_prepare_fake_stream_request():
@@ -91,26 +195,16 @@ def test_prepare_fake_stream_request():
 
 def test_response_api_handler_streams_when_provider_transform_adds_stream():
     handler = BaseLLMHTTPHandler()
-    config = Mock()
-    config.validate_environment.return_value = {}
-    config.get_complete_url.return_value = "https://chatgpt.example.com/responses"
-    config.transform_responses_api_request.return_value = {
-        "model": "gpt-5.3-codex",
-        "input": "hi",
-        "stream": True,
-    }
-    config.sign_request.return_value = ({}, None)
+    config, logging_obj, sse_body = _provider_forced_sse_fixture()
     client = HTTPHandler(client=httpx.Client())
     client.post = Mock(
         return_value=httpx.Response(
             200,
+            headers={"content-type": "text/event-stream"},
+            text=sse_body,
             request=httpx.Request("POST", "https://chatgpt.example.com/responses"),
         )
     )
-    logging_obj = Mock()
-    logging_obj.dynamic_success_callbacks = []
-    transformed_response = Mock()
-    config.transform_response_api_response.return_value = transformed_response
 
     result = handler.response_api_handler(
         model="gpt-5.3-codex",
@@ -125,8 +219,10 @@ def test_response_api_handler_streams_when_provider_transform_adds_stream():
 
     assert client.post.call_args.kwargs["stream"] is True
     assert client.post.call_args.kwargs["json"]["stream"] is True
-    assert result is transformed_response
-    config.transform_response_api_response.assert_called_once()
+    assert result.output_text == "ok"
+    config.transform_response_api_response.assert_not_called()
+    logging_obj.success_handler.assert_not_called()
+    logging_obj.async_success_handler.assert_not_called()
 
 
 def test_response_api_handler_runs_agentic_hooks_in_sync_path(monkeypatch):
@@ -243,26 +339,16 @@ def test_response_api_handler_runs_responses_pre_call_hook_before_transform():
 @pytest.mark.asyncio
 async def test_async_response_api_handler_streams_when_provider_transform_adds_stream():
     handler = BaseLLMHTTPHandler()
-    config = Mock()
-    config.validate_environment.return_value = {}
-    config.get_complete_url.return_value = "https://chatgpt.example.com/responses"
-    config.transform_responses_api_request.return_value = {
-        "model": "gpt-5.3-codex",
-        "input": "hi",
-        "stream": True,
-    }
-    config.sign_request.return_value = ({}, None)
+    config, logging_obj, sse_body = _provider_forced_sse_fixture()
     client = AsyncHTTPHandler()
     client.post = AsyncMock(
         return_value=httpx.Response(
             200,
+            headers={"content-type": "text/event-stream"},
+            text=sse_body,
             request=httpx.Request("POST", "https://chatgpt.example.com/responses"),
         )
     )
-    logging_obj = Mock()
-    logging_obj.dynamic_success_callbacks = []
-    transformed_response = Mock()
-    config.transform_response_api_response.return_value = transformed_response
 
     result = await handler.async_response_api_handler(
         model="gpt-5.3-codex",
@@ -277,8 +363,10 @@ async def test_async_response_api_handler_streams_when_provider_transform_adds_s
 
     assert client.post.call_args.kwargs["stream"] is True
     assert client.post.call_args.kwargs["json"]["stream"] is True
-    assert result is transformed_response
-    config.transform_response_api_response.assert_called_once()
+    assert result.output_text == "ok"
+    config.transform_response_api_response.assert_not_called()
+    logging_obj.success_handler.assert_not_called()
+    logging_obj.async_success_handler.assert_not_called()
 
 
 def test_get_agentic_loop_settings_defaults_and_overrides():

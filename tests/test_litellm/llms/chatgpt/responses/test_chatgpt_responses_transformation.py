@@ -45,12 +45,14 @@ class TestChatGPTResponsesAPITransformation:
                 }
             ],
         }
-        sse_body = "\n".join(
-            [
-                f"data: {json.dumps({'type': 'response.completed', 'response': response_payload})}",
-                "data: [DONE]",
-                "",
-            ]
+        sse_body = (
+            "\n\n".join(
+                [
+                    f"data: {json.dumps({'type': 'response.completed', 'response': response_payload})}",
+                    "data: [DONE]",
+                ]
+            )
+            + "\n\n"
         )
         client = AsyncHTTPHandler()
         client.post = AsyncMock(
