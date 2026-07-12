@@ -5227,9 +5227,7 @@ class ProxyUpdateSpend:
                     await asyncio.sleep(2**i)
         except Exception as e:
             if popped_batch:
-                from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
-
-                if PrismaDBExceptionHandler.is_database_transport_error(e):
+                if _is_transient_spend_log_write_error(e, db_writer_client):
                     await _prepend_spend_logs(prisma_client, logs_to_process)
             _raise_failed_update_spend_exception(e=e, start_time=start_time, proxy_logging_obj=proxy_logging_obj)
         finally:
@@ -5384,12 +5382,10 @@ async def update_spend_logs_job(
             await _prepend_spend_logs(prisma_client, logs_to_process)
             raise
         except Exception as spend_log_error:
-            from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
-
-            if PrismaDBExceptionHandler.is_database_transport_error(spend_log_error):
+            if _is_transient_spend_log_write_error(spend_log_error, db_writer_client):
                 await _prepend_spend_logs(prisma_client, logs_to_process)
                 verbose_proxy_logger.warning(
-                    "Spend tracking - requeued %d spend logs after transient DB failure",
+                    "Spend tracking - requeued %d spend logs after transient writer failure",
                     len(logs_to_process),
                 )
             raise
@@ -5435,6 +5431,20 @@ async def _prepend_spend_logs(
             *logs_to_process,
             *prisma_client.spend_log_transactions,
         ]
+
+
+def _is_transient_spend_log_write_error(
+    error: Exception,
+    db_writer_client: Optional[AsyncHTTPHandler],
+) -> bool:
+    """Return whether a failed local or external spend write can be retried."""
+    from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+
+    if PrismaDBExceptionHandler.is_database_transport_error(error):
+        return True
+
+    external_writer_enabled = db_writer_client is not None and os.getenv("SPEND_LOGS_URL") is not None
+    return external_writer_enabled and isinstance(error, litellm.Timeout)
 
 
 async def _monitor_spend_logs_queue(

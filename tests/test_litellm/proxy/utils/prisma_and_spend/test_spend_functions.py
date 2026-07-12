@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from prisma.errors import DataError
 
+from litellm.exceptions import Timeout
 from litellm.proxy.utils import (
     _monitor_spend_logs_queue,
     _raise_failed_update_spend_exception,
@@ -303,6 +304,41 @@ async def test_update_spend_logs_job_requeues_transient_pool_timeout(
         "skip_duplicates"
     ] is True
     assert mock_prisma_client.spend_log_transactions == []
+
+
+@pytest.mark.asyncio
+async def test_update_spend_logs_job_requeues_external_writer_timeout(
+    mock_prisma_client: Any,
+    make_spend_log_row: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out external writer must not lose the popped spend batch."""
+    proxy_logging = MagicMock()
+    proxy_logging.failure_handler = AsyncMock()
+    writer = MagicMock()
+    writer.post = AsyncMock(
+        side_effect=Timeout(
+            message="external spend writer timed out",
+            model="default-model-name",
+            llm_provider="litellm-httpx-handler",
+        )
+    )
+    mock_prisma_client.spend_log_transactions = [
+        make_spend_log_row(request_id="external-r1")
+    ]
+    monkeypatch.setenv("SPEND_LOGS_URL", "https://spend-writer.internal")
+
+    with pytest.raises(Timeout):
+        await update_spend_logs_job(
+            prisma_client=mock_prisma_client,
+            db_writer_client=writer,
+            proxy_logging_obj=proxy_logging,
+        )
+
+    assert writer.post.await_count == 1
+    assert [
+        row["request_id"] for row in mock_prisma_client.spend_log_transactions
+    ] == ["external-r1"]
 
 
 @pytest.mark.asyncio
