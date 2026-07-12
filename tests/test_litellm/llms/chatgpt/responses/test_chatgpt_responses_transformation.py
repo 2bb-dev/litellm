@@ -7,7 +7,7 @@ Source: litellm/llms/chatgpt/responses/transformation.py
 import json
 import os
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -15,6 +15,8 @@ import pytest
 sys.path.insert(0, os.path.abspath("../../../../.."))
 
 from litellm.llms.openai.common_utils import OpenAIError
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
@@ -22,6 +24,71 @@ from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPICon
 
 
 class TestChatGPTResponsesAPITransformation:
+    @pytest.mark.asyncio
+    async def test_non_stream_caller_buffers_provider_forced_sse(self):
+        config = ChatGPTResponsesAPIConfig()
+        config.validate_environment = MagicMock(return_value={})
+        config.get_complete_url = MagicMock(
+            return_value="https://chatgpt.example.com/responses"
+        )
+        response_payload = {
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "model": "gpt-5.5",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                }
+            ],
+        }
+        sse_body = "\n".join(
+            [
+                f"data: {json.dumps({'type': 'response.completed', 'response': response_payload})}",
+                "data: [DONE]",
+                "",
+            ]
+        )
+        client = AsyncHTTPHandler()
+        client.post = AsyncMock(
+            return_value=httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=sse_body,
+                request=httpx.Request(
+                    "POST", "https://chatgpt.example.com/responses"
+                ),
+            )
+        )
+        logging_obj = MagicMock()
+        logging_obj.dynamic_success_callbacks = []
+        handler = BaseLLMHTTPHandler()
+        handler._call_agentic_completion_hooks = AsyncMock(return_value=None)
+
+        result = await handler.async_response_api_handler(
+            model="gpt-5.5",
+            input="Reply with ok.",
+            responses_api_provider_config=config,
+            response_api_optional_request_params={},
+            custom_llm_provider="chatgpt",
+            litellm_params=GenericLiteLLMParams(),
+            logging_obj=logging_obj,
+            client=client,
+        )
+
+        request_kwargs = client.post.call_args.kwargs
+        assert request_kwargs["stream"] is True
+        assert request_kwargs["json"]["input"] == [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Reply with ok."}],
+            }
+        ]
+        assert result.output_text == "ok"
+
     @pytest.mark.parametrize(
         "model_name",
         [
