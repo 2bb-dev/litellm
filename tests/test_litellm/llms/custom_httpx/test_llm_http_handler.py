@@ -108,8 +108,11 @@ def test_response_api_handler_streams_when_provider_transform_adds_stream():
         )
     )
     logging_obj = Mock()
+    logging_obj.dynamic_success_callbacks = []
+    transformed_response = Mock()
+    config.transform_response_api_response.return_value = transformed_response
 
-    handler.response_api_handler(
+    result = handler.response_api_handler(
         model="gpt-5.3-codex",
         input="hi",
         responses_api_provider_config=config,
@@ -122,6 +125,8 @@ def test_response_api_handler_streams_when_provider_transform_adds_stream():
 
     assert client.post.call_args.kwargs["stream"] is True
     assert client.post.call_args.kwargs["json"]["stream"] is True
+    assert result is transformed_response
+    config.transform_response_api_response.assert_called_once()
 
 
 def test_response_api_handler_runs_agentic_hooks_in_sync_path(monkeypatch):
@@ -255,8 +260,11 @@ async def test_async_response_api_handler_streams_when_provider_transform_adds_s
         )
     )
     logging_obj = Mock()
+    logging_obj.dynamic_success_callbacks = []
+    transformed_response = Mock()
+    config.transform_response_api_response.return_value = transformed_response
 
-    await handler.async_response_api_handler(
+    result = await handler.async_response_api_handler(
         model="gpt-5.3-codex",
         input="hi",
         responses_api_provider_config=config,
@@ -269,6 +277,8 @@ async def test_async_response_api_handler_streams_when_provider_transform_adds_s
 
     assert client.post.call_args.kwargs["stream"] is True
     assert client.post.call_args.kwargs["json"]["stream"] is True
+    assert result is transformed_response
+    config.transform_response_api_response.assert_called_once()
 
 
 def test_get_agentic_loop_settings_defaults_and_overrides():

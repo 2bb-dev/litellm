@@ -2338,6 +2338,7 @@ class BaseLLMHTTPHandler:
 
         # Check if streaming is requested
         stream = response_api_optional_request_params.get("stream", False)
+        is_stream_request = bool(stream)
 
         api_base = responses_api_provider_config.get_complete_url(
             api_base=litellm_params.api_base,
@@ -2369,7 +2370,6 @@ class BaseLLMHTTPHandler:
         # but never included in the outbound provider payload.
         request_context["litellm_params"] = dict(litellm_params)
 
-        is_stream_request = bool(stream)
         if is_stream_request and fake_stream is True:
             stream, data = self._prepare_fake_stream_request(
                 stream=stream,
@@ -2439,8 +2439,11 @@ class BaseLLMHTTPHandler:
                     url=api_base,
                     headers=headers,
                     timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
+                    stream=stream,
                     **body_kwargs,
                 )
+                if stream:
+                    response.read()
         except Exception as e:
             raise self._handle_error(
                 e=e,
@@ -2515,6 +2518,7 @@ class BaseLLMHTTPHandler:
 
         # Check if streaming is requested
         stream = response_api_optional_request_params.get("stream", False)
+        is_stream_request = bool(stream)
 
         api_base = responses_api_provider_config.get_complete_url(
             api_base=litellm_params.api_base,
@@ -2546,7 +2550,6 @@ class BaseLLMHTTPHandler:
         # but never included in the outbound provider payload.
         request_context["litellm_params"] = dict(litellm_params)
 
-        is_stream_request = bool(stream)
         if is_stream_request and fake_stream is True:
             stream, data = self._prepare_fake_stream_request(
                 stream=stream,
@@ -2615,8 +2618,11 @@ class BaseLLMHTTPHandler:
                     url=api_base,
                     headers=headers,
                     timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
+                    stream=stream,
                     **body_kwargs,
                 )
+                if stream:
+                    await response.aread()
 
         except Exception as e:
             raise self._handle_error(

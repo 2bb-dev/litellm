@@ -11,7 +11,9 @@ Upstream syncs must preserve these behaviors:
   `litellm-enterprise` or the `enterprise` workspace.
 - **ChatGPT subscription routing:** Responses state remains persistent where
   required, upstream storage stays disabled, prompt-cache parameters survive
-  transformation, and the ChatGPT session header follows `prompt_cache_key`.
+  transformation, the ChatGPT session header follows `prompt_cache_key`,
+  string inputs are normalized for the subscription backend, and
+  provider-forced SSE remains transparent to non-streaming callers.
 - **OpenClaw attribution:** trusted runtime context and supported OpenClaw
   payload markers continue to populate actor, parent, session, channel,
   execution, and Langfuse metadata without persisting raw credentials.
