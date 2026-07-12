@@ -72,6 +72,7 @@ class BaseResponsesAPIStreamingIterator:
         self.finished = False
         self.responses_api_provider_config = responses_api_provider_config
         self.completed_response: Optional[Any] = None
+        self.terminal_error: Optional[Any] = None
         self.start_time = getattr(logging_obj, "start_time", datetime.now())
         self._failure_handled = False  # Track if failure handler has been called
         self._completed_response_cached = False
@@ -446,6 +447,8 @@ class BaseResponsesAPIStreamingIterator:
                 # Store the completed response (also for incomplete/failed so logging still fires)
                 _chunk_type = getattr(openai_responses_api_chunk, "type", None)
                 openai_types = _get_openai_response_types()
+                if _chunk_type == openai_types.ResponsesAPIStreamEvents.ERROR:
+                    self.terminal_error = openai_responses_api_chunk
                 if openai_responses_api_chunk and _chunk_type in (
                     openai_types.ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
                     openai_types.ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE,

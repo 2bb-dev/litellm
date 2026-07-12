@@ -99,6 +99,37 @@ def _provider_forced_sse_fixture():
     return config, logging_obj, sse_body
 
 
+def test_provider_forced_stream_raises_failed_terminal_message():
+    failed_response = ResponsesAPIResponse(
+        id="resp_failed",
+        created_at=1700000000,
+        status="failed",
+        model="gpt-5.3-codex",
+        output=[],
+        error={"message": "upstream response failed", "type": "server_error"},
+    )
+    completed = Mock()
+    completed.type = ResponsesAPIStreamEvents.RESPONSE_FAILED
+    completed.response = failed_response
+    iterator = Mock()
+    iterator.terminal_error = None
+    iterator.completed_response = completed
+
+    with pytest.raises(ValueError, match="upstream response failed"):
+        BaseLLMHTTPHandler._completed_response_from_provider_stream(iterator)
+
+
+def test_provider_forced_stream_preserves_terminal_error_message():
+    terminal_error = Mock()
+    terminal_error.error = {"message": "upstream stream error"}
+    iterator = Mock()
+    iterator.terminal_error = terminal_error
+    iterator.completed_response = None
+
+    with pytest.raises(ValueError, match="upstream stream error"):
+        BaseLLMHTTPHandler._completed_response_from_provider_stream(iterator)
+
+
 def test_prepare_fake_stream_request():
     # Initialize the BaseLLMHTTPHandler
     handler = BaseLLMHTTPHandler()

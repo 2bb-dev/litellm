@@ -108,6 +108,7 @@ from litellm.types.llms.openai import (
     ResponseInputParam,
     ResponsesAPIOptionalRequestParams,
     ResponsesAPIResponse,
+    ResponsesAPIStreamEvents,
 )
 from litellm.types.realtime import RealtimeQueryParams
 from litellm.types.rerank import RerankResponse
@@ -2261,6 +2262,12 @@ class BaseLLMHTTPHandler:
     def _completed_response_from_provider_stream(
         iterator: BaseResponsesAPIStreamingIterator,
     ) -> ResponsesAPIResponse:
+        terminal_error = iterator.terminal_error
+        if terminal_error is not None:
+            error = getattr(terminal_error, "error", None)
+            message = error.get("message") if isinstance(error, dict) else None
+            raise ValueError(message or "Provider stream failed")
+
         completed = iterator.completed_response
         response_obj = (
             completed
@@ -2269,6 +2276,11 @@ class BaseLLMHTTPHandler:
         )
         if not isinstance(response_obj, ResponsesAPIResponse):
             raise ValueError("Provider stream ended without a completed response")
+
+        if getattr(completed, "type", None) == ResponsesAPIStreamEvents.RESPONSE_FAILED:
+            error = getattr(response_obj, "error", None)
+            message = error.get("message") if isinstance(error, dict) else None
+            raise ValueError(message or "Provider response failed")
 
         hidden_params = getattr(iterator, "_hidden_params", None)
         if isinstance(hidden_params, dict):
