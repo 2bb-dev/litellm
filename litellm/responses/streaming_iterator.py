@@ -64,6 +64,7 @@ class BaseResponsesAPIStreamingIterator:
         custom_llm_provider: Optional[str] = None,
         request_data: Optional[Dict[str, Any]] = None,
         call_type: Optional[str] = None,
+        manage_stream_lifecycle: bool = True,
     ):
         self.response = response
         self.model = model
@@ -84,6 +85,7 @@ class BaseResponsesAPIStreamingIterator:
         self.custom_llm_provider = custom_llm_provider
         self.request_data: Dict[str, Any] = request_data or {}
         self.call_type: Optional[str] = call_type
+        self.manage_stream_lifecycle = manage_stream_lifecycle
 
         # set hidden params for response headers (e.g., x-litellm-model-id)
         # This matches the stream wrapper in litellm/litellm_core_utils/streaming_handler.py
@@ -467,10 +469,11 @@ class BaseResponsesAPIStreamingIterator:
                                     # Best-effort usage cost annotation should not break stream replay.
                                     pass
 
-                    if _chunk_type == openai_types.ResponsesAPIStreamEvents.RESPONSE_FAILED:
-                        self._handle_logging_failed_response()
-                    else:
-                        self._handle_logging_completed_response()
+                    if self.manage_stream_lifecycle:
+                        if _chunk_type == openai_types.ResponsesAPIStreamEvents.RESPONSE_FAILED:
+                            self._handle_logging_failed_response()
+                        else:
+                            self._handle_logging_completed_response()
 
                 return openai_responses_api_chunk
 
@@ -481,7 +484,8 @@ class BaseResponsesAPIStreamingIterator:
         except Exception as e:
             # Trigger failure hooks before re-raising
             # This ensures failures are logged even when _process_chunk is called directly
-            self._handle_failure(e)
+            if self.manage_stream_lifecycle:
+                self._handle_failure(e)
             raise
 
     def _log_completed_response(self, *, is_async: bool) -> None:
@@ -799,6 +803,7 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         custom_llm_provider: Optional[str] = None,
         request_data: Optional[Dict[str, Any]] = None,
         call_type: Optional[str] = None,
+        manage_stream_lifecycle: bool = True,
     ):
         super().__init__(
             response,
@@ -809,6 +814,7 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
             custom_llm_provider,
             request_data,
             call_type,
+            manage_stream_lifecycle,
         )
         self.stream_iterator = SSEDecoder().aiter_bytes(response.aiter_bytes())
 
@@ -834,9 +840,10 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
                 elif result is not None:
                     # Await hook directly instead of run_async_function
                     # (which spawns a thread + event loop per call)
-                    result = await self._call_post_streaming_deployment_hook(
-                        chunk=result,
-                    )
+                    if self.manage_stream_lifecycle:
+                        result = await self._call_post_streaming_deployment_hook(
+                            chunk=result,
+                        )
                     return result
                 # If result is None, continue the loop to get the next chunk
 
@@ -846,11 +853,13 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         except httpx.HTTPError as e:
             # Handle HTTP errors
             self.finished = True
-            self._handle_failure(e)
+            if self.manage_stream_lifecycle:
+                self._handle_failure(e)
             raise e
         except Exception as e:
             self.finished = True
-            self._handle_failure(e)
+            if self.manage_stream_lifecycle:
+                self._handle_failure(e)
             raise e
 
     def _handle_logging_completed_response(self):
@@ -873,6 +882,7 @@ class SyncResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         custom_llm_provider: Optional[str] = None,
         request_data: Optional[Dict[str, Any]] = None,
         call_type: Optional[str] = None,
+        manage_stream_lifecycle: bool = True,
     ):
         super().__init__(
             response,
@@ -883,6 +893,7 @@ class SyncResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
             custom_llm_provider,
             request_data,
             call_type,
+            manage_stream_lifecycle,
         )
         self.stream_iterator = SSEDecoder().iter_bytes(response.iter_bytes())
 
@@ -907,10 +918,11 @@ class SyncResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
                     raise StopIteration
                 elif result is not None:
                     # Sync path: use run_async_function for the hook
-                    result = run_async_function(
-                        async_function=self._call_post_streaming_deployment_hook,
-                        chunk=result,
-                    )
+                    if self.manage_stream_lifecycle:
+                        result = run_async_function(
+                            async_function=self._call_post_streaming_deployment_hook,
+                            chunk=result,
+                        )
                     return result
                 # If result is None, continue the loop to get the next chunk
 
@@ -920,11 +932,13 @@ class SyncResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         except httpx.HTTPError as e:
             # Handle HTTP errors
             self.finished = True
-            self._handle_failure(e)
+            if self.manage_stream_lifecycle:
+                self._handle_failure(e)
             raise e
         except Exception as e:
             self.finished = True
-            self._handle_failure(e)
+            if self.manage_stream_lifecycle:
+                self._handle_failure(e)
             raise e
 
     def _handle_logging_completed_response(self):

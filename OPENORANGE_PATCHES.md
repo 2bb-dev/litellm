@@ -13,7 +13,8 @@ Upstream syncs must preserve these behaviors:
   required, upstream storage stays disabled, prompt-cache parameters survive
   transformation, the ChatGPT session header follows `prompt_cache_key`,
   string inputs are normalized for the subscription backend, and
-  provider-forced SSE remains transparent to non-streaming callers.
+  provider-forced SSE is accumulated into one complete response for
+  non-streaming callers without duplicate streaming hooks or spend logs.
 - **OpenClaw attribution:** trusted runtime context and supported OpenClaw
   payload markers continue to populate actor, parent, session, channel,
   execution, and Langfuse metadata without persisting raw credentials.
@@ -40,6 +41,7 @@ Upstream syncs must preserve these behaviors:
 
 - `tests/test_litellm/llms/chatgpt/chat/test_chatgpt_transformation.py`
 - `tests/test_litellm/llms/chatgpt/responses/test_chatgpt_responses_transformation.py`
+- `tests/test_litellm/llms/custom_httpx/test_llm_http_handler.py`
 - `tests/llm_responses_api_testing/test_base_responses_api_streaming_iterator.py`
 - `tests/test_litellm/proxy/test_litellm_pre_call_utils.py`
 - `tests/test_litellm/proxy/spend_tracking/test_spend_tracking_utils.py`

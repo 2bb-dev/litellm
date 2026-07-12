@@ -51,6 +51,7 @@ jobs:
             tests/test_litellm/litellm_core_utils/test_safe_json_dumps.py \
             tests/test_litellm/llms/chatgpt/chat/test_chatgpt_transformation.py \
             tests/test_litellm/llms/chatgpt/responses/test_chatgpt_responses_transformation.py \
+            tests/test_litellm/llms/custom_httpx/test_llm_http_handler.py \
             tests/llm_responses_api_testing/test_base_responses_api_streaming_iterator.py \
             tests/test_litellm/proxy/test_litellm_pre_call_utils.py \
             tests/test_litellm/proxy/spend_tracking/test_spend_tracking_utils.py \
