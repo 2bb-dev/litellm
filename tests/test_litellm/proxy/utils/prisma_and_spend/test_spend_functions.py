@@ -15,6 +15,7 @@ from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from prisma.errors import DataError
 
 from litellm.proxy.utils import (
     _monitor_spend_logs_queue,
@@ -232,6 +233,100 @@ async def test_update_spend_logs_job_processes_and_clears_queue(
         "first_data_request_id": "r1",
         "skip_duplicates_set": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_update_spend_logs_job_requeues_transient_pool_timeout(
+    mock_prisma_client: Any,
+    make_spend_log_row: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambiguous timeout is retried by a later flush, not inline."""
+    proxy_logging = MagicMock()
+    proxy_logging.failure_handler = AsyncMock()
+    first = make_spend_log_row(request_id="r1")
+    second = make_spend_log_row(request_id="r2")
+    mock_prisma_client.spend_log_transactions = [first]
+    pool_timeout = DataError(
+        data={
+            "user_facing_error": {
+                "message": "Timed out fetching a new connection from the connection pool",
+                "meta": {"table": "LiteLLM_SpendLogs"},
+            }
+        }
+    )
+
+    async def fail_after_new_log(**_: Any) -> None:
+        async with mock_prisma_client._spend_log_transactions_lock:
+            mock_prisma_client.spend_log_transactions.append(second)
+        raise pool_timeout
+
+    mock_prisma_client.db.litellm_spendlogs.create_many = AsyncMock(
+        side_effect=fail_after_new_log
+    )
+
+    with pytest.raises(DataError):
+        await update_spend_logs_job(
+            prisma_client=mock_prisma_client,
+            db_writer_client=None,
+            proxy_logging_obj=proxy_logging,
+        )
+
+    assert mock_prisma_client.db.litellm_spendlogs.create_many.await_count == 1
+    assert [row["request_id"] for row in mock_prisma_client.spend_log_transactions] == [
+        "r1",
+        "r2",
+    ]
+
+    import litellm.proxy.db.spend_log_tool_index as tool_mod
+    import litellm.proxy.guardrails.usage_tracking as guard_mod
+
+    monkeypatch.setattr(
+        guard_mod, "process_spend_logs_guardrail_usage", AsyncMock(), raising=False
+    )
+    monkeypatch.setattr(
+        tool_mod, "process_spend_logs_tool_usage", AsyncMock(), raising=False
+    )
+    mock_prisma_client.db.litellm_spendlogs.create_many = AsyncMock()
+
+    await update_spend_logs_job(
+        prisma_client=mock_prisma_client,
+        db_writer_client=None,
+        proxy_logging_obj=proxy_logging,
+    )
+
+    retried_rows = mock_prisma_client.db.litellm_spendlogs.create_many.await_args.kwargs[
+        "data"
+    ]
+    assert [row["request_id"] for row in retried_rows] == ["r1", "r2"]
+    assert mock_prisma_client.db.litellm_spendlogs.create_many.await_args.kwargs[
+        "skip_duplicates"
+    ] is True
+    assert mock_prisma_client.spend_log_transactions == []
+
+
+@pytest.mark.asyncio
+async def test_update_spend_logs_job_does_not_requeue_permanent_error(
+    mock_prisma_client: Any, make_spend_log_row: Any
+) -> None:
+    """Malformed rows must not become an infinite poison retry."""
+    proxy_logging = MagicMock()
+    proxy_logging.failure_handler = AsyncMock()
+    mock_prisma_client.spend_log_transactions = [
+        make_spend_log_row(request_id="invalid")
+    ]
+    mock_prisma_client.db.litellm_spendlogs.create_many = AsyncMock(
+        side_effect=ValueError("invalid spend row")
+    )
+
+    with pytest.raises(ValueError, match="invalid spend row"):
+        await update_spend_logs_job(
+            prisma_client=mock_prisma_client,
+            db_writer_client=None,
+            proxy_logging_obj=proxy_logging,
+        )
+
+    assert mock_prisma_client.spend_log_transactions == []
 
 
 @pytest.mark.asyncio

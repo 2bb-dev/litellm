@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 import httpx
 from litellm.proxy.utils import (
     DB_CONNECTION_ERROR_TYPES,
+    ProxyUpdateSpend,
     update_spend,
     update_spend_logs_job,
 )
@@ -121,7 +122,7 @@ async def test_update_spend_logs_job_serializes_concurrent_writers():
     ],
 )
 async def test_update_spend_logs_connection_errors(error_type):
-    """Test retry mechanism for different connection error types"""
+    """The scheduled writer requeues transport errors for a later flush."""
     # Setup
     prisma_client = MockPrismaClient()
     proxy_logging_obj = create_mock_proxy_logging()
@@ -138,25 +139,15 @@ async def test_update_spend_logs_connection_errors(error_type):
         {"id": "2", "spend": 20},
     ]
 
-    # Mock the database to fail with connection error twice then succeed
-    create_many_mock = AsyncMock()
-    create_many_mock.side_effect = [
-        error_type,  # First attempt fails
-        error_type,  # Second attempt fails
-        error_type,  # Third attempt fails
-        None,  # Fourth attempt succeeds
-    ]
+    create_many_mock = AsyncMock(side_effect=error_type)
 
     prisma_client.db.litellm_spendlogs.create_many = create_many_mock
 
-    # Execute
-    await update_spend(prisma_client, None, proxy_logging_obj)
+    with pytest.raises(type(error_type)):
+        await update_spend(prisma_client, None, proxy_logging_obj)
 
-    # Verify
-    assert create_many_mock.call_count == 4  # Should have tried 3 times
-    assert (
-        len(prisma_client.spend_log_transactions) == 0
-    )  # Should have cleared after success
+    assert create_many_mock.call_count == 1
+    assert len(prisma_client.spend_log_transactions) == 2
 
 
 @pytest.mark.asyncio
@@ -185,14 +176,20 @@ async def test_update_spend_logs_max_retries_exceeded(error_type):
 
     prisma_client.db.litellm_spendlogs.create_many = create_many_mock
 
-    # Execute and verify it raises after max retries
+    # Direct callers can still request inline retries explicitly.
     with pytest.raises(type(error_type)) as exc_info:
-        await update_spend(prisma_client, None, proxy_logging_obj)
+        await ProxyUpdateSpend.update_spend_logs(
+            n_retry_times=3,
+            prisma_client=prisma_client,
+            db_writer_client=None,
+            proxy_logging_obj=proxy_logging_obj,
+        )
 
     # Verify error message matches
     assert str(exc_info.value) == str(error_type)
     # Verify retry attempts (initial try + 4 retries)
     assert create_many_mock.call_count == 4
+    assert len(prisma_client.spend_log_transactions) == 2
 
     await asyncio.sleep(2)
     # Verify failure handler was called
@@ -260,7 +257,12 @@ async def test_update_spend_logs_exponential_backoff():
 
     # Apply mocks
     with patch("asyncio.sleep", mock_sleep):
-        await update_spend(prisma_client, None, proxy_logging_obj)
+        await ProxyUpdateSpend.update_spend_logs(
+            n_retry_times=3,
+            prisma_client=prisma_client,
+            db_writer_client=None,
+            proxy_logging_obj=proxy_logging_obj,
+        )
 
     # Verify exponential backoff
     assert len(sleep_times) == 2  # Should have slept twice
@@ -348,8 +350,14 @@ async def test_update_spend_logs_multiple_batches_with_failure():
     create_many_mock = AsyncMock(side_effect=create_many_side_effect)
     prisma_client.db.litellm_spendlogs.create_many = create_many_mock
 
-    # Execute
-    await update_spend(prisma_client, None, proxy_logging_obj)
+    # Exercise the lower-level helper's explicit inline-retry contract. The
+    # scheduled job deliberately passes zero retries and requeues instead.
+    await ProxyUpdateSpend.update_spend_logs(
+        n_retry_times=3,
+        prisma_client=prisma_client,
+        db_writer_client=None,
+        proxy_logging_obj=proxy_logging_obj,
+    )
 
     # Verify
     assert create_many_mock.call_count == 6  # 4 batches + 2 retries for failed batch

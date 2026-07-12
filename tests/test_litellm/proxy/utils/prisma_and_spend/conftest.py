@@ -128,6 +128,7 @@ def mock_prisma_client() -> MagicMock:
     client.proxy_logging_obj.failure_handler = AsyncMock()
     client.spend_log_transactions = []
     client._spend_log_transactions_lock = asyncio.Lock()
+    client._spend_log_write_lock = asyncio.Lock()
     client.jsonify_object = lambda data: dict(data)
     client.db.is_connected = MagicMock(return_value=False)
     client.db.connect = AsyncMock()

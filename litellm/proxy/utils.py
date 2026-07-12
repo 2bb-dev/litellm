@@ -5214,19 +5214,23 @@ class ProxyUpdateSpend:
                 except DB_CONNECTION_ERROR_TYPES as e:
                     if i is None:
                         i = 0
-                    verbose_proxy_logger.warning(
-                        "Spend tracking - DB connection error writing spend logs, retry %d/%d. logs_count=%d, error=%s",
-                        i + 1,
-                        n_retry_times,
-                        len(logs_to_process),
-                        str(e),
-                    )
+                    if n_retry_times > 0:
+                        verbose_proxy_logger.warning(
+                            "Spend tracking - DB connection error writing spend logs, retry %d/%d. logs_count=%d, error=%s",
+                            i + 1,
+                            n_retry_times,
+                            len(logs_to_process),
+                            str(e),
+                        )
                     if i >= n_retry_times:
                         raise
                     await asyncio.sleep(2**i)
         except Exception as e:
-            # Logs already removed from queue at start - don't put them back
-            # This matches the original behavior where logs are removed even on error
+            if popped_batch:
+                from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+
+                if PrismaDBExceptionHandler.is_database_transport_error(e):
+                    await _prepend_spend_logs(prisma_client, logs_to_process)
             _raise_failed_update_spend_exception(e=e, start_time=start_time, proxy_logging_obj=proxy_logging_obj)
         finally:
             # Clean up logs_to_process only if we popped it (caller-owned otherwise)
@@ -5346,8 +5350,8 @@ async def update_spend_logs_job(
 
     This job is triggered based on queue size rather than time.
     Pops the batch once, writes spend logs, then runs guardrail usage tracking.
+    Transient failures return the batch to the front for a later scheduler pass.
     """
-    n_retry_times = 3
     MAX_LOGS_PER_INTERVAL = SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL
 
     # The queue monitor and interval job both call this function. Serialize the
@@ -5363,13 +5367,32 @@ async def update_spend_logs_job(
             logs_to_process = prisma_client.spend_log_transactions[:MAX_LOGS_PER_INTERVAL]
             prisma_client.spend_log_transactions = prisma_client.spend_log_transactions[len(logs_to_process) :]
 
-        await ProxyUpdateSpend.update_spend_logs(
-            n_retry_times=n_retry_times,
-            prisma_client=prisma_client,
-            proxy_logging_obj=proxy_logging_obj,
-            db_writer_client=db_writer_client,
-            logs_to_process=logs_to_process,
-        )
+        try:
+            # A read timeout is ambiguous: PostgreSQL may still commit after
+            # Prisma stops waiting. Do not issue overlapping inline retries;
+            # requeue the batch and let the scheduler retry it later. Spend-log
+            # request IDs are unique and create_many skips duplicates, so replay
+            # is safe when the original write eventually committed.
+            await ProxyUpdateSpend.update_spend_logs(
+                n_retry_times=0,
+                prisma_client=prisma_client,
+                proxy_logging_obj=proxy_logging_obj,
+                db_writer_client=db_writer_client,
+                logs_to_process=logs_to_process,
+            )
+        except asyncio.CancelledError:
+            await _prepend_spend_logs(prisma_client, logs_to_process)
+            raise
+        except Exception as spend_log_error:
+            from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+
+            if PrismaDBExceptionHandler.is_database_transport_error(spend_log_error):
+                await _prepend_spend_logs(prisma_client, logs_to_process)
+                verbose_proxy_logger.warning(
+                    "Spend tracking - requeued %d spend logs after transient DB failure",
+                    len(logs_to_process),
+                )
+            raise
 
     # Guardrail/policy usage tracking (same batch, outside spend-logs update)
     try:
@@ -5400,6 +5423,18 @@ async def update_spend_logs_job(
             "Spend tracking - tool usage tracking failed (non-fatal): %s",
             tool_tracking_err,
         )
+
+
+async def _prepend_spend_logs(
+    prisma_client: PrismaClient,
+    logs_to_process: List[Dict[str, Any]],
+) -> None:
+    """Return a failed batch to the front without blocking producers."""
+    async with prisma_client._spend_log_transactions_lock:
+        prisma_client.spend_log_transactions = [
+            *logs_to_process,
+            *prisma_client.spend_log_transactions,
+        ]
 
 
 async def _monitor_spend_logs_queue(
