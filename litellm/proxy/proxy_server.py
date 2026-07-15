@@ -1018,6 +1018,16 @@ async def proxy_startup_event(app: FastAPI):
     GracefulShutdownManager.start_shutdown()
     await GracefulShutdownManager.wait_for_drain()
 
+    if prisma_client is not None and general_settings.get("disable_spend_logs", False) is False:
+        from litellm.proxy.utils import drain_spend_log_queue
+
+        await drain_spend_log_queue(
+            prisma_client=prisma_client,
+            db_writer_client=db_writer_client,
+            proxy_logging_obj=proxy_logging_obj,
+            timeout_seconds=GracefulShutdownManager.get_timeout(),
+        )
+
     # Shutdown event - close shared aiohttp session
     if shared_aiohttp_session is not None:
         try:

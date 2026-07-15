@@ -15,9 +15,12 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 
 import httpx
+from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy.utils import (
     DB_CONNECTION_ERROR_TYPES,
     ProxyUpdateSpend,
+    _spend_log_batch_prefix,
+    drain_spend_log_queue,
     update_spend,
     update_spend_logs_job,
 )
@@ -58,6 +61,25 @@ def create_mock_proxy_logging():
     )
     print("returning proxy logging obj")
     return proxy_logging_obj
+
+
+def test_spend_log_batch_prefix_respects_bytes_and_always_makes_progress():
+    logs = [
+        {"request_id": "first", "payload": "a" * 100},
+        {"request_id": "second", "payload": "b" * 100},
+    ]
+
+    first_size = len(safe_dumps(logs[0]).encode("utf-8"))
+    batch, batch_bytes = _spend_log_batch_prefix(
+        logs,
+        max_count=10,
+        max_bytes=first_size + 2,
+    )
+    assert batch == [logs[0]]
+    assert batch_bytes >= first_size
+
+    oversized, _ = _spend_log_batch_prefix(logs, max_count=10, max_bytes=1)
+    assert oversized == [logs[0]]
 
 
 @pytest.mark.asyncio
@@ -148,6 +170,28 @@ async def test_update_spend_logs_connection_errors(error_type):
 
     assert create_many_mock.call_count == 1
     assert len(prisma_client.spend_log_transactions) == 2
+
+
+@pytest.mark.asyncio
+async def test_scheduled_writer_requeues_only_the_byte_bounded_batch():
+    prisma_client = MockPrismaClient()
+    proxy_logging_obj = create_mock_proxy_logging()
+    prisma_client.spend_log_transactions = [
+        {"request_id": "first", "payload": "a" * (3 * 1024 * 1024)},
+        {"request_id": "second", "payload": "b" * (3 * 1024 * 1024)},
+    ]
+    create_many_mock = AsyncMock(side_effect=httpx.ReadTimeout("Request timed out"))
+    prisma_client.db.litellm_spendlogs.create_many = create_many_mock
+
+    with pytest.raises(httpx.ReadTimeout):
+        await update_spend_logs_job(prisma_client, None, proxy_logging_obj)
+
+    attempted = create_many_mock.call_args.kwargs["data"]
+    assert [entry["request_id"] for entry in attempted] == ["first"]
+    assert [entry["request_id"] for entry in prisma_client.spend_log_transactions] == [
+        "first",
+        "second",
+    ]
 
 
 @pytest.mark.asyncio
@@ -293,7 +337,8 @@ async def test_update_spend_logs_multiple_batches_success():
     create_many_mock = AsyncMock(return_value=None)
     prisma_client.db.litellm_spendlogs.create_many = create_many_mock
 
-    # Execute
+    # Each scheduled flush handles one bounded batch.
+    await update_spend(prisma_client, None, proxy_logging_obj)
     await update_spend(prisma_client, None, proxy_logging_obj)
 
     # Verify
@@ -332,9 +377,8 @@ async def test_update_spend_logs_multiple_batches_with_failure():
     proxy_logging_obj = create_mock_proxy_logging()
 
     # Create 4000 test spend logs (4x BATCH_SIZE)
-    prisma_client.spend_log_transactions = [
-        {"id": str(i), "spend": 10} for i in range(4000)
-    ]
+    logs_to_process = [{"id": str(i), "spend": 10} for i in range(4000)]
+    prisma_client.spend_log_transactions = []
 
     # Mock to fail on second batch first attempt, then succeed
     call_count = 0
@@ -357,6 +401,7 @@ async def test_update_spend_logs_multiple_batches_with_failure():
         prisma_client=prisma_client,
         db_writer_client=None,
         proxy_logging_obj=proxy_logging_obj,
+        logs_to_process=logs_to_process,
     )
 
     # Verify
@@ -377,3 +422,21 @@ async def test_update_spend_logs_multiple_batches_with_failure():
 
     # Verify all logs were cleared from transactions
     assert len(prisma_client.spend_log_transactions) == 0
+
+
+@pytest.mark.asyncio
+async def test_graceful_shutdown_drains_all_spend_batches():
+    prisma_client = MockPrismaClient()
+    proxy_logging_obj = create_mock_proxy_logging()
+    prisma_client.spend_log_transactions = [{"request_id": str(i), "payload": "x" * 1000} for i in range(1200)]
+
+    remaining = await drain_spend_log_queue(
+        prisma_client=prisma_client,
+        db_writer_client=None,
+        proxy_logging_obj=proxy_logging_obj,
+        timeout_seconds=5,
+    )
+
+    assert remaining == 0
+    assert len(prisma_client.spend_log_transactions) == 0
+    assert prisma_client.db.litellm_spendlogs.create_many.call_count == 2

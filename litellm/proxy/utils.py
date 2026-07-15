@@ -36,6 +36,7 @@ from litellm.constants import (
     LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL,
     MAX_TEAM_LIST_LIMIT,
     SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL,
+    SPEND_LOG_DB_WRITE_BATCH_MAX_BYTES,
     SPEND_LOG_DB_WRITE_BATCH_SIZE,
 )
 from litellm.proxy._types import (
@@ -5111,6 +5112,41 @@ def _hash_token_if_needed(token: str) -> str:
         return token
 
 
+def _spend_log_batch_prefix(
+    logs: List[Dict[str, Any]],
+    max_count: int = SPEND_LOG_DB_WRITE_BATCH_SIZE,
+    max_bytes: int = SPEND_LOG_DB_WRITE_BATCH_MAX_BYTES,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Return the largest leading batch within both count and byte limits."""
+    batch: List[Dict[str, Any]] = []
+    serialized_bytes = 2  # JSON array brackets
+
+    for entry in logs[:max_count]:
+        entry_bytes = len(safe_dumps(entry).encode("utf-8"))
+        candidate_bytes = serialized_bytes + entry_bytes + (1 if batch else 0)
+        if batch and candidate_bytes > max_bytes:
+            break
+        batch.append(entry)
+        serialized_bytes = candidate_bytes
+
+    return batch, serialized_bytes
+
+
+def _spend_log_batches(
+    logs: List[Dict[str, Any]],
+) -> List[Tuple[List[Dict[str, Any]], int]]:
+    """Split logs deterministically without ever stalling on one large row."""
+    batches: List[Tuple[List[Dict[str, Any]], int]] = []
+    offset = 0
+    while offset < len(logs):
+        batch, serialized_bytes = _spend_log_batch_prefix(logs[offset:])
+        if not batch:
+            break
+        batches.append((batch, serialized_bytes))
+        offset += len(batch)
+    return batches
+
+
 class ProxyUpdateSpend:
     @staticmethod
     async def update_end_user_spend(
@@ -5159,57 +5195,58 @@ class ProxyUpdateSpend:
         proxy_logging_obj: ProxyLogging,
         logs_to_process: Optional[List[Dict[str, Any]]] = None,
     ):
-        BATCH_SIZE = SPEND_LOG_DB_WRITE_BATCH_SIZE
         MAX_LOGS_PER_INTERVAL = SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL
         popped_batch = False
         if logs_to_process is None:
-            # Atomically read and remove logs to process (protected by lock)
+            # Atomically read and remove one byte-bounded batch. A single very
+            # large prompt is still included so the queue always makes progress.
             async with prisma_client._spend_log_transactions_lock:
-                logs_to_process = prisma_client.spend_log_transactions[:MAX_LOGS_PER_INTERVAL]
-                # Remove the logs we're about to process
+                candidates = prisma_client.spend_log_transactions[:MAX_LOGS_PER_INTERVAL]
+                logs_to_process, _ = _spend_log_batch_prefix(candidates)
                 prisma_client.spend_log_transactions = prisma_client.spend_log_transactions[len(logs_to_process) :]
             popped_batch = True
+        spend_log_batches = _spend_log_batches(logs_to_process)
         if len(logs_to_process) > 0:
+            estimated_bytes = sum(batch_bytes for _, batch_bytes in spend_log_batches)
             verbose_proxy_logger.info(
-                "Spend tracking - processing %d spend logs for DB write",
+                "Spend tracking - processing %d spend logs for DB write (%d estimated bytes)",
                 len(logs_to_process),
+                estimated_bytes,
             )
         start_time = time.time()
         try:
             for i in range(n_retry_times + 1):
                 try:
                     base_url = os.getenv("SPEND_LOGS_URL", None)
-                    if len(logs_to_process) > 0 and base_url is not None and db_writer_client is not None:
-                        if not base_url.endswith("/"):
-                            base_url += "/"
-                        verbose_proxy_logger.debug("base_url: {}".format(base_url))
-                        json_data = json.dumps(logs_to_process)
-                        response = await db_writer_client.post(
-                            url=base_url + "spend/update",
-                            data=json_data,
-                            headers={"Content-Type": "application/json"},
-                        )
-                        del json_data
-                        if response.status_code == 200:
-                            # Items already removed from queue at start of function
-                            pass
-                    else:
-                        for j in range(0, len(logs_to_process), BATCH_SIZE):
-                            batch = logs_to_process[j : j + BATCH_SIZE]
+                    for batch, batch_bytes in spend_log_batches:
+                        if base_url is not None and db_writer_client is not None:
+                            if not base_url.endswith("/"):
+                                base_url += "/"
+                            verbose_proxy_logger.debug("base_url: {}".format(base_url))
+                            json_data = json.dumps(batch)
+                            await db_writer_client.post(
+                                url=base_url + "spend/update",
+                                data=json_data,
+                                headers={"Content-Type": "application/json"},
+                            )
+                            del json_data
+                        else:
                             batch_with_dates = [prisma_client.jsonify_object({**entry}) for entry in batch]
                             await SpendLogsRepository(prisma_client).table.create_many(
                                 data=batch_with_dates, skip_duplicates=True
                             )
-                            verbose_proxy_logger.debug(f"Flushed {len(batch)} logs to the DB.")
-                            # Explicitly clear batch memory
+                            verbose_proxy_logger.debug(
+                                "Flushed %d spend logs (%d estimated bytes) to the DB.",
+                                len(batch),
+                                batch_bytes,
+                            )
                             del batch, batch_with_dates
 
-                        # Items already removed from queue at start of function
-                        async with prisma_client._spend_log_transactions_lock:
-                            remaining_count = len(prisma_client.spend_log_transactions)
-                        verbose_proxy_logger.debug(
-                            f"{len(logs_to_process)} logs processed. Remaining in queue: {remaining_count}"
-                        )
+                    async with prisma_client._spend_log_transactions_lock:
+                        remaining_count = len(prisma_client.spend_log_transactions)
+                    verbose_proxy_logger.debug(
+                        f"{len(logs_to_process)} logs processed. Remaining in queue: {remaining_count}"
+                    )
                     break
                 except DB_CONNECTION_ERROR_TYPES as e:
                     if i is None:
@@ -5362,7 +5399,8 @@ async def update_spend_logs_job(
             return
 
         async with prisma_client._spend_log_transactions_lock:
-            logs_to_process = prisma_client.spend_log_transactions[:MAX_LOGS_PER_INTERVAL]
+            candidates = prisma_client.spend_log_transactions[:MAX_LOGS_PER_INTERVAL]
+            logs_to_process, _ = _spend_log_batch_prefix(candidates)
             prisma_client.spend_log_transactions = prisma_client.spend_log_transactions[len(logs_to_process) :]
 
         try:
@@ -5445,6 +5483,54 @@ def _is_transient_spend_log_write_error(
 
     external_writer_enabled = db_writer_client is not None and os.getenv("SPEND_LOGS_URL") is not None
     return external_writer_enabled and isinstance(error, litellm.Timeout)
+
+
+async def drain_spend_log_queue(
+    prisma_client: PrismaClient,
+    db_writer_client: Optional[AsyncHTTPHandler],
+    proxy_logging_obj: ProxyLogging,
+    timeout_seconds: float,
+) -> int:
+    """Flush queued raw spend rows during graceful shutdown.
+
+    Returns the number of rows still queued when the timeout expires. Normal
+    operation keeps inference non-blocking; only an explicit graceful shutdown
+    waits for telemetry to reach durable storage.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+
+    while True:
+        async with prisma_client._spend_log_transactions_lock:
+            remaining = len(prisma_client.spend_log_transactions)
+        if remaining == 0:
+            verbose_proxy_logger.info("Spend tracking - graceful drain complete")
+            return 0
+
+        time_left = deadline - time.monotonic()
+        if time_left <= 0:
+            verbose_proxy_logger.warning(
+                "Spend tracking - graceful drain timed out with %d logs queued",
+                remaining,
+            )
+            return remaining
+
+        try:
+            await asyncio.wait_for(
+                update_spend_logs_job(
+                    prisma_client=prisma_client,
+                    db_writer_client=db_writer_client,
+                    proxy_logging_obj=proxy_logging_obj,
+                ),
+                timeout=time_left,
+            )
+        except asyncio.TimeoutError:
+            continue
+        except Exception as error:
+            verbose_proxy_logger.warning(
+                "Spend tracking - graceful drain write failed; retrying. error=%s",
+                str(error),
+            )
+            await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
 async def _monitor_spend_logs_queue(
