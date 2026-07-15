@@ -1,4 +1,5 @@
 import json
+from datetime import date, datetime, time
 from typing import Any, Union
 
 from pydantic import BaseModel
@@ -27,6 +28,8 @@ def safe_dumps(data: Any, max_depth: int = DEFAULT_MAX_RECURSE_DEPTH) -> str:
             return obj.replace("\x00", "") if "\x00" in obj else obj
         if isinstance(obj, (int, float, bool, type(None))):
             return obj
+        if isinstance(obj, (datetime, date, time)):
+            return obj.isoformat()
         # Check for circular reference.
         if id(obj) in seen:
             return "CircularReference Detected"

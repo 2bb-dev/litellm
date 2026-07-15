@@ -2,6 +2,7 @@ import asyncio
 import os
 import stat
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
 from litellm.proxy.utils import _get_redoc_url, _get_docs_url
@@ -104,6 +105,36 @@ async def test_durable_spend_log_spool_survives_process_recreation(tmp_path):
     assert batch.logs == [{"request_id": "persisted", "spend": 1.25}]
     await second_process.acknowledge(batch.durable_row_ids or [])
     assert (await second_process.stats()).count == 0
+
+
+@pytest.mark.asyncio
+async def test_durable_spend_log_spool_preserves_prisma_datetime_format(tmp_path):
+    spool = SQLiteSpendLogSpool(str(tmp_path / "spend-queue.sqlite3"))
+    completion_started_at = datetime(
+        2026,
+        7,
+        15,
+        16,
+        22,
+        48,
+        869994,
+        tzinfo=timezone.utc,
+    )
+
+    await spool.enqueue(
+        {
+            "request_id": "datetime-row",
+            "completionStartTime": completion_started_at,
+        }
+    )
+
+    batch = await spool.peek_batch(max_count=10, max_bytes=1024 * 1024)
+    assert batch.logs == [
+        {
+            "request_id": "datetime-row",
+            "completionStartTime": completion_started_at.isoformat(),
+        }
+    ]
 
 
 @pytest.mark.asyncio
