@@ -37,7 +37,16 @@ from litellm.constants import (
     MAX_TEAM_LIST_LIMIT,
     SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL,
     SPEND_LOG_DB_WRITE_BATCH_MAX_BYTES,
+    SPEND_LOG_DB_WRITE_BATCH_MIN_BYTES,
     SPEND_LOG_DB_WRITE_BATCH_SIZE,
+)
+from litellm.proxy.db.spend_log_queue import (
+    SpendLogQueueBatch,
+    acknowledge_spend_log_batch,
+    create_spend_log_spool_from_env,
+    release_spend_log_batch,
+    spend_log_queue_stats,
+    take_spend_log_batch,
 )
 from litellm.proxy._types import (
     DB_CONNECTION_ERROR_TYPES,
@@ -2779,9 +2788,6 @@ async def prefetch_config_params(prisma_client: Any, param_names: List[str]) -> 
 
 
 class PrismaClient:
-    spend_log_transactions: List = []
-    _spend_log_transactions_lock = asyncio.Lock()
-
     def __init__(
         self,
         database_url: str,
@@ -2790,6 +2796,11 @@ class PrismaClient:
     ):
         ## init logging object
         self.proxy_logging_obj = proxy_logging_obj
+        self.spend_log_transactions: List[Dict[str, Any]] = []
+        self._spend_log_transactions_lock = asyncio.Lock()
+        self._spend_log_spool = create_spend_log_spool_from_env()
+        self._spend_log_batch_max_bytes = SPEND_LOG_DB_WRITE_BATCH_MAX_BYTES
+        self._spend_log_batch_max_count = SPEND_LOG_DB_WRITE_BATCH_SIZE
         self.iam_token_db_auth: Optional[bool] = str_to_bool(os.getenv("IAM_TOKEN_DB_AUTH"))
         verbose_proxy_logger.debug("Creating Prisma Client..")
         try:
@@ -5147,6 +5158,42 @@ def _spend_log_batches(
     return batches
 
 
+def _spend_log_batch_limits(prisma_client: Any) -> Tuple[int, int]:
+    return (
+        max(1, int(getattr(prisma_client, "_spend_log_batch_max_count", SPEND_LOG_DB_WRITE_BATCH_SIZE))),
+        max(
+            SPEND_LOG_DB_WRITE_BATCH_MIN_BYTES,
+            int(getattr(prisma_client, "_spend_log_batch_max_bytes", SPEND_LOG_DB_WRITE_BATCH_MAX_BYTES)),
+        ),
+    )
+
+
+def _reduce_spend_log_batch_limits(prisma_client: Any) -> None:
+    current_count, current_bytes = _spend_log_batch_limits(prisma_client)
+    next_count = max(1, current_count // 2)
+    next_bytes = max(SPEND_LOG_DB_WRITE_BATCH_MIN_BYTES, current_bytes // 2)
+    prisma_client._spend_log_batch_max_count = next_count
+    prisma_client._spend_log_batch_max_bytes = next_bytes
+    if (next_count, next_bytes) != (current_count, current_bytes):
+        verbose_proxy_logger.warning(
+            "Spend tracking - reducing retry batch limit to %d rows / %d bytes",
+            next_count,
+            next_bytes,
+        )
+
+
+def _grow_spend_log_batch_limits(prisma_client: Any) -> None:
+    current_count, current_bytes = _spend_log_batch_limits(prisma_client)
+    prisma_client._spend_log_batch_max_count = min(
+        SPEND_LOG_DB_WRITE_BATCH_SIZE,
+        max(current_count + 1, int(current_count * 1.25)),
+    )
+    prisma_client._spend_log_batch_max_bytes = min(
+        SPEND_LOG_DB_WRITE_BATCH_MAX_BYTES,
+        max(current_bytes + SPEND_LOG_DB_WRITE_BATCH_MIN_BYTES, int(current_bytes * 1.25)),
+    )
+
+
 class ProxyUpdateSpend:
     @staticmethod
     async def update_end_user_spend(
@@ -5242,8 +5289,7 @@ class ProxyUpdateSpend:
                             )
                             del batch, batch_with_dates
 
-                    async with prisma_client._spend_log_transactions_lock:
-                        remaining_count = len(prisma_client.spend_log_transactions)
+                    remaining_count = (await spend_log_queue_stats(prisma_client)).count
                     verbose_proxy_logger.debug(
                         f"{len(logs_to_process)} logs processed. Remaining in queue: {remaining_count}"
                     )
@@ -5312,9 +5358,7 @@ async def update_spend(
     )
 
     ### UPDATE SPEND LOGS ###
-    # Check queue size with lock protection
-    async with prisma_client._spend_log_transactions_lock:
-        queue_size = len(prisma_client.spend_log_transactions)
+    queue_size = (await spend_log_queue_stats(prisma_client)).count
     verbose_proxy_logger.debug("Spend Logs transactions: {}".format(queue_size))
 
     # Process spend log transactions when called directly.
@@ -5384,24 +5428,27 @@ async def update_spend_logs_job(
     Job to process spend_log_transactions queue.
 
     This job is triggered based on queue size rather than time.
-    Pops the batch once, writes spend logs, then runs guardrail usage tracking.
-    Transient failures return the batch to the front for a later scheduler pass.
+    Takes one bounded batch, writes spend logs, then runs guardrail usage
+    tracking. Durable rows are acknowledged only after PostgreSQL accepts them;
+    transient failures retain the batch for a smaller scheduler attempt.
     """
-    MAX_LOGS_PER_INTERVAL = SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL
-
     # The queue monitor and interval job both call this function. Serialize the
     # flush, but keep the queue lock short so producers can enqueue while a DB
     # write is in progress.
     async with prisma_client._spend_log_write_lock:
-        async with prisma_client._spend_log_transactions_lock:
-            queue_size = len(prisma_client.spend_log_transactions)
-        if queue_size == 0:
+        stats = await spend_log_queue_stats(prisma_client)
+        if stats.count == 0:
             return
 
-        async with prisma_client._spend_log_transactions_lock:
-            candidates = prisma_client.spend_log_transactions[:MAX_LOGS_PER_INTERVAL]
-            logs_to_process, _ = _spend_log_batch_prefix(candidates)
-            prisma_client.spend_log_transactions = prisma_client.spend_log_transactions[len(logs_to_process) :]
+        max_count, max_bytes = _spend_log_batch_limits(prisma_client)
+        queue_batch: SpendLogQueueBatch = await take_spend_log_batch(
+            prisma_client,
+            max_count=min(SPEND_LOG_DB_MAX_LOGS_PER_INTERVAL, max_count),
+            max_bytes=max_bytes,
+        )
+        logs_to_process = queue_batch.logs
+        if not logs_to_process:
+            return
 
         try:
             # A read timeout is ambiguous: PostgreSQL may still commit after
@@ -5417,16 +5464,20 @@ async def update_spend_logs_job(
                 logs_to_process=logs_to_process,
             )
         except asyncio.CancelledError:
-            await _prepend_spend_logs(prisma_client, logs_to_process)
+            await release_spend_log_batch(prisma_client, queue_batch)
             raise
         except Exception as spend_log_error:
             if _is_transient_spend_log_write_error(spend_log_error, db_writer_client):
-                await _prepend_spend_logs(prisma_client, logs_to_process)
+                _reduce_spend_log_batch_limits(prisma_client)
+                await release_spend_log_batch(prisma_client, queue_batch)
                 verbose_proxy_logger.warning(
-                    "Spend tracking - requeued %d spend logs after transient writer failure",
+                    "Spend tracking - retained %d spend logs after transient writer failure",
                     len(logs_to_process),
                 )
             raise
+        else:
+            await acknowledge_spend_log_batch(prisma_client, queue_batch)
+            _grow_spend_log_batch_limits(prisma_client)
 
     # Guardrail/policy usage tracking (same batch, outside spend-logs update)
     try:
@@ -5500,8 +5551,7 @@ async def drain_spend_log_queue(
     deadline = time.monotonic() + max(0.0, timeout_seconds)
 
     while True:
-        async with prisma_client._spend_log_transactions_lock:
-            remaining = len(prisma_client.spend_log_transactions)
+        remaining = (await spend_log_queue_stats(prisma_client)).count
         if remaining == 0:
             verbose_proxy_logger.info("Spend tracking - graceful drain complete")
             return 0
@@ -5558,15 +5608,19 @@ async def _monitor_spend_logs_queue(
     backoff_multiplier = 1.5  # Exponential backoff multiplier
     current_interval = base_interval
 
+    initial_stats = await spend_log_queue_stats(prisma_client)
     verbose_proxy_logger.info(
-        f"Starting spend logs queue monitor (threshold: {threshold}, poll_interval: {base_interval}s)"
+        "Starting spend logs queue monitor (threshold: %d, poll_interval: %ss, recovered_rows: %d, "
+        "recovered_bytes: %d)",
+        threshold,
+        base_interval,
+        initial_stats.count,
+        initial_stats.serialized_bytes,
     )
 
     while True:
         try:
-            # Check queue size with lock protection
-            async with prisma_client._spend_log_transactions_lock:
-                queue_size = len(prisma_client.spend_log_transactions)
+            queue_size = (await spend_log_queue_stats(prisma_client)).count
 
             if queue_size > 0:
                 if queue_size >= threshold:

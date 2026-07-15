@@ -59,6 +59,7 @@ from litellm.proxy.db.db_transaction_queue.spend_update_queue import SpendUpdate
 from litellm.proxy.db.db_transaction_queue.tool_discovery_queue import (
     ToolDiscoveryQueue,
 )
+from litellm.proxy.db.spend_log_queue import enqueue_spend_log
 from litellm.proxy.route_llm_request import ROUTE_ENDPOINT_MAPPING
 from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
 
@@ -733,12 +734,8 @@ class DBSpendUpdateWriter:
                 payload.get("request_id"), payload.get("spend")
             )
         )
-        if prisma_client is not None and spend_logs_url is not None:
-            async with prisma_client._spend_log_transactions_lock:
-                prisma_client.spend_log_transactions.append(payload)
-        elif prisma_client is not None:
-            async with prisma_client._spend_log_transactions_lock:
-                prisma_client.spend_log_transactions.append(payload)
+        if prisma_client is not None:
+            await enqueue_spend_log(prisma_client, dict(payload))
         else:
             verbose_proxy_logger.debug("prisma_client is None. Skipping writing spend logs to db.")
 

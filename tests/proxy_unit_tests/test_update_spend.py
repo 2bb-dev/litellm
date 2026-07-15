@@ -24,6 +24,11 @@ from litellm.proxy.utils import (
     update_spend,
     update_spend_logs_job,
 )
+from litellm.proxy.db.spend_log_queue import (
+    SQLiteSpendLogSpool,
+    enqueue_spend_log,
+    spend_log_queue_stats,
+)
 
 
 class MockPrismaClient:
@@ -42,6 +47,7 @@ class MockPrismaClient:
 
         self._spend_log_transactions_lock = asyncio.Lock()
         self._spend_log_write_lock = asyncio.Lock()
+        self._spend_log_spool = None
 
     def jsonify_object(self, obj):
         return obj
@@ -80,6 +86,69 @@ def test_spend_log_batch_prefix_respects_bytes_and_always_makes_progress():
 
     oversized, _ = _spend_log_batch_prefix(logs, max_count=10, max_bytes=1)
     assert oversized == [logs[0]]
+
+
+@pytest.mark.asyncio
+async def test_durable_spend_log_spool_survives_process_recreation(tmp_path):
+    spool_path = tmp_path / "spend-queue.sqlite3"
+    first_process = SQLiteSpendLogSpool(str(spool_path))
+    await first_process.enqueue({"request_id": "persisted", "spend": 1.25})
+
+    second_process = SQLiteSpendLogSpool(str(spool_path))
+    stats = await second_process.stats()
+    batch = await second_process.peek_batch(max_count=10, max_bytes=1024 * 1024)
+
+    assert stats.count == 1
+    assert batch.logs == [{"request_id": "persisted", "spend": 1.25}]
+    await second_process.acknowledge(batch.durable_row_ids or [])
+    assert (await second_process.stats()).count == 0
+
+
+@pytest.mark.asyncio
+async def test_durable_spend_log_spool_group_commits_concurrent_producers(tmp_path):
+    spool = SQLiteSpendLogSpool(str(tmp_path / "spend-queue.sqlite3"))
+
+    await asyncio.gather(*(spool.enqueue({"request_id": str(index)}) for index in range(50)))
+
+    batch = await spool.peek_batch(max_count=100, max_bytes=1024 * 1024)
+    assert [row["request_id"] for row in batch.logs] == [str(index) for index in range(50)]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_writer_acknowledges_durable_rows_only_after_db_success(tmp_path):
+    prisma_client = MockPrismaClient()
+    prisma_client._spend_log_spool = SQLiteSpendLogSpool(str(tmp_path / "spend-queue.sqlite3"))
+    proxy_logging_obj = create_mock_proxy_logging()
+    await enqueue_spend_log(prisma_client, {"request_id": "durable"})
+
+    await update_spend_logs_job(prisma_client, None, proxy_logging_obj)
+
+    assert prisma_client.db.litellm_spendlogs.create_many.await_count == 1
+    assert (await spend_log_queue_stats(prisma_client)).count == 0
+
+
+@pytest.mark.asyncio
+async def test_scheduled_writer_retains_durable_rows_and_reduces_batch_after_timeout(tmp_path):
+    prisma_client = MockPrismaClient()
+    prisma_client._spend_log_spool = SQLiteSpendLogSpool(str(tmp_path / "spend-queue.sqlite3"))
+    prisma_client._spend_log_batch_max_count = 1000
+    prisma_client._spend_log_batch_max_bytes = 4 * 1024 * 1024
+    proxy_logging_obj = create_mock_proxy_logging()
+    await enqueue_spend_log(prisma_client, {"request_id": "durable", "payload": "x" * 1024})
+    prisma_client.db.litellm_spendlogs.create_many = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+
+    with pytest.raises(httpx.ReadTimeout):
+        await update_spend_logs_job(prisma_client, None, proxy_logging_obj)
+
+    assert (await spend_log_queue_stats(prisma_client)).count == 1
+    assert prisma_client._spend_log_batch_max_count == 500
+    assert prisma_client._spend_log_batch_max_bytes == 2 * 1024 * 1024
+
+    prisma_client.db.litellm_spendlogs.create_many = AsyncMock(return_value=None)
+    await update_spend_logs_job(prisma_client, None, proxy_logging_obj)
+
+    assert (await spend_log_queue_stats(prisma_client)).count == 0
+    assert prisma_client._spend_log_batch_max_count == 625
 
 
 @pytest.mark.asyncio
