@@ -44,6 +44,7 @@ from litellm.proxy.db.spend_log_queue import (
     SpendLogQueueBatch,
     acknowledge_spend_log_batch,
     create_spend_log_spool_from_env,
+    quarantine_spend_log_batch,
     release_spend_log_batch,
     spend_log_queue_stats,
     take_spend_log_batch,
@@ -5194,6 +5195,36 @@ def _grow_spend_log_batch_limits(prisma_client: Any) -> None:
     )
 
 
+def _split_spend_log_batch_limits(prisma_client: Any, batch: SpendLogQueueBatch) -> None:
+    """Reduce the next durable attempt enough to isolate a row-level failure."""
+    current_count, current_bytes = _spend_log_batch_limits(prisma_client)
+    prisma_client._spend_log_batch_max_count = max(
+        1,
+        min(current_count, len(batch.logs) // 2),
+    )
+    prisma_client._spend_log_batch_max_bytes = max(
+        SPEND_LOG_DB_WRITE_BATCH_MIN_BYTES,
+        min(current_bytes, batch.serialized_bytes // 2),
+    )
+
+
+def _is_permanent_spend_log_row_error(error: Exception) -> bool:
+    """Return whether retrying the same individual payload cannot succeed."""
+    if isinstance(error, (TypeError, ValueError)):
+        return True
+    try:
+        import prisma
+    except ImportError:
+        return False
+    return isinstance(
+        error,
+        (
+            prisma.errors.DataError,
+            prisma.errors.MissingRequiredValueError,
+        ),
+    )
+
+
 class ProxyUpdateSpend:
     @staticmethod
     async def update_end_user_spend(
@@ -5474,6 +5505,24 @@ async def update_spend_logs_job(
                     "Spend tracking - retained %d spend logs after transient writer failure",
                     len(logs_to_process),
                 )
+            elif queue_batch.is_durable and _is_permanent_spend_log_row_error(spend_log_error):
+                if len(logs_to_process) > 1:
+                    _split_spend_log_batch_limits(prisma_client, queue_batch)
+                    verbose_proxy_logger.warning(
+                        "Spend tracking - splitting %d-row durable batch to isolate invalid payload",
+                        len(logs_to_process),
+                    )
+                else:
+                    await quarantine_spend_log_batch(
+                        prisma_client,
+                        queue_batch,
+                        str(spend_log_error),
+                    )
+                    stats = await spend_log_queue_stats(prisma_client)
+                    verbose_proxy_logger.error(
+                        "Spend tracking - quarantined permanently invalid durable row; dead_letter_rows=%d",
+                        stats.quarantined_count,
+                    )
             raise
         else:
             await acknowledge_spend_log_batch(prisma_client, queue_batch)
@@ -5611,11 +5660,12 @@ async def _monitor_spend_logs_queue(
     initial_stats = await spend_log_queue_stats(prisma_client)
     verbose_proxy_logger.info(
         "Starting spend logs queue monitor (threshold: %d, poll_interval: %ss, recovered_rows: %d, "
-        "recovered_bytes: %d)",
+        "recovered_bytes: %d, dead_letter_rows: %d)",
         threshold,
         base_interval,
         initial_stats.count,
         initial_stats.serialized_bytes,
+        initial_stats.quarantined_count,
     )
 
     while True:

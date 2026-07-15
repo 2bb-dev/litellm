@@ -25,6 +25,8 @@ Upstream syncs must preserve these behaviors:
   error logging, and resilient cleanup. Deployments that set
   `SPEND_LOG_DURABLE_QUEUE_PATH` persist pending rows in a local SQLite WAL and
   acknowledge them only after the idempotent PostgreSQL insert succeeds.
+  Permanently invalid rows are isolated and preserved in local dead-letter
+  storage so one poison payload cannot block later telemetry.
 
 ## Upstream Sync Procedure
 

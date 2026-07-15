@@ -200,6 +200,64 @@ async def test_scheduled_writer_retains_durable_rows_and_reduces_batch_after_tim
 
 
 @pytest.mark.asyncio
+async def test_scheduled_writer_isolates_and_quarantines_invalid_durable_row(tmp_path):
+    prisma_client = MockPrismaClient()
+    spool = SQLiteSpendLogSpool(str(tmp_path / "spend-queue.sqlite3"))
+    prisma_client._spend_log_spool = spool
+    proxy_logging_obj = create_mock_proxy_logging()
+    await enqueue_spend_log(prisma_client, {"request_id": "poison"})
+    await enqueue_spend_log(prisma_client, {"request_id": "good"})
+
+    async def reject_poison(**kwargs):
+        if any(row["request_id"] == "poison" for row in kwargs["data"]):
+            raise ValueError("invalid spend payload")
+
+    prisma_client.db.litellm_spendlogs.create_many = AsyncMock(side_effect=reject_poison)
+
+    with pytest.raises(ValueError):
+        await update_spend_logs_job(prisma_client, None, proxy_logging_obj)
+    assert (await spend_log_queue_stats(prisma_client)).count == 2
+    assert prisma_client._spend_log_batch_max_count == 1
+
+    with pytest.raises(ValueError):
+        await update_spend_logs_job(prisma_client, None, proxy_logging_obj)
+    quarantined = await spend_log_queue_stats(prisma_client)
+    assert quarantined.count == 1
+    assert quarantined.quarantined_count == 1
+
+    with spool._connection() as connection:
+        dead_letter = connection.execute(
+            "SELECT payload, error FROM spend_log_dead_letter WHERE spool_id = 1"
+        ).fetchone()
+    assert dead_letter is not None
+    assert '"request_id": "poison"' in dead_letter[0]
+    assert dead_letter[1] == "invalid spend payload"
+
+    await update_spend_logs_job(prisma_client, None, proxy_logging_obj)
+    final_stats = await spend_log_queue_stats(prisma_client)
+    assert final_stats.count == 0
+    assert final_stats.quarantined_count == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduled_writer_retains_unknown_durable_failure(tmp_path):
+    prisma_client = MockPrismaClient()
+    prisma_client._spend_log_spool = SQLiteSpendLogSpool(str(tmp_path / "spend-queue.sqlite3"))
+    proxy_logging_obj = create_mock_proxy_logging()
+    await enqueue_spend_log(prisma_client, {"request_id": "unknown"})
+    prisma_client.db.litellm_spendlogs.create_many = AsyncMock(
+        side_effect=RuntimeError("schema unavailable")
+    )
+
+    with pytest.raises(RuntimeError):
+        await update_spend_logs_job(prisma_client, None, proxy_logging_obj)
+
+    stats = await spend_log_queue_stats(prisma_client)
+    assert stats.count == 1
+    assert stats.quarantined_count == 0
+
+
+@pytest.mark.asyncio
 async def test_update_spend_logs_job_serializes_concurrent_writers():
     """The interval job and queue monitor must not write spend logs concurrently."""
     prisma_client = MockPrismaClient()

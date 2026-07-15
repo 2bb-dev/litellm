@@ -34,6 +34,7 @@ class SpendLogQueueStats:
     count: int
     serialized_bytes: int = 0
     oldest_age_seconds: Optional[float] = None
+    quarantined_count: int = 0
 
 
 class SQLiteSpendLogSpool:
@@ -86,6 +87,18 @@ class SQLiteSpendLogSpool:
                     payload TEXT NOT NULL,
                     payload_bytes INTEGER NOT NULL,
                     created_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS spend_log_dead_letter (
+                    spool_id INTEGER PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    payload_bytes INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    failed_at REAL NOT NULL,
+                    error TEXT NOT NULL
                 )
                 """
             )
@@ -172,6 +185,41 @@ class SQLiteSpendLogSpool:
         async with self._operation_lock:
             await asyncio.to_thread(self._acknowledge_sync, list(row_ids))
 
+    async def quarantine(self, row_ids: Sequence[int], error: str) -> None:
+        if not row_ids:
+            return
+        async with self._operation_lock:
+            await asyncio.to_thread(self._quarantine_sync, list(row_ids), error[:1000])
+
+    def _quarantine_sync(self, row_ids: List[int], error: str) -> None:
+        with self._connection() as connection:
+            for offset in range(0, len(row_ids), 500):
+                chunk = row_ids[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                connection.execute(
+                    f"""
+                    INSERT INTO spend_log_dead_letter (
+                        spool_id,
+                        payload,
+                        payload_bytes,
+                        created_at,
+                        failed_at,
+                        error
+                    )
+                    SELECT id, payload, payload_bytes, created_at, ?, ?
+                    FROM spend_log_spool
+                    WHERE id IN ({placeholders})
+                    ON CONFLICT (spool_id) DO UPDATE SET
+                        failed_at = excluded.failed_at,
+                        error = excluded.error
+                    """,
+                    [time.time(), error, *chunk],
+                )
+                connection.execute(
+                    f"DELETE FROM spend_log_spool WHERE id IN ({placeholders})",
+                    chunk,
+                )
+
     def _acknowledge_sync(self, row_ids: List[int]) -> None:
         with self._connection() as connection:
             for offset in range(0, len(row_ids), 500):
@@ -195,12 +243,20 @@ class SQLiteSpendLogSpool:
             count=pending_count + durable.count,
             serialized_bytes=pending_bytes + durable.serialized_bytes,
             oldest_age_seconds=durable.oldest_age_seconds,
+            quarantined_count=durable.quarantined_count,
         )
 
     def _stats_sync(self) -> SpendLogQueueStats:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0), MIN(created_at) FROM spend_log_spool"
+                """
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(payload_bytes), 0),
+                    MIN(created_at),
+                    (SELECT COUNT(*) FROM spend_log_dead_letter)
+                FROM spend_log_spool
+                """
             ).fetchone()
         count = int(row[0]) if row is not None else 0
         oldest_at = float(row[2]) if row is not None and row[2] is not None else None
@@ -208,6 +264,7 @@ class SQLiteSpendLogSpool:
             count=count,
             serialized_bytes=int(row[1]) if row is not None else 0,
             oldest_age_seconds=max(0.0, time.time() - oldest_at) if oldest_at is not None else None,
+            quarantined_count=int(row[3]) if row is not None else 0,
         )
 
 
@@ -255,6 +312,7 @@ async def spend_log_queue_stats(prisma_client: Any) -> SpendLogQueueStats:
         count=memory_count + durable.count,
         serialized_bytes=durable.serialized_bytes,
         oldest_age_seconds=durable.oldest_age_seconds,
+        quarantined_count=durable.quarantined_count,
     )
 
 
@@ -292,6 +350,21 @@ async def acknowledge_spend_log_batch(prisma_client: Any, batch: SpendLogQueueBa
     if spool is None:
         raise RuntimeError("Durable spend-log queue disappeared before acknowledgement")
     await spool.acknowledge(batch.durable_row_ids or [])
+
+
+async def quarantine_spend_log_batch(
+    prisma_client: Any,
+    batch: SpendLogQueueBatch,
+    error: str,
+) -> bool:
+    """Move one permanently invalid durable batch into local dead-letter storage."""
+    if not batch.is_durable:
+        return False
+    spool = getattr(prisma_client, "_spend_log_spool", None)
+    if spool is None:
+        raise RuntimeError("Durable spend-log queue disappeared before quarantine")
+    await spool.quarantine(batch.durable_row_ids or [], error)
+    return True
 
 
 async def release_spend_log_batch(prisma_client: Any, batch: SpendLogQueueBatch) -> None:
