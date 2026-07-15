@@ -9,9 +9,10 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
@@ -45,7 +46,20 @@ class SQLiteSpendLogSpool:
         self._pending_enqueues: List[Tuple[str, int, asyncio.Future[None]]] = []
         self._enqueue_flush_task: Optional[asyncio.Task[None]] = None
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
         self._initialize()
+
+    def _restrict_permissions(self) -> None:
+        os.chmod(self.path.parent, 0o700)
+        for candidate in (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ):
+            try:
+                os.chmod(candidate, 0o600)
+            except FileNotFoundError:
+                continue
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.path), timeout=30.0)
@@ -53,8 +67,18 @@ class SQLiteSpendLogSpool:
         connection.execute("PRAGMA synchronous = FULL")
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+            self._restrict_permissions()
+
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
             connection.execute(
@@ -67,7 +91,6 @@ class SQLiteSpendLogSpool:
                 )
                 """
             )
-        os.chmod(self.path, 0o600)
 
     async def enqueue(self, payload: Dict[str, Any]) -> None:
         serialized = safe_dumps(payload)
@@ -108,7 +131,7 @@ class SQLiteSpendLogSpool:
 
     def _enqueue_many_sync(self, rows: List[Tuple[str, int]]) -> None:
         now = time.time()
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.executemany(
                 "INSERT INTO spend_log_spool(payload, payload_bytes, created_at) VALUES (?, ?, ?)",
                 [(serialized, payload_bytes, now) for serialized, payload_bytes in rows],
@@ -123,7 +146,7 @@ class SQLiteSpendLogSpool:
         row_ids: List[int] = []
         serialized_bytes = 2
 
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 "SELECT id, payload, payload_bytes FROM spend_log_spool ORDER BY id LIMIT ?",
                 (max_count,),
@@ -152,7 +175,7 @@ class SQLiteSpendLogSpool:
             await asyncio.to_thread(self._acknowledge_sync, list(row_ids))
 
     def _acknowledge_sync(self, row_ids: List[int]) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             for offset in range(0, len(row_ids), 500):
                 chunk = row_ids[offset : offset + 500]
                 placeholders = ",".join("?" for _ in chunk)
@@ -166,7 +189,7 @@ class SQLiteSpendLogSpool:
             return await asyncio.to_thread(self._stats_sync)
 
     def _stats_sync(self) -> SpendLogQueueStats:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0), MIN(created_at) FROM spend_log_spool"
             ).fetchone()

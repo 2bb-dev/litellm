@@ -79,6 +79,15 @@ def test_timeout_falls_back_on_garbage(monkeypatch):
     assert GracefulShutdownManager.get_timeout() == DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT
 
 
+def test_remaining_timeout_uses_process_wide_budget(monkeypatch):
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "5")
+    GracefulShutdownManager._shutdown_started_at = time.monotonic() - 2
+
+    remaining = GracefulShutdownManager.get_remaining_timeout()
+
+    assert 2.9 <= remaining <= 3.0
+
+
 # ── wait_for_drain ────────────────────────────────────────────────────────────
 
 

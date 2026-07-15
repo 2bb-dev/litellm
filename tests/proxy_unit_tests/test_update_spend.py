@@ -1,6 +1,8 @@
 import asyncio
 import os
+import stat
 import sys
+from pathlib import Path
 from unittest.mock import Mock
 from litellm.proxy.utils import _get_redoc_url, _get_docs_url
 
@@ -112,6 +114,20 @@ async def test_durable_spend_log_spool_group_commits_concurrent_producers(tmp_pa
 
     batch = await spool.peek_batch(max_count=100, max_bytes=1024 * 1024)
     assert [row["request_id"] for row in batch.logs] == [str(index) for index in range(50)]
+
+
+def test_durable_spend_log_spool_restricts_database_and_sidecar_permissions(tmp_path):
+    spool_path = tmp_path / "spend-queue" / "queue.sqlite3"
+    spool = SQLiteSpendLogSpool(str(spool_path))
+    sidecars = [spool_path, Path(f"{spool_path}-wal"), Path(f"{spool_path}-shm")]
+    for path in sidecars[1:]:
+        path.touch(mode=0o666)
+        path.chmod(0o666)
+
+    spool._restrict_permissions()
+
+    assert stat.S_IMODE(spool_path.parent.stat().st_mode) == 0o700
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in sidecars)
 
 
 @pytest.mark.asyncio

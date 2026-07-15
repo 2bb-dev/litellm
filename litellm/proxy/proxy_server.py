@@ -1025,7 +1025,7 @@ async def proxy_startup_event(app: FastAPI):
             prisma_client=prisma_client,
             db_writer_client=db_writer_client,
             proxy_logging_obj=proxy_logging_obj,
-            timeout_seconds=GracefulShutdownManager.get_timeout(),
+            timeout_seconds=GracefulShutdownManager.get_remaining_timeout(),
         )
 
     # Shutdown event - close shared aiohttp session
