@@ -69,6 +69,14 @@ class GracefulShutdownManager:
             return DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT
 
     @classmethod
+    def get_remaining_timeout(cls) -> float:
+        """Return the unspent portion of the process-wide shutdown budget."""
+        timeout = cls.get_timeout()
+        if cls._shutdown_started_at is None:
+            return max(0.0, timeout)
+        return max(0.0, timeout - (time.monotonic() - cls._shutdown_started_at))
+
+    @classmethod
     def start_shutdown(cls) -> None:
         """
         Mark the worker as draining. Idempotent — repeated calls (e.g. SIGTERM

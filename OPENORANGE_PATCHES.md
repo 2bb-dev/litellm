@@ -20,9 +20,13 @@ Upstream syncs must preserve these behaviors:
   execution, and Langfuse metadata without persisting raw credentials.
 - **Responses logging:** streamed terminal responses retain reconstructed
   output, annotations, refusals, and ordering for request-detail views.
-- **Spend-log resilience:** database writes use bounded configurable batches,
+- **Spend-log resilience:** database writes use byte-bounded adaptive batches,
   one process-local writer at a time, deterministic lock ordering, prompt-safe
-  error logging, and resilient cleanup.
+  error logging, and resilient cleanup. Deployments that set
+  `SPEND_LOG_DURABLE_QUEUE_PATH` persist pending rows in a local SQLite WAL and
+  acknowledge them only after the idempotent PostgreSQL insert succeeds.
+  Permanently invalid rows are isolated and preserved in local dead-letter
+  storage so one poison payload cannot block later telemetry.
 
 ## Upstream Sync Procedure
 
