@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from datetime import date, datetime, time, timezone
 
 import pytest
 
@@ -27,6 +28,20 @@ def test_nested_structures():
     assert result["name"] == "test"
     assert result["numbers"] == [1, 2, 3]
     assert result["nested"] == {"a": 1, "b": 2}
+
+
+def test_datetime_types_use_iso_8601():
+    data = {
+        "timestamp": datetime(2026, 7, 15, 16, 22, 48, 869994, tzinfo=timezone.utc),
+        "date": date(2026, 7, 15),
+        "time": time(16, 22, 48, 869994),
+    }
+
+    assert json.loads(safe_dumps(data)) == {
+        "timestamp": "2026-07-15T16:22:48.869994+00:00",
+        "date": "2026-07-15",
+        "time": "16:22:48.869994",
+    }
 
 
 def test_circular_reference():
