@@ -185,8 +185,19 @@ class SQLiteSpendLogSpool:
                 )
 
     async def stats(self) -> SpendLogQueueStats:
-        async with self._operation_lock:
-            return await asyncio.to_thread(self._stats_sync)
+        # Hold the pending lock until the durable snapshot is read. This makes
+        # an enqueue visible either in the pending group or in SQLite, never in
+        # neither, so graceful shutdown cannot finish between those states.
+        async with self._pending_lock:
+            pending_count = len(self._pending_enqueues)
+            pending_bytes = sum(row[1] for row in self._pending_enqueues)
+            async with self._operation_lock:
+                durable = await asyncio.to_thread(self._stats_sync)
+        return SpendLogQueueStats(
+            count=pending_count + durable.count,
+            serialized_bytes=pending_bytes + durable.serialized_bytes,
+            oldest_age_seconds=durable.oldest_age_seconds,
+        )
 
     def _stats_sync(self) -> SpendLogQueueStats:
         with self._connection() as connection:

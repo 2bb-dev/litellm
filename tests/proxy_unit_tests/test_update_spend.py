@@ -116,6 +116,27 @@ async def test_durable_spend_log_spool_group_commits_concurrent_producers(tmp_pa
     assert [row["request_id"] for row in batch.logs] == [str(index) for index in range(50)]
 
 
+@pytest.mark.asyncio
+async def test_durable_spend_log_spool_stats_include_pending_group_commit(tmp_path):
+    spool = SQLiteSpendLogSpool(str(tmp_path / "queue.sqlite3"))
+    release_flush = asyncio.Event()
+    original_flush = spool._flush_pending_enqueues
+
+    async def delayed_flush():
+        await release_flush.wait()
+        await original_flush()
+
+    spool._flush_pending_enqueues = delayed_flush
+    enqueue = asyncio.create_task(spool.enqueue({"request_id": "pending"}))
+    await asyncio.sleep(0)
+
+    assert (await spool.stats()).count == 1
+
+    release_flush.set()
+    await enqueue
+    assert (await spool.stats()).count == 1
+
+
 def test_durable_spend_log_spool_restricts_database_and_sidecar_permissions(tmp_path):
     spool_path = tmp_path / "spend-queue" / "queue.sqlite3"
     spool = SQLiteSpendLogSpool(str(spool_path))
