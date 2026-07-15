@@ -46,11 +46,9 @@ class SQLiteSpendLogSpool:
         self._pending_enqueues: List[Tuple[str, int, asyncio.Future[None]]] = []
         self._enqueue_flush_task: Optional[asyncio.Task[None]] = None
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
         self._initialize()
 
     def _restrict_permissions(self) -> None:
-        os.chmod(self.path.parent, 0o700)
         for candidate in (
             self.path,
             Path(f"{self.path}-wal"),

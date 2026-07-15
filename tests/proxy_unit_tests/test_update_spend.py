@@ -138,7 +138,10 @@ async def test_durable_spend_log_spool_stats_include_pending_group_commit(tmp_pa
 
 
 def test_durable_spend_log_spool_restricts_database_and_sidecar_permissions(tmp_path):
-    spool_path = tmp_path / "spend-queue" / "queue.sqlite3"
+    spool_directory = tmp_path / "shared"
+    spool_directory.mkdir(mode=0o755)
+    spool_directory.chmod(0o755)
+    spool_path = spool_directory / "queue.sqlite3"
     spool = SQLiteSpendLogSpool(str(spool_path))
     sidecars = [spool_path, Path(f"{spool_path}-wal"), Path(f"{spool_path}-shm")]
     for path in sidecars[1:]:
@@ -147,8 +150,16 @@ def test_durable_spend_log_spool_restricts_database_and_sidecar_permissions(tmp_
 
     spool._restrict_permissions()
 
-    assert stat.S_IMODE(spool_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(spool_path.parent.stat().st_mode) == 0o755
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in sidecars)
+
+
+def test_durable_spend_log_spool_creates_private_parent_directory(tmp_path):
+    spool_path = tmp_path / "private" / "queue.sqlite3"
+
+    SQLiteSpendLogSpool(str(spool_path))
+
+    assert stat.S_IMODE(spool_path.parent.stat().st_mode) & 0o077 == 0
 
 
 @pytest.mark.asyncio
