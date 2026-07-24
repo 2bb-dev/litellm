@@ -605,10 +605,17 @@ async def _reserve_counter(
     attempted_increment = False
     try:
         if counter.source_cache_key is not None:
-            await _ensure_spend_counter_initialized(
-                counter_key=counter.counter_key,
-                source_cache_key=counter.source_cache_key,
-            )
+            if invalidate_on_failure:
+                await _ensure_spend_counter_initialized(
+                    counter_key=counter.counter_key,
+                    source_cache_key=counter.source_cache_key,
+                )
+            else:
+                await _ensure_spend_counter_initialized(
+                    counter_key=counter.counter_key,
+                    source_cache_key=counter.source_cache_key,
+                    invalidate_on_failure=False,
+                )
         elif counter.spend_log_entity_id is not None and counter.window_start is not None:
             initialized = await _ensure_window_spend_counter_initialized(
                 counter_key=counter.counter_key,
@@ -690,6 +697,7 @@ async def _set_reserved_entry_actual_cost(
     actual_cost: float,
     default_reserved_cost: float,
     reseed_on_inconsistent: bool = True,
+    invalidate_on_failure: bool = True,
 ) -> None:
     from litellm.proxy.proxy_server import (
         _increment_spend_counter_cache,
@@ -712,10 +720,17 @@ async def _set_reserved_entry_actual_cost(
         counter_key=counter_key,
         adjustment=adjustment,
     ):
-        await _increment_spend_counter_cache(
-            counter_key=counter_key,
-            increment=adjustment,
-        )
+        if invalidate_on_failure:
+            await _increment_spend_counter_cache(
+                counter_key=counter_key,
+                increment=adjustment,
+            )
+        else:
+            await _increment_spend_counter_cache(
+                counter_key=counter_key,
+                increment=adjustment,
+                invalidate_on_failure=False,
+            )
     elif reseed_on_inconsistent:
         # Post-call reconcile / release: the counter was flushed or reseeded
         # between reservation and reconcile (Redis restart / cross-pod reset),
@@ -762,6 +777,7 @@ async def _release_applied_entries_best_effort(
                 entry=entry,
                 actual_cost=0.0,
                 default_reserved_cost=default_reserved_cost,
+                invalidate_on_failure=invalidate_on_failure,
             )
         except Exception:
             counter_key = entry.get("counter_key")

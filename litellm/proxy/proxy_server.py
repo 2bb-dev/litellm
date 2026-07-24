@@ -2509,6 +2509,7 @@ async def _init_and_increment_window_spend_counter(
 async def _ensure_spend_counter_initialized(
     counter_key: str,
     source_cache_key: Union[str, List[str]],
+    invalidate_on_failure: bool = True,
 ):
     is_warm = await _is_spend_counter_cache_warm(counter_key=counter_key)
     if is_warm is False:
@@ -2523,7 +2524,14 @@ async def _ensure_spend_counter_initialized(
             # DB unavailable - fall back to in-process cache (may be stale).
             base_spend = await _get_source_cache_base_spend(source_cache_key=source_cache_key)
             if base_spend > 0:
-                await _increment_spend_counter_cache(counter_key=counter_key, increment=base_spend)
+                if invalidate_on_failure:
+                    await _increment_spend_counter_cache(counter_key=counter_key, increment=base_spend)
+                else:
+                    await _increment_spend_counter_cache(
+                        counter_key=counter_key,
+                        increment=base_spend,
+                        invalidate_on_failure=False,
+                    )
 
 
 async def _get_source_cache_base_spend(

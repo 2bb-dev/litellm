@@ -64,21 +64,46 @@ class _AmbiguousIncrementRedis:
     def __init__(self):
         self.values = {}
         self.failure_mode = None
+        self.decrement_failure_mode = None
+        self.initialization_failure_mode = None
+        self.concurrent_value_before_initialization_increment = None
+        self.clean_misses_remaining = 0
         self.delete_calls = 0
 
     async def async_get_cache(self, key, **kwargs):
+        if self.clean_misses_remaining > 0:
+            self.clean_misses_remaining -= 1
+            return None
         return self.values.get(key)
 
     async def async_increment(self, key, value, **kwargs):
+        if self.concurrent_value_before_initialization_increment is not None:
+            self.values[key] = self.concurrent_value_before_initialization_increment
+            self.concurrent_value_before_initialization_increment = None
+            if self.initialization_failure_mode == "before":
+                self.initialization_failure_mode = None
+                raise RuntimeError("initialization increment failed before mutation")
+            current_value = float(self.values[key]) + value
+            self.values[key] = current_value
+            if self.initialization_failure_mode == "after":
+                self.initialization_failure_mode = None
+                raise RuntimeError("initialization increment failed after mutation")
+            return current_value
         if value > 0 and self.failure_mode == "before":
             self.failure_mode = None
             raise RuntimeError("increment failed before mutation")
+        if value < 0 and self.decrement_failure_mode == "before":
+            self.decrement_failure_mode = None
+            raise RuntimeError("decrement failed before mutation")
 
         current_value = float(self.values.get(key, 0.0)) + value
         self.values[key] = current_value
         if value > 0 and self.failure_mode == "after":
             self.failure_mode = None
             raise RuntimeError("increment failed after mutation")
+        if value < 0 and self.decrement_failure_mode == "after":
+            self.decrement_failure_mode = None
+            raise RuntimeError("decrement failed after mutation")
         return current_value
 
     async def async_delete_cache(self, key, **kwargs):
@@ -541,6 +566,100 @@ async def test_strict_redis_increment_failure_after_mutation_preserves_uncertain
     assert existing_reservation is not None
     assert redis_counter.values[counter_key] == pytest.approx(1.2)
     assert redis_counter.delete_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
+async def test_strict_redis_overspend_rollback_failure_preserves_shared_counter(
+    spend_counter_state,
+    failure_mode,
+):
+    counter_cache, key_cache = spend_counter_state
+    redis_counter = _AmbiguousIncrementRedis()
+    counter_cache.redis_cache = redis_counter
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    valid_token = UserAPIKeyAuth(
+        token=f"key-strict-redis-rollback-{failure_mode}",
+        spend=0.0,
+        max_budget=1.0,
+        budget_enforcement="strict",
+    )
+    counter_key = f"spend:key:key-strict-redis-rollback-{failure_mode}"
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.6,
+    ):
+        existing_reservation = await _reserve_strict_test_request(
+            valid_token=valid_token,
+            key_cache=key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        redis_counter.decrement_failure_mode = failure_mode
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await _reserve_strict_test_request(
+                valid_token=valid_token,
+                key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await _reserve_strict_test_request(
+                valid_token=valid_token,
+                key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+    assert existing_reservation is not None
+    assert redis_counter.delete_calls == 0
+    expected_counter = 1.2 if failure_mode == "before" else 0.6
+    assert redis_counter.values[counter_key] == pytest.approx(expected_counter)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
+async def test_strict_redis_cold_initialization_failure_preserves_shared_counter(
+    spend_counter_state,
+    failure_mode,
+):
+    counter_cache, key_cache = spend_counter_state
+    redis_counter = _AmbiguousIncrementRedis()
+    redis_counter.clean_misses_remaining = 2
+    redis_counter.initialization_failure_mode = failure_mode
+    redis_counter.concurrent_value_before_initialization_increment = 0.8
+    counter_cache.redis_cache = redis_counter
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    valid_token = UserAPIKeyAuth(
+        token=f"key-strict-redis-cold-init-{failure_mode}",
+        spend=0.2,
+        max_budget=1.0,
+        budget_enforcement="strict",
+    )
+    key_cache.in_memory_cache.set_cache(key=valid_token.token, value=valid_token)
+    counter_key = f"spend:key:key-strict-redis-cold-init-{failure_mode}"
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.6,
+    ):
+        with pytest.raises(litellm.BudgetExceededError):
+            await _reserve_strict_test_request(
+                valid_token=valid_token,
+                key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await _reserve_strict_test_request(
+                valid_token=valid_token,
+                key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+    assert redis_counter.delete_calls == 0
+    expected_counter = 0.8 if failure_mode == "before" else 1.0
+    assert redis_counter.values[counter_key] == pytest.approx(expected_counter)
 
 
 @pytest.mark.asyncio
