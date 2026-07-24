@@ -2156,7 +2156,7 @@ async def _validate_update_key_data(
     # - Anyone else (non-PROXY_ADMIN, not the owner, not a team member
     #   on a team key): must pass _check_key_admin_access (PROXY_ADMIN
     #   / key-owner / team-admin / org-admin of the key).
-    # - max_budget / spend / budget_limits: always require the admin
+    # - max_budget / spend / budget_limits / budget_enforcement: always require the admin
     #   check, even for the key owner or a team member (matches the
     #   existing admin-only budget semantics).  budget_limits uses
     #   model_fields_set because an explicit null/[] clears the field
@@ -2170,6 +2170,7 @@ async def _validate_update_key_data(
         (data.max_budget is not None and data.max_budget != existing_key_row.max_budget)
         or data.spend is not None
         or "budget_limits" in data.model_fields_set
+        or "budget_enforcement" in data.model_fields_set
     )
 
     # Personal-key bypass: the caller both created the key AND still owns it

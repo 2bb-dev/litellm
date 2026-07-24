@@ -180,6 +180,74 @@ async def test_should_reject_strict_key_request_when_reservation_storage_is_unav
 
 
 @pytest.mark.asyncio
+async def test_strict_budget_rejects_after_failed_overspend_rollback(
+    spend_counter_state,
+    monkeypatch,
+):
+    counter_cache, key_cache = spend_counter_state
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    valid_token = UserAPIKeyAuth(
+        token="key-strict-budget-rollback",
+        spend=0.0,
+        max_budget=1.0,
+        budget_enforcement="strict",
+    )
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.6,
+    ):
+        reservation = await reserve_budget_for_request(
+            request_body=_request_body(),
+            route="/chat/completions",
+            llm_router=None,
+            valid_token=valid_token,
+            team_object=None,
+            user_object=None,
+            prisma_client=None,
+            user_api_key_cache=key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+        original_increment = counter_cache.async_increment_cache
+
+        async def fail_decrement(*args, **kwargs):
+            if kwargs["value"] < 0:
+                raise RuntimeError("rollback unavailable")
+            return await original_increment(*args, **kwargs)
+
+        monkeypatch.setattr(counter_cache, "async_increment_cache", fail_decrement)
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await reserve_budget_for_request(
+                request_body=_request_body(),
+                route="/chat/completions",
+                llm_router=None,
+                valid_token=valid_token,
+                team_object=None,
+                user_object=None,
+                prisma_client=None,
+                user_api_key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await reserve_budget_for_request(
+                request_body=_request_body(),
+                route="/chat/completions",
+                llm_router=None,
+                valid_token=valid_token,
+                team_object=None,
+                user_object=None,
+                prisma_client=None,
+                user_api_key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+    assert reservation is not None
+
+
+@pytest.mark.asyncio
 async def test_should_admit_at_most_one_concurrent_strict_key_reservation(
     spend_counter_state,
 ):

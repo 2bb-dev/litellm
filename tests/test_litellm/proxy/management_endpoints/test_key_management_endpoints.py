@@ -572,6 +572,76 @@ async def test_generate_key_helper_fn_with_access_group_ids(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_budget_enforcement_create_update_and_auth_readback(monkeypatch):
+    """The strict policy survives key persistence and authentication readback."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy.auth.auth_checks import get_key_object
+    from litellm.repositories.verification_token_repository import (
+        VerificationTokenRepository,
+    )
+
+    stored_key = None
+    mock_prisma_client = AsyncMock()
+    verification_token_repository = VerificationTokenRepository(mock_prisma_client)
+
+    async def insert_data(*args, **kwargs):
+        nonlocal stored_key
+        if kwargs["table_name"] == "key":
+            stored_key = verification_token_repository._to_model(
+                MagicMock(dict=MagicMock(return_value=kwargs["data"]))
+            )
+            return MagicMock(
+                token=stored_key.token,
+                created_at=None,
+                updated_at=None,
+                litellm_budget_table=None,
+            )
+        return MagicMock()
+
+    mock_prisma_client.insert_data = AsyncMock(side_effect=insert_data)
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+
+    await generate_key_helper_fn(
+        request_type="key",
+        table_name="key",
+        token="sk-strict-budget-policy",
+        budget_enforcement="strict",
+    )
+
+    assert stored_key is not None
+    assert stored_key.budget_enforcement == "strict"
+
+    with patch(
+        "litellm.proxy.auth.auth_checks._fetch_key_object_from_db_with_reconnect",
+        AsyncMock(return_value=stored_key),
+    ):
+        authenticated_key = await get_key_object(
+            hashed_token=stored_key.token,
+            prisma_client=mock_prisma_client,
+            user_api_key_cache=DualCache(),
+        )
+    assert authenticated_key.budget_enforcement == "strict"
+
+    update_data = await prepare_key_update_data(
+        data=UpdateKeyRequest(key=stored_key.token, budget_enforcement=None),
+        existing_key_row=stored_key,
+    )
+    assert update_data["budget_enforcement"] is None
+    stored_key = stored_key.model_copy(update=update_data)
+
+    with patch(
+        "litellm.proxy.auth.auth_checks._fetch_key_object_from_db_with_reconnect",
+        AsyncMock(return_value=stored_key),
+    ):
+        authenticated_key = await get_key_object(
+            hashed_token=stored_key.token,
+            prisma_client=mock_prisma_client,
+            user_api_key_cache=DualCache(),
+        )
+    assert authenticated_key.budget_enforcement is None
+
+
+@pytest.mark.asyncio
 async def test_key_generation_with_mcp_tool_permissions(monkeypatch):
     """
     Test that /key/generate correctly handles mcp_tool_permissions in object_permission.
@@ -9907,6 +9977,59 @@ class TestKeyOwnerPrivilegeEscalation:
                     user_api_key_cache=MagicMock(),
                 )
         mock_check.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_creator_cannot_clear_own_budget_enforcement(self):
+        """Clearing strict budget enforcement is a budget change and requires admin."""
+        data = UpdateKeyRequest(key="sk-test", budget_enforcement=None)
+        existing = self._make_existing_key(created_by="creator-123")
+        existing.budget_enforcement = "strict"
+        auth = self._make_auth(user_id="creator-123")
+
+        mock_check = AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Not authorized")
+        )
+        with patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+            mock_check,
+        ):
+            with pytest.raises(HTTPException):
+                await _validate_update_key_data(
+                    data=data,
+                    existing_key_row=existing,
+                    user_api_key_dict=auth,
+                    llm_router=None,
+                    premium_user=False,
+                    prisma_client=AsyncMock(),
+                    user_api_key_cache=MagicMock(),
+                )
+        mock_check.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_admin_can_clear_budget_enforcement(self):
+        data = UpdateKeyRequest(key="sk-test", budget_enforcement=None)
+        existing = self._make_existing_key(created_by="someone-else")
+        existing.budget_enforcement = "strict"
+        auth = UserAPIKeyAuth(
+            user_id="admin-user",
+            user_role=LitellmUserRoles.PROXY_ADMIN,
+        )
+
+        mock_check = AsyncMock()
+        with patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+            mock_check,
+        ):
+            await _validate_update_key_data(
+                data=data,
+                existing_key_row=existing,
+                user_api_key_dict=auth,
+                llm_router=None,
+                premium_user=False,
+                prisma_client=AsyncMock(),
+                user_api_key_cache=MagicMock(),
+            )
+        mock_check.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_admin_can_clear_budget_limits(self):

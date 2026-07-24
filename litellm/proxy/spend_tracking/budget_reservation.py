@@ -113,12 +113,14 @@ async def reserve_budget_for_request(
                 reserved_value = await _reserve_counter(
                     counter=counter,
                     reservation_cost=reservation_cost,
+                    invalidate_on_failure=not is_strict_budget_enforcement,
                 )
             except _CounterReservationUnavailable as exc:
                 if exc.touched_counter and not exc.counter_invalidated:
                     await _release_applied_entries_best_effort(
                         entries=[entry],
                         default_reserved_cost=reservation_cost,
+                        invalidate_on_failure=not is_strict_budget_enforcement,
                     )
                 applied_entries.remove(entry)
                 if is_strict_budget_enforcement:
@@ -171,6 +173,7 @@ async def reserve_budget_for_request(
         await _release_applied_entries_best_effort(
             entries=applied_entries,
             default_reserved_cost=reservation_cost,
+            invalidate_on_failure=not is_strict_budget_enforcement,
         )
         raise
 
@@ -591,6 +594,7 @@ def _coerce_window(window: Any) -> dict:
 async def _reserve_counter(
     counter: _BudgetCounter,
     reservation_cost: float,
+    invalidate_on_failure: bool = True,
 ) -> Optional[float]:
     from litellm.proxy.proxy_server import (
         _ensure_spend_counter_initialized,
@@ -635,15 +639,16 @@ async def _reserve_counter(
             exc_info=True,
         )
         counter_invalidated = False
-        try:
-            await _invalidate_spend_counter(counter_key=counter.counter_key)
-            counter_invalidated = True
-        except Exception:
-            verbose_proxy_logger.warning(
-                "Failed to invalidate spend counter after budget reservation failure for %s",
-                counter.counter_key,
-                exc_info=True,
-            )
+        if invalidate_on_failure:
+            try:
+                await _invalidate_spend_counter(counter_key=counter.counter_key)
+                counter_invalidated = True
+            except Exception:
+                verbose_proxy_logger.warning(
+                    "Failed to invalidate spend counter after budget reservation failure for %s",
+                    counter.counter_key,
+                    exc_info=True,
+                )
         raise _CounterReservationUnavailable(
             touched_counter=attempted_increment,
             counter_invalidated=counter_invalidated,
@@ -743,6 +748,7 @@ async def _counter_can_apply_adjustment(
 async def _release_applied_entries_best_effort(
     entries: List[dict],
     default_reserved_cost: float,
+    invalidate_on_failure: bool = True,
 ) -> None:
     for entry in entries:
         try:
@@ -756,14 +762,15 @@ async def _release_applied_entries_best_effort(
             verbose_proxy_logger.exception("Failed to release partial budget reservation during exception cleanup")
             if counter_key is None:
                 continue
-            try:
-                from litellm.proxy.proxy_server import _invalidate_spend_counter
+            if invalidate_on_failure:
+                try:
+                    from litellm.proxy.proxy_server import _invalidate_spend_counter
 
-                await _invalidate_spend_counter(counter_key=counter_key)
-            except Exception:
-                verbose_proxy_logger.exception(
-                    "Failed to invalidate partial budget reservation counter during exception cleanup"
-                )
+                    await _invalidate_spend_counter(counter_key=counter_key)
+                except Exception:
+                    verbose_proxy_logger.exception(
+                        "Failed to invalidate partial budget reservation counter during exception cleanup"
+                    )
 
 
 async def _resize_applied_reservation(
