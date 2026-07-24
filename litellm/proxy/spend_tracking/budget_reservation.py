@@ -624,10 +624,17 @@ async def _reserve_counter(
                 raise _CounterReservationUnavailable
 
         attempted_increment = True
-        reserved_value = await _increment_spend_counter_cache(
-            counter_key=counter.counter_key,
-            increment=reservation_cost,
-        )
+        if invalidate_on_failure:
+            reserved_value = await _increment_spend_counter_cache(
+                counter_key=counter.counter_key,
+                increment=reservation_cost,
+            )
+        else:
+            reserved_value = await _increment_spend_counter_cache(
+                counter_key=counter.counter_key,
+                increment=reservation_cost,
+                invalidate_on_failure=False,
+            )
         return float(reserved_value) if reserved_value is not None else None
     except _CounterReservationUnavailable:
         raise

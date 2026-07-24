@@ -60,6 +60,51 @@ def _request_body() -> dict:
     }
 
 
+class _AmbiguousIncrementRedis:
+    def __init__(self):
+        self.values = {}
+        self.failure_mode = None
+        self.delete_calls = 0
+
+    async def async_get_cache(self, key, **kwargs):
+        return self.values.get(key)
+
+    async def async_increment(self, key, value, **kwargs):
+        if value > 0 and self.failure_mode == "before":
+            self.failure_mode = None
+            raise RuntimeError("increment failed before mutation")
+
+        current_value = float(self.values.get(key, 0.0)) + value
+        self.values[key] = current_value
+        if value > 0 and self.failure_mode == "after":
+            self.failure_mode = None
+            raise RuntimeError("increment failed after mutation")
+        return current_value
+
+    async def async_delete_cache(self, key, **kwargs):
+        self.delete_calls += 1
+        self.values.pop(key, None)
+
+
+async def _reserve_strict_test_request(
+    *,
+    valid_token,
+    key_cache,
+    proxy_logging_obj,
+):
+    return await reserve_budget_for_request(
+        request_body=_request_body(),
+        route="/chat/completions",
+        llm_router=None,
+        valid_token=valid_token,
+        team_object=None,
+        user_object=None,
+        prisma_client=None,
+        user_api_key_cache=key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+    )
+
+
 def test_should_not_serialize_budget_reservation_on_user_api_key_auth():
     auth = UserAPIKeyAuth(
         token="key-budget-runtime-state",
@@ -404,6 +449,98 @@ async def test_strict_increment_failure_after_mutation_preserves_uncertain_reser
             )
 
     assert existing_reservation is not None
+
+
+@pytest.mark.asyncio
+async def test_strict_redis_increment_failure_before_mutation_preserves_existing_reservation(
+    spend_counter_state,
+):
+    counter_cache, key_cache = spend_counter_state
+    redis_counter = _AmbiguousIncrementRedis()
+    counter_cache.redis_cache = redis_counter
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    valid_token = UserAPIKeyAuth(
+        token="key-strict-redis-before-mutation",
+        spend=0.0,
+        max_budget=1.0,
+        budget_enforcement="strict",
+    )
+    counter_key = "spend:key:key-strict-redis-before-mutation"
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.6,
+    ):
+        existing_reservation = await _reserve_strict_test_request(
+            valid_token=valid_token,
+            key_cache=key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        redis_counter.failure_mode = "before"
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await _reserve_strict_test_request(
+                valid_token=valid_token,
+                key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await _reserve_strict_test_request(
+                valid_token=valid_token,
+                key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+    assert existing_reservation is not None
+    assert redis_counter.values[counter_key] == pytest.approx(0.6)
+    assert redis_counter.delete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_strict_redis_increment_failure_after_mutation_preserves_uncertain_reservation(
+    spend_counter_state,
+):
+    counter_cache, key_cache = spend_counter_state
+    redis_counter = _AmbiguousIncrementRedis()
+    counter_cache.redis_cache = redis_counter
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    valid_token = UserAPIKeyAuth(
+        token="key-strict-redis-after-mutation",
+        spend=0.0,
+        max_budget=1.0,
+        budget_enforcement="strict",
+    )
+    counter_key = "spend:key:key-strict-redis-after-mutation"
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.6,
+    ):
+        existing_reservation = await _reserve_strict_test_request(
+            valid_token=valid_token,
+            key_cache=key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        redis_counter.failure_mode = "after"
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await _reserve_strict_test_request(
+                valid_token=valid_token,
+                key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await _reserve_strict_test_request(
+                valid_token=valid_token,
+                key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+    assert existing_reservation is not None
+    assert redis_counter.values[counter_key] == pytest.approx(1.2)
+    assert redis_counter.delete_calls == 0
 
 
 @pytest.mark.asyncio

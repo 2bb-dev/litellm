@@ -2590,7 +2590,11 @@ async def _is_spend_counter_cache_warm(counter_key: str) -> bool:
     return spend_counter_cache.in_memory_cache.get_cache(key=counter_key) is not None
 
 
-async def _increment_spend_counter_cache(counter_key: str, increment: float):
+async def _increment_spend_counter_cache(
+    counter_key: str,
+    increment: float,
+    invalidate_on_failure: bool = True,
+):
     if spend_counter_cache.redis_cache is not None:
         try:
             current_value = await spend_counter_cache.redis_cache.async_increment(
@@ -2599,7 +2603,8 @@ async def _increment_spend_counter_cache(counter_key: str, increment: float):
                 refresh_ttl=True,
             )
         except Exception:
-            await _invalidate_spend_counter(counter_key=counter_key)
+            if invalidate_on_failure:
+                await _invalidate_spend_counter(counter_key=counter_key)
             raise
         spend_counter_cache.in_memory_cache.set_cache(
             key=counter_key,
