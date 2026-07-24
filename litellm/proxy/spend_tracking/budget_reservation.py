@@ -94,6 +94,7 @@ async def reserve_budget_for_request(
         route=route,
         llm_router=llm_router,
     )
+    is_strict_budget_enforcement = valid_token.budget_enforcement == "strict"
     # estimate_request_max_cost still returns None when the model is unknown
     # to the cost map (no token-priced cost fields, e.g. image/audio routes).
     # In that case we fall back to read-time enforcement only.
@@ -120,6 +121,12 @@ async def reserve_budget_for_request(
                         default_reserved_cost=reservation_cost,
                     )
                 applied_entries.remove(entry)
+                if is_strict_budget_enforcement:
+                    raise litellm.BudgetExceededError(
+                        current_cost=counter.max_budget,
+                        max_budget=counter.max_budget,
+                        message=(f"Budget reservation unavailable! {counter.entity_type}={counter.entity_id}"),
+                    )
                 continue
 
             if reserved_value is not None:
@@ -130,6 +137,17 @@ async def reserve_budget_for_request(
                     cached_spend = await _get_current_counter_value(counter=counter)
                 current_spend = cached_spend + reservation_cost
             if current_spend > counter.max_budget:
+                if is_strict_budget_enforcement:
+                    raise litellm.BudgetExceededError(
+                        current_cost=current_spend,
+                        max_budget=counter.max_budget,
+                        message=(
+                            "Budget has been exceeded! "
+                            f"{counter.entity_type}={counter.entity_id} "
+                            f"Current cost: {current_spend}, "
+                            f"Max budget: {counter.max_budget}"
+                        ),
+                    )
                 remaining_before_reservation = counter.max_budget - (current_spend - reservation_cost)
                 if remaining_before_reservation > 1e-12:
                     await _resize_applied_reservation(

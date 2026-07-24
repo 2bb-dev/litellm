@@ -3407,6 +3407,7 @@ async def generate_key_helper_fn(
     router_settings: Optional[dict] = None,
     access_group_ids: Optional[list] = None,
     budget_limits: Optional[list] = None,  # multiple concurrent budget windows
+    budget_enforcement: Optional[Literal["strict"]] = None,
 ):
     from litellm.proxy.proxy_server import premium_user, prisma_client
 
@@ -3531,6 +3532,7 @@ async def generate_key_helper_fn(
             "budget_id": budget_id,
             "blocked": blocked,
             "budget_limits": budget_limits_json,
+            "budget_enforcement": budget_enforcement,
             "created_by": created_by,
             "updated_by": updated_by,
             "allowed_routes": allowed_routes or [],

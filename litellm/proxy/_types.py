@@ -1060,6 +1060,7 @@ class AllowedVectorStoreIndexItem(LiteLLMPydanticObjectBase):
 class KeyRequestBase(GenerateRequestBase):
     key: Optional[str] = None
     budget_id: Optional[str] = None
+    budget_enforcement: Optional[Literal["strict"]] = None
     tags: Optional[List[str]] = None
     disable_global_guardrails: Optional[bool] = None
     enforced_params: Optional[List[str]] = None

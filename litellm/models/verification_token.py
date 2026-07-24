@@ -6,7 +6,7 @@ Canonical definition for ``litellm_verificationtoken``. Re-exported from
 """
 
 from datetime import datetime
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import ConfigDict
 
@@ -59,6 +59,7 @@ class LiteLLM_VerificationToken(LiteLLMPydanticObjectBase):
     key_rotation_at: Optional[datetime] = None
     router_settings: Optional[dict] = None
     budget_limits: Optional[List[dict]] = None
+    budget_enforcement: Optional[Literal["strict"]] = None
     model_config = ConfigDict(protected_namespaces=())
 
 

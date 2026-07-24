@@ -14,6 +14,8 @@ from litellm.proxy._types import (
     LiteLLM_TeamMembership,
     LiteLLM_TeamTable,
     LiteLLM_UserTable,
+    GenerateKeyRequest,
+    UpdateKeyRequest,
     UserAPIKeyAuth,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
@@ -70,6 +72,218 @@ def test_should_not_serialize_budget_reservation_on_user_api_key_auth():
     assert "budget_reservation" not in auth.model_dump()
     assert "budget_reservation" not in auth.model_dump(exclude_none=True)
     assert "budget_reservation" not in auth.model_dump_json()
+
+
+def test_should_round_trip_strict_budget_enforcement_key_policy():
+    generated_key = GenerateKeyRequest(budget_enforcement="strict")
+    updated_key = UpdateKeyRequest(key="sk-strict-budget", budget_enforcement="strict")
+    authenticated_key = UserAPIKeyAuth(
+        token="key-strict-budget-policy",
+        budget_enforcement="strict",
+    )
+
+    assert generated_key.model_dump(exclude_unset=True) == {"budget_enforcement": "strict"}
+    assert updated_key.model_dump(exclude_unset=True) == {
+        "key": "sk-strict-budget",
+        "budget_enforcement": "strict",
+    }
+    assert authenticated_key.budget_enforcement == "strict"
+
+    with pytest.raises(ValueError):
+        GenerateKeyRequest(budget_enforcement="best_effort")
+
+
+@pytest.mark.asyncio
+async def test_should_reject_strict_key_reservation_above_remaining_budget(
+    spend_counter_state,
+):
+    counter_cache, key_cache = spend_counter_state
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    valid_token = UserAPIKeyAuth(
+        token="key-strict-budget-remaining",
+        spend=0.0,
+        max_budget=1.0,
+        budget_enforcement="strict",
+    )
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.6,
+    ):
+        reservation = await reserve_budget_for_request(
+            request_body=_request_body(),
+            route="/chat/completions",
+            llm_router=None,
+            valid_token=valid_token,
+            team_object=None,
+            user_object=None,
+            prisma_client=None,
+            user_api_key_cache=key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await reserve_budget_for_request(
+                request_body=_request_body(),
+                route="/chat/completions",
+                llm_router=None,
+                valid_token=valid_token,
+                team_object=None,
+                user_object=None,
+                prisma_client=None,
+                user_api_key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+    assert reservation is not None
+    assert counter_cache.in_memory_cache.get_cache(
+        key="spend:key:key-strict-budget-remaining"
+    ) == pytest.approx(0.6)
+    await release_budget_reservation(reservation)
+
+
+@pytest.mark.asyncio
+async def test_should_reject_strict_key_request_when_reservation_storage_is_unavailable(
+    spend_counter_state,
+    monkeypatch,
+):
+    counter_cache, key_cache = spend_counter_state
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    valid_token = UserAPIKeyAuth(
+        token="key-strict-budget-storage",
+        spend=0.0,
+        max_budget=1.0,
+        budget_enforcement="strict",
+    )
+
+    async def fail_increment_cache(*args, **kwargs):
+        raise RuntimeError("counter unavailable")
+
+    monkeypatch.setattr(counter_cache, "async_increment_cache", fail_increment_cache)
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.5,
+    ):
+        with pytest.raises(litellm.BudgetExceededError):
+            await reserve_budget_for_request(
+                request_body=_request_body(),
+                route="/chat/completions",
+                llm_router=None,
+                valid_token=valid_token,
+                team_object=None,
+                user_object=None,
+                prisma_client=None,
+                user_api_key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+
+@pytest.mark.asyncio
+async def test_should_admit_at_most_one_concurrent_strict_key_reservation(
+    spend_counter_state,
+):
+    counter_cache, key_cache = spend_counter_state
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    valid_token = UserAPIKeyAuth(
+        token="key-strict-budget-concurrency",
+        spend=0.0,
+        max_budget=1.0,
+        budget_enforcement="strict",
+    )
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.6,
+    ):
+        results = await asyncio.gather(
+            *(
+                reserve_budget_for_request(
+                    request_body=_request_body(),
+                    route="/chat/completions",
+                    llm_router=None,
+                    valid_token=valid_token,
+                    team_object=None,
+                    user_object=None,
+                    prisma_client=None,
+                    user_api_key_cache=key_cache,
+                    proxy_logging_obj=proxy_logging_obj,
+                )
+                for _ in range(2)
+            ),
+            return_exceptions=True,
+        )
+
+    reservations = [result for result in results if isinstance(result, dict)]
+    assert len(reservations) == 1
+    assert sum(isinstance(result, litellm.BudgetExceededError) for result in results) == 1
+    assert counter_cache.in_memory_cache.get_cache(
+        key="spend:key:key-strict-budget-concurrency"
+    ) == pytest.approx(0.6)
+    await release_budget_reservation(reservations[0])
+
+
+@pytest.mark.asyncio
+async def test_should_admit_strict_key_reservation_after_utc_day_window_reset(
+    spend_counter_state,
+):
+    from litellm.proxy.common_utils.reset_budget_job import ResetBudgetJob
+
+    counter_cache, key_cache = spend_counter_state
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    window = {
+        "budget_duration": "1d",
+        "max_budget": 1.0,
+        "reset_at": (now - timedelta(seconds=1)).isoformat() + "Z",
+    }
+    valid_token = UserAPIKeyAuth(
+        token="key-strict-budget-utc-reset",
+        budget_enforcement="strict",
+        budget_limits=[window],
+    )
+    counter_key = "spend:key:key-strict-budget-utc-reset:window:1d"
+    counter_cache.in_memory_cache.set_cache(key=counter_key, value=0.6)
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.6,
+    ):
+        with pytest.raises(litellm.BudgetExceededError):
+            await reserve_budget_for_request(
+                request_body=_request_body(),
+                route="/chat/completions",
+                llm_router=None,
+                valid_token=valid_token,
+                team_object=None,
+                user_object=None,
+                prisma_client=None,
+                user_api_key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+        assert await ResetBudgetJob._reset_expired_window(
+            window=window,
+            counter_key=counter_key,
+            spend_counter_cache=counter_cache,
+            now=now,
+        )
+
+        reservation = await reserve_budget_for_request(
+            request_body=_request_body(),
+            route="/chat/completions",
+            llm_router=None,
+            valid_token=valid_token,
+            team_object=None,
+            user_object=None,
+            prisma_client=None,
+            user_api_key_cache=key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+    assert reservation is not None
+    assert counter_cache.in_memory_cache.get_cache(key=counter_key) == pytest.approx(0.6)
+    await release_budget_reservation(reservation)
 
 
 @pytest.mark.asyncio
