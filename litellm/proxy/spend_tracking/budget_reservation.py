@@ -108,7 +108,6 @@ async def reserve_budget_for_request(
                 counter=counter,
                 reserved_cost=reservation_cost,
             )
-            applied_entries.append(entry)
             try:
                 reserved_value = await _reserve_counter(
                     counter=counter,
@@ -116,13 +115,12 @@ async def reserve_budget_for_request(
                     invalidate_on_failure=not is_strict_budget_enforcement,
                 )
             except _CounterReservationUnavailable as exc:
-                if exc.touched_counter and not exc.counter_invalidated:
+                if not is_strict_budget_enforcement and exc.touched_counter and not exc.counter_invalidated:
                     await _release_applied_entries_best_effort(
                         entries=[entry],
                         default_reserved_cost=reservation_cost,
                         invalidate_on_failure=not is_strict_budget_enforcement,
                     )
-                applied_entries.remove(entry)
                 if is_strict_budget_enforcement:
                     raise litellm.BudgetExceededError(
                         current_cost=counter.max_budget,
@@ -131,6 +129,7 @@ async def reserve_budget_for_request(
                     )
                 continue
 
+            applied_entries.append(entry)
             if reserved_value is not None:
                 current_spend = reserved_value
             else:

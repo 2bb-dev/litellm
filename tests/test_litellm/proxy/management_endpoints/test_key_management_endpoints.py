@@ -579,6 +579,7 @@ async def test_budget_enforcement_create_update_and_auth_readback(monkeypatch):
     from litellm.repositories.verification_token_repository import (
         VerificationTokenRepository,
     )
+    from litellm.proxy.utils import PrismaClient
 
     stored_key = None
     mock_prisma_client = AsyncMock()
@@ -599,6 +600,26 @@ async def test_budget_enforcement_create_update_and_auth_readback(monkeypatch):
         return MagicMock()
 
     mock_prisma_client.insert_data = AsyncMock(side_effect=insert_data)
+    mock_prisma_client.db = MagicMock()
+
+    async def update_stored_key(*args, **kwargs):
+        nonlocal stored_key
+        persisted_data = stored_key.model_dump()
+        persisted_data.update(kwargs["data"])
+        stored_key = verification_token_repository._to_model(persisted_data)
+        return stored_key
+
+    mock_prisma_client.db.litellm_verificationtoken.update = AsyncMock(
+        side_effect=update_stored_key
+    )
+    mock_prisma_client.jsonify_object = PrismaClient.jsonify_object.__get__(
+        mock_prisma_client,
+        PrismaClient,
+    )
+    mock_prisma_client.update_data = PrismaClient.update_data.__get__(
+        mock_prisma_client,
+        PrismaClient,
+    )
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
 
     await generate_key_helper_fn(
@@ -627,7 +648,16 @@ async def test_budget_enforcement_create_update_and_auth_readback(monkeypatch):
         existing_key_row=stored_key,
     )
     assert update_data["budget_enforcement"] is None
-    stored_key = stored_key.model_copy(update=update_data)
+    await mock_prisma_client.update_data(
+        token=stored_key.token,
+        data={**update_data, "token": stored_key.token},
+    )
+
+    update_call = (
+        mock_prisma_client.db.litellm_verificationtoken.update.await_args.kwargs
+    )
+    assert update_call["where"]["token"] == stored_key.token
+    assert update_call["data"]["budget_enforcement"] is None
 
     with patch(
         "litellm.proxy.auth.auth_checks._fetch_key_object_from_db_with_reconnect",
