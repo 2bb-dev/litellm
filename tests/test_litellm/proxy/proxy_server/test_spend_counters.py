@@ -486,6 +486,36 @@ async def test_reconcile_budget_reservation_for_counter_update_failure_invalidat
     assert fake_invalidate.called is True
 
 
+@pytest.mark.asyncio
+async def test_reconcile_strict_budget_failure_preserves_reserved_counters(
+    monkeypatch,
+):
+    """Strict reservations must remain fail-closed when reconciliation fails."""
+    import litellm.proxy.spend_tracking.budget_reservation as br
+
+    reserved_keys = {"spend:key:strict"}
+    monkeypatch.setattr(
+        br,
+        "get_reserved_counter_keys",
+        MagicMock(return_value=reserved_keys),
+    )
+    monkeypatch.setattr(
+        br,
+        "reconcile_budget_reservation",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    fake_invalidate = AsyncMock()
+    monkeypatch.setattr(br, "invalidate_budget_reservation_counters", fake_invalidate)
+
+    result = await ps._reconcile_budget_reservation_for_counter_update(
+        budget_reservation={"budget_enforcement": "strict"},
+        response_cost=1.0,
+    )
+
+    assert result == reserved_keys
+    fake_invalidate.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # _increment_end_user_and_tag_spend_counters
 # ---------------------------------------------------------------------------

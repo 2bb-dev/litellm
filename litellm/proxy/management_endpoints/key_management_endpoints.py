@@ -4193,6 +4193,18 @@ async def _execute_virtual_key_regeneration(
         existing_key_row=key_in_db,
         user_api_key_dict=user_api_key_dict,
     )
+    if (
+        data is not None
+        and "budget_enforcement" in data.model_fields_set
+        and user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN.value
+    ):
+        await _check_key_admin_access(
+            user_api_key_dict=user_api_key_dict,
+            hashed_token=hashed_api_key,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            route="/key/regenerate (budget_enforcement)",
+        )
 
     # Apply the same membership rule used on /key/update: when the caller
     # asks to point the regenerated key at a different organization_id,

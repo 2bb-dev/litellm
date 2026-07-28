@@ -2377,6 +2377,12 @@ async def _reconcile_budget_reservation_for_counter_update(
             finalize=False,
         )
     except Exception:
+        if budget_reservation.get("budget_enforcement") == "strict":
+            verbose_proxy_logger.warning(
+                "Failed to reconcile strict budget reservation after persisted spend; preserving reserved counters",
+                exc_info=True,
+            )
+            return reserved_counter_keys
         verbose_proxy_logger.warning(
             "Failed to reconcile budget reservation after persisted spend; invalidating reserved counters and falling back to direct increment",
             exc_info=True,

@@ -11740,6 +11740,43 @@ async def test_regenerate_user_id_rebind_guard(
 
 
 @pytest.mark.asyncio
+async def test_regenerate_owner_cannot_clear_strict_budget_enforcement():
+    from litellm.proxy._types import RegenerateKeyRequest
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _execute_virtual_key_regeneration,
+    )
+
+    existing_key = _make_regenerate_existing_key()
+    existing_key.budget_enforcement = "strict"
+    data = RegenerateKeyRequest(budget_enforcement=None)
+    mock_prisma_client = _make_regenerate_mock_prisma()
+    admin_check = AsyncMock(
+        side_effect=HTTPException(status_code=403, detail="Not authorized")
+    )
+
+    with patch(
+        "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+        admin_check,
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await _execute_virtual_key_regeneration(
+                prisma_client=mock_prisma_client,
+                key_in_db=existing_key,
+                hashed_api_key="abc123",
+                key="abc123",
+                data=data,
+                user_api_key_dict=_non_admin_user_api_key_dict(),
+                litellm_changed_by=None,
+                user_api_key_cache=MagicMock(),
+                proxy_logging_obj=MagicMock(),
+            )
+
+    assert exc.value.status_code == 403
+    admin_check.assert_awaited_once()
+    assert mock_prisma_client.db.litellm_verificationtoken.update.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_regenerate_premium_gate_requires_actual_master_key():
     # ``regenerate_key_fn``'s decorator wraps the underlying ValueError
     # into a ProxyException with empty ``message``. The exception type
