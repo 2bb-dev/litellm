@@ -185,6 +185,7 @@ async def reserve_budget_for_request(
         "entries": applied_entries,
         "finalized": False,
         "input_cost": min(float(input_cost or 0.0), reservation_cost),
+        **({"budget_enforcement": "strict"} if is_strict_budget_enforcement else {}),
     }
 
 
@@ -202,6 +203,7 @@ async def reconcile_budget_reservation(
         entries=budget_reservation.get("entries") or [],
         actual_cost=actual,
         default_reserved_cost=reserved_cost,
+        invalidate_on_failure=budget_reservation.get("budget_enforcement") != "strict",
     )
     if finalize:
         budget_reservation["finalized"] = True
@@ -682,6 +684,7 @@ async def _set_reserved_entries_actual_cost(
     actual_cost: float,
     default_reserved_cost: float,
     reseed_on_inconsistent: bool = True,
+    invalidate_on_failure: bool = True,
 ) -> None:
     for entry in entries:
         await _set_reserved_entry_actual_cost(
@@ -689,6 +692,7 @@ async def _set_reserved_entries_actual_cost(
             actual_cost=actual_cost,
             default_reserved_cost=default_reserved_cost,
             reseed_on_inconsistent=reseed_on_inconsistent,
+            invalidate_on_failure=invalidate_on_failure,
         )
 
 

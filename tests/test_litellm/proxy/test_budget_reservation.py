@@ -23,6 +23,7 @@ from litellm.proxy.spend_tracking.budget_reservation import (
     estimate_request_max_cost,
     get_budget_window_start,
     invalidate_budget_reservation_counters,
+    reconcile_budget_reservation,
     release_budget_reservation,
     release_budget_reservation_on_cancel,
     reserve_budget_for_request,
@@ -614,6 +615,54 @@ async def test_strict_redis_overspend_rollback_failure_preserves_shared_counter(
     assert existing_reservation is not None
     assert redis_counter.delete_calls == 0
     expected_counter = 1.2 if failure_mode == "before" else 0.6
+    assert redis_counter.values[counter_key] == pytest.approx(expected_counter)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
+async def test_strict_redis_reconcile_failure_preserves_shared_counter(
+    spend_counter_state,
+    failure_mode,
+):
+    counter_cache, key_cache = spend_counter_state
+    redis_counter = _AmbiguousIncrementRedis()
+    counter_cache.redis_cache = redis_counter
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    valid_token = UserAPIKeyAuth(
+        token=f"key-strict-redis-reconcile-{failure_mode}",
+        spend=0.0,
+        max_budget=1.0,
+        budget_enforcement="strict",
+    )
+    counter_key = f"spend:key:key-strict-redis-reconcile-{failure_mode}"
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.6,
+    ):
+        reservation = await _reserve_strict_test_request(
+            valid_token=valid_token,
+            key_cache=key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        assert reservation["budget_enforcement"] == "strict"
+        redis_counter.decrement_failure_mode = failure_mode
+
+        with pytest.raises(RuntimeError):
+            await reconcile_budget_reservation(
+                budget_reservation=reservation,
+                actual_cost=0.5,
+            )
+
+        with pytest.raises(litellm.BudgetExceededError):
+            await _reserve_strict_test_request(
+                valid_token=valid_token,
+                key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+    assert redis_counter.delete_calls == 0
+    expected_counter = 0.6 if failure_mode == "before" else 0.5
     assert redis_counter.values[counter_key] == pytest.approx(expected_counter)
 
 
