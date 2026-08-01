@@ -21,6 +21,9 @@ from litellm.constants import (
     MODEL_COST_MAP_MIN_MODEL_COUNT,
 )
 
+# Providers implemented in this fork: upstream's map cannot describe their models.
+FORK_OWNED_MODEL_PREFIXES = ("chatgpt/",)
+
 
 class GetModelCostMap:
     """
@@ -32,6 +35,7 @@ class GetModelCostMap:
     """
 
     _backup_model_count: int = -1  # -1 = not yet loaded
+    _fork_owned_entries: Optional[dict] = None
 
     @staticmethod
     def load_local_model_cost_map() -> dict:
@@ -40,6 +44,23 @@ class GetModelCostMap:
             files("litellm").joinpath("model_prices_and_context_window_backup.json").read_text(encoding="utf-8")
         )
         return content
+
+    @classmethod
+    def get_fork_owned_entries(cls) -> dict:
+        """Bundled entries for providers this fork implements itself.
+
+        The remote map is upstream's, so it cannot describe (or keeps a staler
+        copy of) models served by fork-only providers. Only these entries are
+        retained; the rest of the parsed backup is discarded.
+        """
+        if cls._fork_owned_entries is None:
+            backup = cls.load_local_model_cost_map()
+            cls._fork_owned_entries = {
+                model: info
+                for model, info in backup.items()
+                if model.startswith(FORK_OWNED_MODEL_PREFIXES)
+            }
+        return cls._fork_owned_entries
 
     @classmethod
     def _get_backup_model_count(cls) -> int:
@@ -285,4 +306,5 @@ def get_model_cost_map(url: str) -> dict:
 
     _cost_map_source_info.source = "remote"
     _cost_map_source_info.fallback_reason = None
+    content.update(GetModelCostMap.get_fork_owned_entries())
     return _expand_model_aliases(content)

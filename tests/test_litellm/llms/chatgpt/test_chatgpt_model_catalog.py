@@ -1,13 +1,4 @@
-"""
-The ChatGPT subscription catalog must describe reasoning support.
-
-Every `chatgpt/*` deployment is a GPT-5 reasoning model served over the Codex
-Responses backend, but no catalog entry declared `supports_reasoning`, and the
-GPT-5.4 Mini / GPT-5.5 / GPT-5.6 subscription models had no entry at all.
-Clients read these capabilities from `/v1/model/info` (which merges the catalog
-under a deployment's own `model_info`), so a missing flag silently downgrades a
-reasoning model to a plain chat model and hides thinking controls.
-"""
+"""Catalog coverage for the ChatGPT subscription models."""
 
 import json
 import os

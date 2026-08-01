@@ -292,3 +292,33 @@ def test_model_group_info_invalid_method(client, auth_as, null_router):
         response = client.post("/model_group/info", json={})
     assert response.status_code == 405
     assert len(response.content) > 0
+
+
+# ---------------------------------------------------------------------------
+# Catalog enrichment of a deployment's model_info
+# ---------------------------------------------------------------------------
+
+
+def test_model_info_enriches_chatgpt_subscription_deployment():
+    """A ``chatgpt/*`` deployment is described by its own catalog entry.
+
+    Without one, enrichment falls back to the same-named public OpenAI model and
+    reports that model's context window instead of the subscription window.
+    """
+    from litellm.proxy.proxy_server import _get_proxy_model_info
+
+    deployment = {
+        "model_name": "openai/gpt-5.6-luna",
+        "litellm_params": {
+            "model": "litellm_proxy/chatgpt/gpt-5.6-luna",
+            "api_base": "http://127.0.0.1:4101",
+        },
+        "model_info": {"id": "luna-slot1", "mode": "responses"},
+    }
+
+    model_info = _get_proxy_model_info(model=deployment)["model_info"]
+
+    assert model_info["key"] == "chatgpt/gpt-5.6-luna"
+    assert model_info["max_input_tokens"] == 372000
+    assert model_info["supports_reasoning"] is True
+    assert model_info["supports_vision"] is True
