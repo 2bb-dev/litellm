@@ -11,7 +11,7 @@ export LITELLM_LOCAL_MODEL_COST_MAP=True
 import json
 import os
 from importlib.resources import files
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Mapping, Optional
 
 import httpx
 
@@ -255,7 +255,23 @@ def _expand_model_aliases(model_cost: dict) -> dict:
     return model_cost
 
 
-def get_model_cost_map(url: str) -> dict:
+def merge_fork_owned_entries(fetched: Mapping[str, dict], fork_entries: Mapping[str, dict]) -> dict:
+    """Fill gaps for models served by providers this fork implements.
+
+    A fetched value always wins, per model and per field, so a custom catalog
+    supplied through ``LITELLM_MODEL_COST_MAP_URL`` keeps its pricing and
+    limits. Only what the fetched map leaves undefined is filled in.
+    """
+    return {
+        **fetched,
+        **{
+            model: {**info, **fetched.get(model, {})}
+            for model, info in fork_entries.items()
+        },
+    }
+
+
+def get_model_cost_map(url: str, fetch_remote: Optional[Callable[[str], dict]] = None) -> dict:
     """
     Public entry point — returns the model cost map dict.
 
@@ -279,8 +295,9 @@ def get_model_cost_map(url: str) -> dict:
     _cost_map_source_info.url = url
     _cost_map_source_info.is_env_forced = False
 
+    fetch = fetch_remote or GetModelCostMap.fetch_remote_model_cost_map
     try:
-        content = GetModelCostMap.fetch_remote_model_cost_map(url)
+        content = fetch(url)
     except Exception as e:
         verbose_logger.warning(
             "LiteLLM: Failed to fetch remote model cost map from %s: %s. Falling back to local backup.",
@@ -306,5 +323,6 @@ def get_model_cost_map(url: str) -> dict:
 
     _cost_map_source_info.source = "remote"
     _cost_map_source_info.fallback_reason = None
-    content.update(GetModelCostMap.get_fork_owned_entries())
-    return _expand_model_aliases(content)
+    return _expand_model_aliases(
+        merge_fork_owned_entries(content, GetModelCostMap.get_fork_owned_entries())
+    )
