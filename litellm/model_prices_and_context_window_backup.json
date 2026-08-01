@@ -19293,6 +19293,91 @@
         "max_tokens": 8191,
         "mode": "embedding"
     },
+    "chatgpt/gpt-5.4-mini": {
+        "litellm_provider": "chatgpt",
+        "max_input_tokens": 1050000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "responses",
+        "supported_endpoints": [
+            "/v1/chat/completions",
+            "/v1/responses"
+        ],
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_vision": true
+    },
+    "chatgpt/gpt-5.5": {
+        "litellm_provider": "chatgpt",
+        "max_input_tokens": 1050000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "responses",
+        "supported_endpoints": [
+            "/v1/chat/completions",
+            "/v1/responses"
+        ],
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_vision": true
+    },
+    "chatgpt/gpt-5.6-sol": {
+        "litellm_provider": "chatgpt",
+        "max_input_tokens": 372000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "responses",
+        "supported_endpoints": [
+            "/v1/chat/completions",
+            "/v1/responses"
+        ],
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_vision": true
+    },
+    "chatgpt/gpt-5.6-terra": {
+        "litellm_provider": "chatgpt",
+        "max_input_tokens": 372000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "responses",
+        "supported_endpoints": [
+            "/v1/chat/completions",
+            "/v1/responses"
+        ],
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_vision": true
+    },
+    "chatgpt/gpt-5.6-luna": {
+        "litellm_provider": "chatgpt",
+        "max_input_tokens": 372000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "responses",
+        "supported_endpoints": [
+            "/v1/chat/completions",
+            "/v1/responses"
+        ],
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_vision": true
+    },
     "chatgpt/gpt-5.4": {
         "litellm_provider": "chatgpt",
         "max_input_tokens": 1050000,
@@ -19305,6 +19390,7 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_vision": true
     },
@@ -19319,6 +19405,7 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_vision": true
     },
@@ -19333,6 +19420,7 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_vision": true
     },
@@ -19347,6 +19435,7 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_vision": true
     },
@@ -19362,6 +19451,7 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_vision": true
     },
@@ -19377,6 +19467,7 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_vision": true
     },
@@ -19391,6 +19482,7 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_vision": true
     },
@@ -19406,6 +19498,7 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_vision": true
     },
@@ -19420,6 +19513,7 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_vision": true
     },
@@ -19434,6 +19528,7 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_vision": true
     },
