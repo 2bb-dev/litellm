@@ -433,6 +433,8 @@ async def acompletion(
     verbosity: Optional[Literal["low", "medium", "high"]] = None,
     safety_identifier: Optional[str] = None,
     service_tier: Optional[str] = None,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_retention: Optional[str] = None,
     # set api_base, api_version, api_key
     base_url: Optional[str] = None,
     api_version: Optional[str] = None,
@@ -582,6 +584,8 @@ async def acompletion(
         "reasoning_effort": reasoning_effort,
         "safety_identifier": safety_identifier,
         "service_tier": service_tier,
+        "prompt_cache_key": prompt_cache_key,
+        "prompt_cache_retention": prompt_cache_retention,
         "extra_headers": extra_headers,
         "acompletion": True,  # assuming this is a required parameter
         "thinking": thinking,
@@ -4738,6 +4742,8 @@ def completion(  # type: ignore
     extra_headers: Optional[dict] = None,
     safety_identifier: Optional[str] = None,
     service_tier: Optional[str] = None,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_retention: Optional[str] = None,
     # soon to be deprecated params by OpenAI
     functions: Optional[List] = None,
     function_call: Optional[str] = None,
@@ -4866,6 +4872,8 @@ def completion(  # type: ignore
                 verbosity=verbosity,
                 safety_identifier=safety_identifier,
                 service_tier=service_tier,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
                 base_url=base_url,
                 api_version=api_version,
                 api_key=api_key,
@@ -5161,6 +5169,8 @@ def completion(  # type: ignore
             ),
             "safety_identifier": safety_identifier,
             "service_tier": service_tier,
+            "prompt_cache_key": prompt_cache_key,
+            "prompt_cache_retention": prompt_cache_retention,
             "allowed_openai_params": kwargs.get("allowed_openai_params"),
             "base_model": base_model,
         }
