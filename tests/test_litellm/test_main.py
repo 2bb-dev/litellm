@@ -1962,3 +1962,118 @@ class TestCallTypesOCR:
 
         call_type = CallTypes("aocr")
         assert call_type == CallTypes.aocr
+
+
+def _mock_openai_client_for_chat():
+    mock_response = MagicMock()
+    mock_response.model_dump.return_value = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1234567890,
+        "model": "gpt-5.4",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+    mock_raw_response = MagicMock()
+    mock_raw_response.headers = {}
+    mock_raw_response.parse.return_value = mock_response
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.with_raw_response.create.return_value = mock_raw_response
+    return mock_client
+
+
+class TestPromptCacheParams:
+    """`prompt_cache_key` / `prompt_cache_retention` reach the provider request.
+
+    Both params are known OpenAI params, so `get_non_default_completion_params()`
+    excludes them from passthrough params, and `optional_param_args` is built
+    from `completion()`'s named parameters. Without a named parameter a caller
+    value stays in `**kwargs` and is dropped with no error, which silently
+    disables upstream prompt-cache routing.
+    """
+
+    @pytest.mark.parametrize("param", ["prompt_cache_key", "prompt_cache_retention"])
+    def test_param_is_a_known_openai_param(self, param):
+        from litellm.constants import (
+            DEFAULT_CHAT_COMPLETION_PARAM_VALUES,
+            OPENAI_CHAT_COMPLETION_PARAMS,
+        )
+        from litellm.utils import get_non_default_completion_params
+
+        assert param in OPENAI_CHAT_COMPLETION_PARAMS
+        assert param in DEFAULT_CHAT_COMPLETION_PARAM_VALUES
+        assert param not in get_non_default_completion_params({param: "conversation-1"})
+
+    @pytest.mark.parametrize("func", [litellm.completion, litellm.acompletion])
+    def test_params_are_appended_to_the_signature(self, func):
+        """New params must not shift existing positional bindings."""
+        import inspect
+
+        positional = [
+            name
+            for name, parameter in inspect.signature(func).parameters.items()
+            if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ]
+        assert positional[-2:] == ["prompt_cache_key", "prompt_cache_retention"]
+
+    def test_completion_forwards_params_to_provider_request(self):
+        mock_client = _mock_openai_client_for_chat()
+
+        litellm.completion(
+            model="openai/gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            prompt_cache_key="conversation-123",
+            prompt_cache_retention="24h",
+            api_key="sk-test",
+            client=mock_client,
+        )
+
+        create_kwargs = mock_client.chat.completions.with_raw_response.create.call_args.kwargs
+        assert create_kwargs.get("prompt_cache_key") == "conversation-123"
+        assert create_kwargs.get("prompt_cache_retention") == "24h"
+
+    def test_completion_omits_params_when_not_requested(self):
+        mock_client = _mock_openai_client_for_chat()
+
+        litellm.completion(
+            model="openai/gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            api_key="sk-test",
+            client=mock_client,
+        )
+
+        create_kwargs = mock_client.chat.completions.with_raw_response.create.call_args.kwargs
+        assert "prompt_cache_key" not in create_kwargs
+        assert "prompt_cache_retention" not in create_kwargs
+
+    def test_responses_bridge_carries_prompt_cache_key(self):
+        """ChatGPT subscription routes reach the provider through the
+        /chat/completions to /responses bridge."""
+        from litellm.completion_extras.litellm_responses_transformation.transformation import (
+            LiteLLMResponsesTransformationHandler,
+        )
+
+        optional_params = litellm.utils.get_optional_params(
+            model="chatgpt/gpt-5.4",
+            custom_llm_provider="litellm_proxy",
+            prompt_cache_key="conversation-123",
+            drop_params=True,
+        )
+        assert optional_params.get("prompt_cache_key") == "conversation-123"
+
+        request = LiteLLMResponsesTransformationHandler().transform_request(
+            model="chatgpt/gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            optional_params=optional_params,
+            litellm_params={},
+            headers={},
+            litellm_logging_obj=MagicMock(),
+        )
+        assert request.get("prompt_cache_key") == "conversation-123"

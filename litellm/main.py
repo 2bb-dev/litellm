@@ -433,8 +433,6 @@ async def acompletion(
     verbosity: Optional[Literal["low", "medium", "high"]] = None,
     safety_identifier: Optional[str] = None,
     service_tier: Optional[str] = None,
-    prompt_cache_key: Optional[str] = None,
-    prompt_cache_retention: Optional[str] = None,
     # set api_base, api_version, api_key
     base_url: Optional[str] = None,
     api_version: Optional[str] = None,
@@ -449,6 +447,8 @@ async def acompletion(
     shared_session: Optional["ClientSession"] = None,
     # Per-request JSON schema validation (overrides litellm.enable_json_schema_validation)
     enable_json_schema_validation: Optional[bool] = None,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_retention: Optional[str] = None,
     **kwargs,
 ) -> Union[ModelResponse, CustomStreamWrapper]:
     """
@@ -4742,8 +4742,6 @@ def completion(  # type: ignore
     extra_headers: Optional[dict] = None,
     safety_identifier: Optional[str] = None,
     service_tier: Optional[str] = None,
-    prompt_cache_key: Optional[str] = None,
-    prompt_cache_retention: Optional[str] = None,
     # soon to be deprecated params by OpenAI
     functions: Optional[List] = None,
     function_call: Optional[str] = None,
@@ -4758,6 +4756,8 @@ def completion(  # type: ignore
     shared_session: Optional["ClientSession"] = None,
     # Per-request JSON schema validation (overrides litellm.enable_json_schema_validation)
     enable_json_schema_validation: Optional[bool] = None,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_retention: Optional[str] = None,
     **kwargs,
 ) -> Union[ModelResponse, CustomStreamWrapper]:
     """
