@@ -447,6 +447,8 @@ async def acompletion(
     shared_session: Optional["ClientSession"] = None,
     # Per-request JSON schema validation (overrides litellm.enable_json_schema_validation)
     enable_json_schema_validation: Optional[bool] = None,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_retention: Optional[str] = None,
     **kwargs,
 ) -> Union[ModelResponse, CustomStreamWrapper]:
     """
@@ -582,6 +584,8 @@ async def acompletion(
         "reasoning_effort": reasoning_effort,
         "safety_identifier": safety_identifier,
         "service_tier": service_tier,
+        "prompt_cache_key": prompt_cache_key,
+        "prompt_cache_retention": prompt_cache_retention,
         "extra_headers": extra_headers,
         "acompletion": True,  # assuming this is a required parameter
         "thinking": thinking,
@@ -4752,6 +4756,8 @@ def completion(  # type: ignore
     shared_session: Optional["ClientSession"] = None,
     # Per-request JSON schema validation (overrides litellm.enable_json_schema_validation)
     enable_json_schema_validation: Optional[bool] = None,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_retention: Optional[str] = None,
     **kwargs,
 ) -> Union[ModelResponse, CustomStreamWrapper]:
     """
@@ -4866,6 +4872,8 @@ def completion(  # type: ignore
                 verbosity=verbosity,
                 safety_identifier=safety_identifier,
                 service_tier=service_tier,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
                 base_url=base_url,
                 api_version=api_version,
                 api_key=api_key,
@@ -5161,6 +5169,8 @@ def completion(  # type: ignore
             ),
             "safety_identifier": safety_identifier,
             "service_tier": service_tier,
+            "prompt_cache_key": prompt_cache_key,
+            "prompt_cache_retention": prompt_cache_retention,
             "allowed_openai_params": kwargs.get("allowed_openai_params"),
             "base_model": base_model,
         }
