@@ -11,7 +11,7 @@ export LITELLM_LOCAL_MODEL_COST_MAP=True
 import json
 import os
 from importlib.resources import files
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Mapping, Optional
 
 import httpx
 
@@ -20,6 +20,9 @@ from litellm.constants import (
     MODEL_COST_MAP_MAX_SHRINK_RATIO,
     MODEL_COST_MAP_MIN_MODEL_COUNT,
 )
+
+# Providers implemented in this fork: upstream's map cannot describe their models.
+FORK_OWNED_MODEL_PREFIXES = ("chatgpt/",)
 
 
 class GetModelCostMap:
@@ -32,6 +35,7 @@ class GetModelCostMap:
     """
 
     _backup_model_count: int = -1  # -1 = not yet loaded
+    _fork_owned_entries: Optional[dict] = None
 
     @staticmethod
     def load_local_model_cost_map() -> dict:
@@ -40,6 +44,23 @@ class GetModelCostMap:
             files("litellm").joinpath("model_prices_and_context_window_backup.json").read_text(encoding="utf-8")
         )
         return content
+
+    @classmethod
+    def get_fork_owned_entries(cls) -> dict:
+        """Bundled entries for providers this fork implements itself.
+
+        The remote map is upstream's, so it cannot describe (or keeps a staler
+        copy of) models served by fork-only providers. Only these entries are
+        retained; the rest of the parsed backup is discarded.
+        """
+        if cls._fork_owned_entries is None:
+            backup = cls.load_local_model_cost_map()
+            cls._fork_owned_entries = {
+                model: info
+                for model, info in backup.items()
+                if model.startswith(FORK_OWNED_MODEL_PREFIXES)
+            }
+        return cls._fork_owned_entries
 
     @classmethod
     def _get_backup_model_count(cls) -> int:
@@ -234,7 +255,23 @@ def _expand_model_aliases(model_cost: dict) -> dict:
     return model_cost
 
 
-def get_model_cost_map(url: str) -> dict:
+def merge_fork_owned_entries(fetched: Mapping[str, dict], fork_entries: Mapping[str, dict]) -> dict:
+    """Fill gaps for models served by providers this fork implements.
+
+    A fetched value always wins, per model and per field, so a custom catalog
+    supplied through ``LITELLM_MODEL_COST_MAP_URL`` keeps its pricing and
+    limits. Only what the fetched map leaves undefined is filled in.
+    """
+    return {
+        **fetched,
+        **{
+            model: {**info, **fetched.get(model, {})}
+            for model, info in fork_entries.items()
+        },
+    }
+
+
+def get_model_cost_map(url: str, fetch_remote: Optional[Callable[[str], dict]] = None) -> dict:
     """
     Public entry point — returns the model cost map dict.
 
@@ -258,8 +295,9 @@ def get_model_cost_map(url: str) -> dict:
     _cost_map_source_info.url = url
     _cost_map_source_info.is_env_forced = False
 
+    fetch = fetch_remote or GetModelCostMap.fetch_remote_model_cost_map
     try:
-        content = GetModelCostMap.fetch_remote_model_cost_map(url)
+        content = fetch(url)
     except Exception as e:
         verbose_logger.warning(
             "LiteLLM: Failed to fetch remote model cost map from %s: %s. Falling back to local backup.",
@@ -285,4 +323,6 @@ def get_model_cost_map(url: str) -> dict:
 
     _cost_map_source_info.source = "remote"
     _cost_map_source_info.fallback_reason = None
-    return _expand_model_aliases(content)
+    return _expand_model_aliases(
+        merge_fork_owned_entries(content, GetModelCostMap.get_fork_owned_entries())
+    )
