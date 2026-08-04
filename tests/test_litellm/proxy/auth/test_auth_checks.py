@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import sys
@@ -1500,6 +1501,218 @@ async def test_check_team_member_model_access_no_override_inherits_team():
 
 
 # Tag Budget Enforcement Tests
+
+
+@pytest.mark.asyncio
+async def test_tag_max_budget_check_returns_typed_outcomes_from_one_batch_lookup():
+    from litellm.proxy.auth.auth_checks import (
+        TagBudgetCheckOutcome,
+        tag_max_budget_check,
+    )
+
+    mock_prisma = MagicMock()
+    mock_cache = MagicMock()
+    mock_cache.async_get_cache = AsyncMock(return_value=None)
+    mock_cache.async_set_cache = AsyncMock()
+    mock_prisma.db.litellm_tagtable.find_many = AsyncMock(
+        return_value=[
+            LiteLLM_TagTable(
+                tag_name="empty-budget",
+                litellm_budget_table=LiteLLM_BudgetTable(max_budget=None),
+            ),
+            LiteLLM_TagTable(
+                tag_name="no-budget-table",
+                litellm_budget_table=None,
+            ),
+            LiteLLM_TagTable(
+                tag_name="under-budget",
+                spend=0.25,
+                litellm_budget_table=LiteLLM_BudgetTable(max_budget=1.0),
+            ),
+        ]
+    )
+
+    with patch(
+        "litellm.proxy.proxy_server.get_current_spend",
+        new_callable=AsyncMock,
+        return_value=0.25,
+    ):
+        outcomes = await tag_max_budget_check(
+            request_body={
+                "metadata": {
+                    "tags": [
+                        "missing-tag",
+                        "empty-budget",
+                        "no-budget-table",
+                        "under-budget",
+                    ]
+                }
+            },
+            prisma_client=mock_prisma,
+            user_api_key_cache=mock_cache,
+            proxy_logging_obj=MagicMock(),
+            valid_token=None,
+        )
+
+    assert outcomes == {
+        "missing-tag": TagBudgetCheckOutcome.NO_POLICY,
+        "empty-budget": TagBudgetCheckOutcome.NO_POLICY,
+        "no-budget-table": TagBudgetCheckOutcome.NO_POLICY,
+        "under-budget": TagBudgetCheckOutcome.WITHIN_BUDGET,
+    }
+    mock_prisma.db.litellm_tagtable.find_many.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tag_max_budget_check_raises_when_prisma_is_unavailable():
+    from litellm.proxy.auth.auth_checks import (
+        TagBudgetLookupUnavailableError,
+        tag_max_budget_check,
+    )
+
+    with pytest.raises(TagBudgetLookupUnavailableError):
+        await tag_max_budget_check(
+            request_body={"metadata": {"tags": ["paid-tag"]}},
+            prisma_client=None,
+            user_api_key_cache=MagicMock(),
+            proxy_logging_obj=MagicMock(),
+            valid_token=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_tag_max_budget_check_raises_when_cache_lookup_fails():
+    from litellm.proxy.auth.auth_checks import (
+        TagBudgetLookupUnavailableError,
+        tag_max_budget_check,
+    )
+
+    mock_cache = MagicMock()
+    cache_error = RuntimeError("cache unavailable")
+    mock_cache.async_get_cache = AsyncMock(side_effect=cache_error)
+
+    with pytest.raises(TagBudgetLookupUnavailableError) as exc_info:
+        await tag_max_budget_check(
+            request_body={"metadata": {"tags": ["paid-tag"]}},
+            prisma_client=MagicMock(),
+            user_api_key_cache=mock_cache,
+            proxy_logging_obj=MagicMock(),
+            valid_token=None,
+        )
+
+    assert exc_info.value.__cause__ is cache_error
+
+
+@pytest.mark.asyncio
+async def test_tag_max_budget_check_raises_when_database_lookup_fails():
+    from litellm.proxy.auth.auth_checks import (
+        TagBudgetLookupUnavailableError,
+        tag_max_budget_check,
+    )
+
+    mock_prisma = MagicMock()
+    mock_cache = MagicMock()
+    database_error = RuntimeError("database unavailable")
+    mock_cache.async_get_cache = AsyncMock(return_value=None)
+    mock_prisma.db.litellm_tagtable.find_many = AsyncMock(side_effect=database_error)
+
+    with pytest.raises(TagBudgetLookupUnavailableError) as exc_info:
+        await tag_max_budget_check(
+            request_body={"metadata": {"tags": ["paid-tag"]}},
+            prisma_client=mock_prisma,
+            user_api_key_cache=mock_cache,
+            proxy_logging_obj=MagicMock(),
+            valid_token=None,
+        )
+
+    assert exc_info.value.__cause__ is database_error
+
+
+@pytest.mark.asyncio
+async def test_tag_max_budget_check_keeps_budget_exceeded_error_contract():
+    from litellm.proxy.auth.auth_checks import tag_max_budget_check
+
+    mock_cache = MagicMock()
+    mock_cache.async_get_cache = AsyncMock(
+        return_value=LiteLLM_TagTable(
+            tag_name="paid-tag",
+            spend=1.5,
+            litellm_budget_table=LiteLLM_BudgetTable(max_budget=1.0),
+        )
+    )
+
+    with (
+        patch(
+            "litellm.proxy.proxy_server.get_current_spend",
+            new_callable=AsyncMock,
+            return_value=1.5,
+        ),
+        pytest.raises(litellm.BudgetExceededError) as exc_info,
+    ):
+        await tag_max_budget_check(
+            request_body={"metadata": {"tags": ["paid-tag"]}},
+            prisma_client=MagicMock(),
+            user_api_key_cache=mock_cache,
+            proxy_logging_obj=MagicMock(),
+            valid_token=None,
+        )
+
+    assert exc_info.value.current_cost == 1.5
+    assert exc_info.value.max_budget == 1.0
+
+
+@pytest.mark.asyncio
+async def test_legacy_tag_max_budget_check_signature_and_fail_open_are_unchanged():
+    from litellm.proxy.auth.auth_checks import get_tag_objects_batch
+
+    assert tuple(inspect.signature(_tag_max_budget_check).parameters) == (
+        "request_body",
+        "prisma_client",
+        "user_api_key_cache",
+        "proxy_logging_obj",
+        "valid_token",
+    )
+    assert all(
+        parameter.default is inspect.Parameter.empty
+        for parameter in inspect.signature(_tag_max_budget_check).parameters.values()
+    )
+    raise_on_error = inspect.signature(get_tag_objects_batch).parameters[
+        "raise_on_error"
+    ]
+    assert raise_on_error.kind is inspect.Parameter.KEYWORD_ONLY
+    assert raise_on_error.default is False
+
+    mock_prisma = MagicMock()
+    mock_cache = MagicMock()
+    mock_cache.async_get_cache = AsyncMock(return_value=None)
+    mock_prisma.db.litellm_tagtable.find_many = AsyncMock(
+        side_effect=RuntimeError("database unavailable")
+    )
+
+    assert (
+        await _tag_max_budget_check(
+            request_body={"metadata": {"tags": ["paid-tag"]}},
+            prisma_client=mock_prisma,
+            user_api_key_cache=mock_cache,
+            proxy_logging_obj=MagicMock(),
+            valid_token=None,
+        )
+        is None
+    )
+
+    mock_cache.async_get_cache = AsyncMock(
+        side_effect=RuntimeError("cache unavailable")
+    )
+    assert (
+        await _tag_max_budget_check(
+            request_body={"metadata": {"tags": ["paid-tag"]}},
+            prisma_client=mock_prisma,
+            user_api_key_cache=mock_cache,
+            proxy_logging_obj=MagicMock(),
+            valid_token=None,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

@@ -97,7 +97,7 @@ async def test_create_and_get_tag():
             retrieved_tag.description = "Test tag for unit testing"
             retrieved_tag.models = ["model-1"]
             retrieved_tag.model_info = "{}"
-            retrieved_tag.spend = 0.0
+            retrieved_tag.spend = 12.5
             retrieved_tag.budget_id = None
             retrieved_tag.created_at = datetime.now()
             retrieved_tag.updated_at = datetime.now()
@@ -112,6 +112,8 @@ async def test_create_and_get_tag():
             result = response.json()
             assert "test-tag" in result
             assert result["test-tag"]["description"] == "Test tag for unit testing"
+            assert result["test-tag"]["spend"] == 12.5
+            assert isinstance(result["test-tag"]["spend"], float)
     finally:
         # Clean up dependency overrides
         app.dependency_overrides.clear()
@@ -278,7 +280,7 @@ async def test_list_tags_with_dynamic_tags():
             stored_tag.description = "A stored tag"
             stored_tag.models = ["model-1"]
             stored_tag.model_info = {}
-            stored_tag.spend = 0.0
+            stored_tag.spend = 7.25
             stored_tag.budget_id = None
             stored_tag.created_at = datetime(2025, 1, 1)
             stored_tag.updated_at = datetime(2025, 1, 1)
@@ -321,12 +323,19 @@ async def test_list_tags_with_dynamic_tags():
             assert "dynamic-tag-1" in tag_names
             assert "dynamic-tag-2" in tag_names
 
+            stored_tag_result = next(
+                tag for tag in result if tag["name"] == "stored-tag"
+            )
+            assert stored_tag_result["spend"] == 7.25
+            assert isinstance(stored_tag_result["spend"], float)
+
             # Verify dynamic tags include created_at/updated_at
             dynamic_tags = {
                 t["name"]: t for t in result if t["name"].startswith("dynamic-")
             }
             assert dynamic_tags["dynamic-tag-1"]["created_at"] is not None
             assert dynamic_tags["dynamic-tag-1"]["updated_at"] is not None
+            assert "spend" not in dynamic_tags["dynamic-tag-1"]
 
     finally:
         app.dependency_overrides.clear()

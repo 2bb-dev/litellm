@@ -13,6 +13,7 @@ import asyncio
 import math
 import re
 import time
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Type, Union, cast
 
 from fastapi import HTTPException, Request, status
@@ -109,6 +110,15 @@ last_db_access_time = LimitedSizeOrderedDict(max_size=100)
 db_cache_expiry = DEFAULT_IN_MEMORY_TTL  # refresh every 5s
 
 all_routes = LiteLLMRoutes.openai_routes.value + LiteLLMRoutes.management_routes.value
+
+
+class TagBudgetCheckOutcome(str, Enum):
+    NO_POLICY = "NO_POLICY"
+    WITHIN_BUDGET = "WITHIN_BUDGET"
+
+
+class TagBudgetLookupUnavailableError(RuntimeError):
+    pass
 
 
 def _log_budget_lookup_failure(entity: str, error: Exception) -> None:
@@ -1090,7 +1100,6 @@ async def get_end_user_object(
         route: The request route
         parent_otel_span: Optional OpenTelemetry span for tracing
         proxy_logging_obj: Optional proxy logging object
-
     Returns:
         LiteLLM_EndUserTable if found, None otherwise
     """
@@ -1271,6 +1280,8 @@ async def get_tag_objects_batch(
     user_api_key_cache: UserApiKeyCache,
     parent_otel_span: Optional[Span] = None,
     proxy_logging_obj: Optional[ProxyLogging] = None,
+    *,
+    raise_on_error: bool = False,
 ) -> Dict[str, LiteLLM_TagTable]:
     """
     Batch fetch multiple tag objects from cache and db.
@@ -1285,10 +1296,14 @@ async def get_tag_objects_batch(
         user_api_key_cache: Cache for storing tag objects
         parent_otel_span: Optional OpenTelemetry span for tracing
         proxy_logging_obj: Optional proxy logging object
+        raise_on_error: Raise TagBudgetLookupUnavailableError instead of failing open
 
     Returns:
         Dictionary mapping tag_name to LiteLLM_TagTable object
     """
+    if prisma_client is None and raise_on_error:
+        raise TagBudgetLookupUnavailableError("Tag budget lookup requires a database connection")
+
     if prisma_client is None:
         return {}
 
@@ -1298,19 +1313,23 @@ async def get_tag_objects_batch(
     tag_objects = {}
     uncached_tags = []
 
-    # Try to get all tags from cache first
-    for tag_name in tag_names:
-        cache_key = f"tag:{tag_name}"
-        cached_tag = await user_api_key_cache.async_get_cache(
-            key=cache_key,
-            model_type=LiteLLM_TagTable,
-        )
-        if cached_tag is not None:
-            tag_objects[tag_name] = cached_tag
-        else:
-            uncached_tags.append(tag_name)
+    try:
+        for tag_name in tag_names:
+            cache_key = f"tag:{tag_name}"
+            cached_tag = await user_api_key_cache.async_get_cache(
+                key=cache_key,
+                model_type=LiteLLM_TagTable,
+            )
+            if cached_tag is not None:
+                tag_objects[tag_name] = cached_tag
+            else:
+                uncached_tags.append(tag_name)
+    except Exception as e:
+        verbose_proxy_logger.debug(f"Error batch fetching tags from cache: {e}")
+        if raise_on_error:
+            raise TagBudgetLookupUnavailableError("Tag budget lookup is unavailable") from e
+        return tag_objects
 
-    # Batch fetch uncached tags from DB in one query
     if uncached_tags:
         try:
             db_tags = await TagRepository(prisma_client).table.find_many(
@@ -1318,7 +1337,6 @@ async def get_tag_objects_batch(
                 include={"litellm_budget_table": True},
             )
 
-            # Cache and add to tag_objects
             for db_tag in db_tags:
                 tag_name = db_tag.tag_name
                 cache_key = f"tag:{tag_name}"
@@ -1331,6 +1349,8 @@ async def get_tag_objects_batch(
                 tag_objects[tag_name] = _tag_obj
         except Exception as e:
             verbose_proxy_logger.debug(f"Error batch fetching tags from database: {e}")
+            if raise_on_error:
+                raise TagBudgetLookupUnavailableError("Tag budget lookup is unavailable") from e
 
     return tag_objects
 
@@ -4217,6 +4237,84 @@ async def _organization_max_budget_check(
         )
 
 
+async def _tag_budget_check_outcome(
+    tag_name: str,
+    tag_object: Optional[LiteLLM_TagTable],
+) -> TagBudgetCheckOutcome:
+    if tag_object is None or tag_object.litellm_budget_table is None:
+        return TagBudgetCheckOutcome.NO_POLICY
+
+    max_budget = tag_object.litellm_budget_table.max_budget
+    if max_budget is None:
+        return TagBudgetCheckOutcome.NO_POLICY
+
+    from litellm.proxy.proxy_server import get_current_spend
+
+    tag_spend = await get_current_spend(
+        counter_key=f"spend:tag:{tag_name}",
+        fallback_spend=tag_object.spend or 0.0,
+        max_budget=max_budget,
+        fallback_authoritative=True,
+    )
+    if tag_spend <= max_budget:
+        return TagBudgetCheckOutcome.WITHIN_BUDGET
+
+    raise litellm.BudgetExceededError(
+        current_cost=tag_spend,
+        max_budget=max_budget,
+        message=f"Budget has been exceeded! Tag={tag_name} Current cost: {tag_spend}, Max budget: {max_budget}",
+    )
+
+
+async def _tag_budget_check_outcomes(
+    request_body: dict,
+    prisma_client: Optional[PrismaClient],
+    user_api_key_cache: UserApiKeyCache,
+    proxy_logging_obj: ProxyLogging,
+    *,
+    raise_on_lookup_error: bool,
+) -> Dict[str, TagBudgetCheckOutcome]:
+    from litellm.proxy.common_utils.http_parsing_utils import get_tags_from_request_body
+
+    tags = get_tags_from_request_body(request_body=request_body)
+    if not tags:
+        return {}
+
+    tag_objects = await get_tag_objects_batch(
+        tag_names=tags,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+        raise_on_error=raise_on_lookup_error,
+    )
+    outcomes = tuple(
+        [
+            await _tag_budget_check_outcome(
+                tag_name=tag_name,
+                tag_object=tag_objects.get(tag_name),
+            )
+            for tag_name in tags
+        ]
+    )
+    return dict(zip(tags, outcomes))
+
+
+async def tag_max_budget_check(
+    request_body: dict,
+    prisma_client: Optional[PrismaClient],
+    user_api_key_cache: UserApiKeyCache,
+    proxy_logging_obj: ProxyLogging,
+    valid_token: Optional[UserAPIKeyAuth],
+) -> Dict[str, TagBudgetCheckOutcome]:
+    return await _tag_budget_check_outcomes(
+        request_body=request_body,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+        raise_on_lookup_error=True,
+    )
+
+
 async def _tag_max_budget_check(
     request_body: dict,
     prisma_client: Optional[PrismaClient],
@@ -4224,54 +4322,16 @@ async def _tag_max_budget_check(
     proxy_logging_obj: ProxyLogging,
     valid_token: Optional[UserAPIKeyAuth],
 ):
-    """
-    Check if any tags in the request are over their max budget.
-
-    Raises:
-        BudgetExceededError if any tag is over its max budget.
-        Triggers a budget alert if any tag is over its max budget.
-    """
-    from litellm.proxy.common_utils.http_parsing_utils import get_tags_from_request_body
-
     if prisma_client is None:
         return
 
-    # Get tags from request metadata
-    tags = get_tags_from_request_body(request_body=request_body)
-    if not tags:
-        return
-
-    # Batch fetch all tags in one go
-    tag_objects = await get_tag_objects_batch(
-        tag_names=tags,
+    await _tag_budget_check_outcomes(
+        request_body=request_body,
         prisma_client=prisma_client,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        raise_on_lookup_error=False,
     )
-
-    # Check budget for each tag
-    for tag_name in tags:
-        tag_object = tag_objects.get(tag_name)
-        if tag_object is None:
-            continue
-
-        # Check if tag has budget limits
-        if tag_object.litellm_budget_table is not None and tag_object.litellm_budget_table.max_budget is not None:
-            from litellm.proxy.proxy_server import get_current_spend
-
-            tag_spend = await get_current_spend(
-                counter_key=f"spend:tag:{tag_name}",
-                fallback_spend=tag_object.spend or 0.0,
-                max_budget=tag_object.litellm_budget_table.max_budget,
-                fallback_authoritative=True,
-            )
-            if tag_spend <= tag_object.litellm_budget_table.max_budget:
-                continue
-            raise litellm.BudgetExceededError(
-                current_cost=tag_spend,
-                max_budget=tag_object.litellm_budget_table.max_budget,
-                message=f"Budget has been exceeded! Tag={tag_name} Current cost: {tag_spend}, Max budget: {tag_object.litellm_budget_table.max_budget}",
-            )
 
 
 def is_model_allowed_by_pattern(model: str, allowed_model_pattern: str) -> bool:
