@@ -5,6 +5,7 @@ providers that only exist in this fork.
 """
 
 from litellm.litellm_core_utils.get_model_cost_map import (
+    FORK_OWNED_MODEL_IDS,
     FORK_OWNED_MODEL_PREFIXES,
     GetModelCostMap,
     get_model_cost_map,
@@ -69,15 +70,16 @@ class TestForkOwnedEntries:
         entries = GetModelCostMap.get_fork_owned_entries()
 
         assert entries
-        assert all(model.startswith(FORK_OWNED_MODEL_PREFIXES) for model in entries)
+        assert all(model.startswith(FORK_OWNED_MODEL_PREFIXES) or model in FORK_OWNED_MODEL_IDS for model in entries)
+        assert FORK_OWNED_MODEL_IDS <= entries.keys()
 
-    def test_subscription_models_survive_a_remote_map_without_them(self, monkeypatch):
+    def test_fork_models_survive_a_remote_map_without_them(self, monkeypatch):
         monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
         backup = GetModelCostMap.load_local_model_cost_map()
         remote = {
             model: info
             for model, info in backup.items()
-            if not model.startswith(FORK_OWNED_MODEL_PREFIXES)
+            if not model.startswith(FORK_OWNED_MODEL_PREFIXES) and model not in FORK_OWNED_MODEL_IDS
         }
         remote["chatgpt/gpt-5.4"] = {"litellm_provider": "chatgpt", "mode": "responses"}
 
@@ -85,3 +87,4 @@ class TestForkOwnedEntries:
 
         assert loaded["chatgpt/gpt-5.6-luna"]["supports_reasoning"] is True
         assert loaded["chatgpt/gpt-5.4"]["supports_reasoning"] is True
+        assert FORK_OWNED_MODEL_IDS <= loaded.keys()

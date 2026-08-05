@@ -23,6 +23,14 @@ from litellm.constants import (
 
 # Providers implemented in this fork: upstream's map cannot describe their models.
 FORK_OWNED_MODEL_PREFIXES = ("chatgpt/",)
+FORK_OWNED_MODEL_IDS = frozenset(
+    {
+        "moonshot/kimi-k2.7-code",
+        "moonshot/kimi-k3",
+        "xai/grok-4.5",
+        "zai/glm-5.2",
+    }
+)
 
 
 class GetModelCostMap:
@@ -58,7 +66,7 @@ class GetModelCostMap:
             cls._fork_owned_entries = {
                 model: info
                 for model, info in backup.items()
-                if model.startswith(FORK_OWNED_MODEL_PREFIXES)
+                if model.startswith(FORK_OWNED_MODEL_PREFIXES) or model in FORK_OWNED_MODEL_IDS
             }
         return cls._fork_owned_entries
 
@@ -264,10 +272,7 @@ def merge_fork_owned_entries(fetched: Mapping[str, dict], fork_entries: Mapping[
     """
     return {
         **fetched,
-        **{
-            model: {**info, **fetched.get(model, {})}
-            for model, info in fork_entries.items()
-        },
+        **{model: {**info, **fetched.get(model, {})} for model, info in fork_entries.items()},
     }
 
 
@@ -323,6 +328,4 @@ def get_model_cost_map(url: str, fetch_remote: Optional[Callable[[str], dict]] =
 
     _cost_map_source_info.source = "remote"
     _cost_map_source_info.fallback_reason = None
-    return _expand_model_aliases(
-        merge_fork_owned_entries(content, GetModelCostMap.get_fork_owned_entries())
-    )
+    return _expand_model_aliases(merge_fork_owned_entries(content, GetModelCostMap.get_fork_owned_entries()))
