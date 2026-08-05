@@ -53,4 +53,7 @@ class ZAIChatConfig(OpenAIGPTConfig):
         except Exception:
             pass
 
+        if model.split("/", 1)[-1] == "glm-5.2":
+            base_params.append("reasoning_effort")
+
         return base_params

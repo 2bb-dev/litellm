@@ -90,7 +90,7 @@ class MoonshotChatConfig(OpenAIGPTConfig):
 
         Moonshot AI limitations:
         - functions parameter is not supported (use tools instead)
-        - tool_choice doesn't support "required" value
+        - tool_choice doesn't support "required" before kimi-k3
         - kimi-thinking-preview doesn't support tool calls at all
         """
         excluded_params: List[str] = ["functions"]
@@ -104,6 +104,9 @@ class MoonshotChatConfig(OpenAIGPTConfig):
         for param in base_openai_params:
             if param not in excluded_params:
                 final_params.append(param)
+
+        if model.split("/", 1)[-1] == "kimi-k3":
+            final_params.append("reasoning_effort")
 
         return final_params
 
@@ -205,7 +208,7 @@ class MoonshotChatConfig(OpenAIGPTConfig):
             dict: The transformed request. Sent as the body of the API call.
         """
         # Add tool_choice="required" message if needed
-        if optional_params.get("tool_choice", None) == "required":
+        if optional_params.get("tool_choice", None) == "required" and model.split("/", 1)[-1] != "kimi-k3":
             messages = self._add_tool_choice_required_message(
                 messages=messages,
                 optional_params=optional_params,

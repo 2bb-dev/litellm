@@ -5,8 +5,10 @@ These tests validate the MoonshotChatConfig class which extends OpenAIGPTConfig.
 Moonshot AI is an OpenAI-compatible provider with minor customizations.
 """
 
+import json
 import os
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath("../../../../.."))  # Adds the parent directory to the system path
@@ -591,6 +593,97 @@ class TestMoonshotConfig:
 
         assert result["messages"][1].get("reasoning_content") == " "
 
+    @pytest.mark.parametrize("model", ["kimi-k3", "kimi-k2.7-code"])
+    def test_latest_reasoning_models_drop_temperature_and_preserve_reasoning_content(self, model, monkeypatch):
+        monkeypatch.setattr(litellm, "model_cost", GetModelCostMap.load_local_model_cost_map())
+        config = MoonshotChatConfig()
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "fn", "arguments": "{}"},
+                    }
+                ],
+                "provider_specific_fields": {"reasoning_content": "stored thinking"},
+            }
+        ]
+
+        optional_params = config.map_openai_params(
+            non_default_params={"temperature": 0.5},
+            optional_params={},
+            model=model,
+            drop_params=False,
+        )
+        result = config.transform_request(
+            model=model,
+            messages=messages,
+            optional_params=optional_params,
+            litellm_params={},
+            headers={},
+        )
+
+        assert "temperature" not in result
+        assert result["messages"][0]["reasoning_content"] == "stored thinking"
+
+    def test_kimi_k3_supports_reasoning_effort_and_native_required_tool_choice(self, monkeypatch):
+        monkeypatch.setattr(litellm, "model_cost", GetModelCostMap.load_local_model_cost_map())
+        config = MoonshotChatConfig()
+        supported_params = config.get_supported_openai_params("kimi-k3")
+        assert "reasoning_effort" in supported_params
+
+        optional_params = config.map_openai_params(
+            non_default_params={
+                "reasoning_effort": "max",
+                "tool_choice": "required",
+                "tools": [{"type": "function", "function": {"name": "fn"}}],
+            },
+            optional_params={},
+            model="kimi-k3",
+            drop_params=False,
+        )
+        result = config.transform_request(
+            model="kimi-k3",
+            messages=[{"role": "user", "content": "Call a tool"}],
+            optional_params=optional_params,
+            litellm_params={},
+            headers={},
+        )
+
+        assert result["reasoning_effort"] == "max"
+        assert result["tool_choice"] == "required"
+        assert result["messages"] == [{"role": "user", "content": "Call a tool"}]
+
+    def test_kimi_k27_code_keeps_required_tool_choice_compatibility(self, monkeypatch):
+        monkeypatch.setattr(litellm, "model_cost", GetModelCostMap.load_local_model_cost_map())
+        config = MoonshotChatConfig()
+        assert "reasoning_effort" not in config.get_supported_openai_params("kimi-k2.7-code")
+
+        optional_params = config.map_openai_params(
+            non_default_params={
+                "reasoning_effort": "high",
+                "tool_choice": "required",
+                "tools": [{"type": "function", "function": {"name": "fn"}}],
+            },
+            optional_params={},
+            model="kimi-k2.7-code",
+            drop_params=False,
+        )
+        result = config.transform_request(
+            model="kimi-k2.7-code",
+            messages=[{"role": "user", "content": "Call a tool"}],
+            optional_params=optional_params,
+            litellm_params={},
+            headers={},
+        )
+
+        assert "reasoning_effort" not in result
+        assert "tool_choice" not in result
+        assert result["messages"][-1]["content"] == "Please select a tool to handle the current issue."
+
     def test_non_reasoning_model_messages_untouched(self):
         """For non-reasoning models, transform_request leaves messages unchanged."""
         config = MoonshotChatConfig()
@@ -701,6 +794,64 @@ class TestMoonshotConfig:
 
         # reasoning_content should be preserved in the assistant message
         assert result[1].get("reasoning_content") == "<thinking>Planning to call weather tool</thinking>"
+
+
+class TestLatestKimiModelRegistry:
+    @pytest.fixture(autouse=True)
+    def model_cost_map(self):
+        return GetModelCostMap.load_local_model_cost_map()
+
+    @pytest.mark.parametrize(
+        ("model", "max_input_tokens", "max_output_tokens", "input_cost", "cache_cost", "output_cost"),
+        [
+            ("moonshot/kimi-k3", 1048576, 1048576, 3e-06, 3e-07, 15e-06),
+            ("moonshot/kimi-k2.7-code", 262144, None, 9.5e-07, 1.9e-07, 4e-06),
+        ],
+    )
+    def test_native_metadata(
+        self,
+        model,
+        max_input_tokens,
+        max_output_tokens,
+        input_cost,
+        cache_cost,
+        output_cost,
+        model_cost_map,
+    ):
+        info = model_cost_map[model]
+        assert info["litellm_provider"] == "moonshot"
+        assert info["mode"] == "chat"
+        assert info["max_input_tokens"] == max_input_tokens
+        assert info.get("max_output_tokens") == max_output_tokens
+        assert info["input_cost_per_token"] == pytest.approx(input_cost)
+        assert info["cache_read_input_token_cost"] == pytest.approx(cache_cost)
+        assert info["output_cost_per_token"] == pytest.approx(output_cost)
+        for capability in (
+            "supports_function_calling",
+            "supports_prompt_caching",
+            "supports_reasoning",
+            "supports_response_schema",
+            "supports_tool_choice",
+            "supports_video_input",
+            "supports_vision",
+        ):
+            assert info[capability] is True
+
+        from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
+
+        routed_model, provider, _, _ = get_llm_provider(model)
+        assert routed_model == model.split("/", 1)[1]
+        assert provider == "moonshot"
+
+    def test_backup_matches_main(self, model_cost_map):
+        repo_root = Path(__file__).parents[4]
+        with open(repo_root / "model_prices_and_context_window.json") as file:
+            main_cost = json.load(file)
+        with open(repo_root / "litellm" / "model_prices_and_context_window_backup.json") as file:
+            backup_cost = json.load(file)
+
+        for model in ("moonshot/kimi-k3", "moonshot/kimi-k2.7-code"):
+            assert main_cost[model] == backup_cost[model] == model_cost_map[model]
 
 
 class TestKimiK26ModelRegistry:

@@ -4,6 +4,7 @@ Tests for Z.AI (Zhipu AI) provider - GLM models
 
 import json
 import math
+from pathlib import Path
 
 import pytest
 import respx
@@ -11,6 +12,8 @@ import respx
 import litellm
 from litellm import completion
 from litellm.cost_calculator import cost_per_token
+from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
+from litellm.llms.zai.chat.transformation import ZAIChatConfig
 
 
 @pytest.fixture
@@ -51,6 +54,53 @@ def test_zai_in_provider_lists():
     assert "zai" in litellm.provider_list
 
 
+def test_glm52_native_metadata_and_routing():
+    repo_root = Path(__file__).parents[4]
+    with open(repo_root / "model_prices_and_context_window.json") as file:
+        main_cost = json.load(file)
+    with open(repo_root / "litellm" / "model_prices_and_context_window_backup.json") as file:
+        backup_cost = json.load(file)
+
+    model = "zai/glm-5.2"
+    info = main_cost[model]
+    assert backup_cost[model] == info
+    assert info["litellm_provider"] == "zai"
+    assert info["mode"] == "chat"
+    assert info["max_input_tokens"] == 1000000
+    assert info["max_output_tokens"] == 131072
+    assert info["input_cost_per_token"] == pytest.approx(1.4e-06)
+    assert info["cache_read_input_token_cost"] == pytest.approx(2.6e-07)
+    assert info["output_cost_per_token"] == pytest.approx(4.4e-06)
+    assert info["supports_function_calling"] is True
+    assert info["supports_prompt_caching"] is True
+    assert info["supports_reasoning"] is True
+    assert info["supports_tool_choice"] is True
+
+    routed_model, provider, _, _ = get_llm_provider(model)
+    assert routed_model == "glm-5.2"
+    assert provider == "zai"
+
+
+def test_glm52_supports_reasoning_effort_without_changing_other_glm_models():
+    config = ZAIChatConfig()
+    glm52_params = config.get_supported_openai_params("glm-5.2")
+    glm51_params = config.get_supported_openai_params("glm-5.1")
+
+    assert "thinking" in glm52_params
+    assert "reasoning_effort" in glm52_params
+    assert "thinking" in glm51_params
+    assert "reasoning_effort" not in glm51_params
+
+    mapped = config.map_openai_params(
+        non_default_params={"reasoning_effort": "high", "thinking": {"type": "enabled"}},
+        optional_params={},
+        model="glm-5.2",
+        drop_params=False,
+    )
+    assert mapped["reasoning_effort"] == "high"
+    assert mapped["thinking"] == {"type": "enabled"}
+
+
 def test_zai_models_in_model_cost():
     """Test that ZAI models are in the model cost map"""
     import os
@@ -59,6 +109,7 @@ def test_zai_models_in_model_cost():
     litellm.model_cost = litellm.get_model_cost_map(url="")
 
     zai_models = [
+        "zai/glm-5.2",
         "zai/glm-4.7",
         "zai/glm-4.6",
         "zai/glm-4.5",
@@ -148,9 +199,7 @@ async def test_zai_completion_call(respx_mock, zai_response, monkeypatch):
     monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
     litellm.disable_aiohttp_transport = True
 
-    respx_mock.post("https://api.z.ai/api/paas/v4/chat/completions").respond(
-        json=zai_response
-    )
+    respx_mock.post("https://api.z.ai/api/paas/v4/chat/completions").respond(json=zai_response)
 
     response = await litellm.acompletion(
         model="zai/glm-4.6",
@@ -174,9 +223,7 @@ def test_zai_sync_completion(respx_mock, zai_response, monkeypatch):
     monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
     litellm.disable_aiohttp_transport = True
 
-    respx_mock.post("https://api.z.ai/api/paas/v4/chat/completions").respond(
-        json=zai_response
-    )
+    respx_mock.post("https://api.z.ai/api/paas/v4/chat/completions").respond(json=zai_response)
 
     response = completion(
         model="zai/glm-4.6",
