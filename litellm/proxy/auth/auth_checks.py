@@ -4299,7 +4299,7 @@ async def _tag_budget_check_outcomes(
     return dict(zip(tags, outcomes))
 
 
-async def tag_max_budget_check(
+async def strict_tag_max_budget_check(
     request_body: dict,
     prisma_client: Optional[PrismaClient],
     user_api_key_cache: UserApiKeyCache,
@@ -4312,6 +4312,22 @@ async def tag_max_budget_check(
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
         raise_on_lookup_error=True,
+    )
+
+
+async def tag_max_budget_check(
+    request_body: dict,
+    prisma_client: Optional[PrismaClient],
+    user_api_key_cache: UserApiKeyCache,
+    proxy_logging_obj: ProxyLogging,
+    valid_token: Optional[UserAPIKeyAuth],
+) -> Dict[str, TagBudgetCheckOutcome]:
+    return await strict_tag_max_budget_check(
+        request_body=request_body,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+        valid_token=valid_token,
     )
 
 

@@ -1507,7 +1507,7 @@ async def test_check_team_member_model_access_no_override_inherits_team():
 async def test_tag_max_budget_check_returns_typed_outcomes_from_one_batch_lookup():
     from litellm.proxy.auth.auth_checks import (
         TagBudgetCheckOutcome,
-        tag_max_budget_check,
+        strict_tag_max_budget_check,
     )
 
     mock_prisma = MagicMock()
@@ -1537,7 +1537,7 @@ async def test_tag_max_budget_check_returns_typed_outcomes_from_one_batch_lookup
         new_callable=AsyncMock,
         return_value=0.25,
     ):
-        outcomes = await tag_max_budget_check(
+        outcomes = await strict_tag_max_budget_check(
             request_body={
                 "metadata": {
                     "tags": [
