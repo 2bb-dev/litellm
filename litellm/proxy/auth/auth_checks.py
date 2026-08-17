@@ -4306,6 +4306,14 @@ async def strict_tag_max_budget_check(
     proxy_logging_obj: ProxyLogging,
     valid_token: Optional[UserAPIKeyAuth],
 ) -> Dict[str, TagBudgetCheckOutcome]:
+    if valid_token is not None:
+        from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
+
+        LiteLLMProxyRequestSetup.apply_key_tags_pre_auth(
+            request_data=request_body,
+            user_api_key_dict=valid_token,
+        )
+
     return await _tag_budget_check_outcomes(
         request_body=request_body,
         prisma_client=prisma_client,

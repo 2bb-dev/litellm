@@ -1564,6 +1564,46 @@ async def test_tag_max_budget_check_returns_typed_outcomes_from_one_batch_lookup
 
 
 @pytest.mark.asyncio
+async def test_strict_tag_max_budget_check_includes_virtual_key_tags():
+    from litellm.proxy.auth.auth_checks import (
+        TagBudgetCheckOutcome,
+        strict_tag_max_budget_check,
+    )
+
+    mock_prisma = MagicMock()
+    mock_cache = MagicMock()
+    mock_cache.async_get_cache = AsyncMock(return_value=None)
+    mock_cache.async_set_cache = AsyncMock()
+    mock_prisma.db.litellm_tagtable.find_many = AsyncMock(
+        return_value=[
+            LiteLLM_TagTable(
+                tag_name="key-tag",
+                spend=0.25,
+                litellm_budget_table=LiteLLM_BudgetTable(max_budget=1.0),
+            )
+        ]
+    )
+    request_body = {"metadata": {}}
+    valid_token = UserAPIKeyAuth(metadata={"tags": ["key-tag"]})
+
+    with patch(
+        "litellm.proxy.proxy_server.get_current_spend",
+        new_callable=AsyncMock,
+        return_value=0.25,
+    ):
+        outcomes = await strict_tag_max_budget_check(
+            request_body=request_body,
+            prisma_client=mock_prisma,
+            user_api_key_cache=mock_cache,
+            proxy_logging_obj=MagicMock(),
+            valid_token=valid_token,
+        )
+
+    assert outcomes == {"key-tag": TagBudgetCheckOutcome.WITHIN_BUDGET}
+    assert request_body["metadata"]["tags"] == ["key-tag"]
+
+
+@pytest.mark.asyncio
 async def test_tag_max_budget_check_raises_when_prisma_is_unavailable():
     from litellm.proxy.auth.auth_checks import (
         TagBudgetLookupUnavailableError,
