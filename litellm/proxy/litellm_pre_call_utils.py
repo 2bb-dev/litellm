@@ -2639,13 +2639,19 @@ class LiteLLMProxyRequestSetup:
         request_data: dict,
         user_api_key_dict: UserAPIKeyAuth,
     ) -> None:
-        """Merge key metadata tags into request_data before _tag_max_budget_check."""
-        key_metadata = user_api_key_dict.metadata
-        if not key_metadata:
-            return
-
-        key_tags = key_metadata.get("tags")
-        if not key_tags or not isinstance(key_tags, list):
+        """Merge effective key, team, and project tags before tag budget checks."""
+        tag_sources = (
+            user_api_key_dict.metadata,
+            user_api_key_dict.team_metadata,
+            user_api_key_dict.project_metadata,
+        )
+        effective_tags = [
+            tag
+            for source in tag_sources
+            if isinstance(source, dict) and isinstance(source.get("tags"), list)
+            for tag in source["tags"]
+        ]
+        if not effective_tags:
             return
 
         _metadata_variable_name = get_metadata_variable_name_from_kwargs(request_data)
@@ -2661,7 +2667,7 @@ class LiteLLMProxyRequestSetup:
         existing_tags = metadata.get("tags")
         metadata["tags"] = LiteLLMProxyRequestSetup._merge_tags(
             request_tags=existing_tags if isinstance(existing_tags, list) else None,
-            tags_to_add=key_tags,
+            tags_to_add=effective_tags,
         )
 
     @staticmethod

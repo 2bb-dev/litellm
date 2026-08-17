@@ -1580,11 +1580,25 @@ async def test_strict_tag_max_budget_check_includes_virtual_key_tags():
                 tag_name="key-tag",
                 spend=0.25,
                 litellm_budget_table=LiteLLM_BudgetTable(max_budget=1.0),
-            )
+            ),
+            LiteLLM_TagTable(
+                tag_name="team-tag",
+                spend=0.25,
+                litellm_budget_table=LiteLLM_BudgetTable(max_budget=1.0),
+            ),
+            LiteLLM_TagTable(
+                tag_name="project-tag",
+                spend=0.25,
+                litellm_budget_table=LiteLLM_BudgetTable(max_budget=1.0),
+            ),
         ]
     )
     request_body = {"metadata": {}}
-    valid_token = UserAPIKeyAuth(metadata={"tags": ["key-tag"]})
+    valid_token = UserAPIKeyAuth(
+        metadata={"tags": ["key-tag"]},
+        team_metadata={"tags": ["team-tag"]},
+        project_metadata={"tags": ["project-tag"]},
+    )
 
     with patch(
         "litellm.proxy.proxy_server.get_current_spend",
@@ -1599,8 +1613,16 @@ async def test_strict_tag_max_budget_check_includes_virtual_key_tags():
             valid_token=valid_token,
         )
 
-    assert outcomes == {"key-tag": TagBudgetCheckOutcome.WITHIN_BUDGET}
-    assert request_body["metadata"]["tags"] == ["key-tag"]
+    assert outcomes == {
+        "key-tag": TagBudgetCheckOutcome.WITHIN_BUDGET,
+        "team-tag": TagBudgetCheckOutcome.WITHIN_BUDGET,
+        "project-tag": TagBudgetCheckOutcome.WITHIN_BUDGET,
+    }
+    assert request_body["metadata"]["tags"] == [
+        "key-tag",
+        "team-tag",
+        "project-tag",
+    ]
 
 
 @pytest.mark.asyncio
