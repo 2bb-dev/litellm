@@ -425,11 +425,12 @@ async def info_tag(
                 "description": tag_record.description,
                 "models": tag_record.models,
                 "model_info": model_info,
-                "spend": tag_record.spend,
                 "created_at": tag_record.created_at.isoformat(),
                 "updated_at": tag_record.updated_at.isoformat(),
                 "created_by": tag_record.created_by,
             }
+            if user_api_key_has_admin_view(user_api_key_dict):
+                tag_dict["spend"] = tag_record.spend
 
             # Add budget info if available
             if hasattr(tag_record, "litellm_budget_table") and tag_record.litellm_budget_table:
@@ -549,11 +550,12 @@ async def list_tags(
                 "description": tag_record.description,
                 "models": tag_record.models,
                 "model_info": model_info,
-                "spend": tag_record.spend,
                 "created_at": tag_record.created_at.isoformat(),
                 "updated_at": tag_record.updated_at.isoformat(),
                 "created_by": tag_record.created_by,
             }
+            if user_api_key_has_admin_view(user_api_key_dict):
+                tag_dict["spend"] = tag_record.spend
 
             # Add budget info if available
             if hasattr(tag_record, "litellm_budget_table") and tag_record.litellm_budget_table:

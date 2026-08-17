@@ -437,7 +437,7 @@ async def test_internal_user_list_tags_only_returns_tags_used_by_their_keys():
             stored_tag.description = "A stored tag used by the caller"
             stored_tag.models = ["model-1"]
             stored_tag.model_info = {}
-            stored_tag.spend = 0.0
+            stored_tag.spend = 99.0
             stored_tag.budget_id = None
             stored_tag.created_at = datetime(2025, 1, 1)
             stored_tag.updated_at = datetime(2025, 1, 1)
@@ -455,6 +455,7 @@ async def test_internal_user_list_tags_only_returns_tags_used_by_their_keys():
                 "stored-owned-tag",
                 "dynamic-owned-tag",
             ]
+            assert "spend" not in response.json()[0]
             mock_db.litellm_verificationtoken.find_many.assert_awaited_once_with(
                 where={"user_id": "internal-user-123"},
                 select={"token": True},
