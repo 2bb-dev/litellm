@@ -29,6 +29,50 @@ from ..common_utils import (
 )
 
 
+def _lift_privileged_input_messages(input: Any) -> tuple[Any, list[str]]:
+    """Move ChatGPT-unsupported system context into Responses instructions."""
+    if not isinstance(input, list):
+        return input, []
+
+    remaining: list[Any] = []
+    instructions: list[str] = []
+    for item in input:
+        text = _privileged_message_text(item)
+        if text is None:
+            remaining.append(item)
+        elif text:
+            instructions.append(text)
+    return remaining, instructions
+
+
+def _privileged_message_text(item: Any) -> Optional[str]:
+    if not isinstance(item, dict):
+        return None
+    if item.get("type") not in (None, "message"):
+        return None
+    if item.get("role") not in ("system", "developer"):
+        return None
+
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+
+    parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") not in (
+            "input_text",
+            "text",
+        ):
+            return None
+        text = part.get("text")
+        if not isinstance(text, str):
+            return None
+        parts.append(text)
+    return "\n".join(parts)
+
+
 class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     def __init__(self) -> None:
         super().__init__()
@@ -80,6 +124,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                     "content": [{"type": "input_text", "text": request["input"]}],
                 }
             ]
+        request["input"], input_instructions = _lift_privileged_input_messages(request.get("input"))
         prompt_cache_key = request.get("prompt_cache_key")
         if prompt_cache_key:
             headers["session_id"] = prompt_cache_key
@@ -91,6 +136,8 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 request["instructions"] = f"{base_instructions}\n\n{existing_instructions}"
         else:
             request["instructions"] = base_instructions
+        if input_instructions:
+            request["instructions"] = "\n\n".join([request["instructions"], *input_instructions])
         # ChatGPT's Codex Responses backend rejects stored responses. OpenClaw
         # keeps its own session state and passes encrypted reasoning items back
         # explicitly, so force the backend request to remain stateless.
