@@ -240,6 +240,60 @@ class TestChatGPTResponsesAPITransformation:
         assert "reasoning.encrypted_content" in request["include"]
         assert request["instructions"].startswith("You are Codex, based on GPT-5.")
 
+    def test_chatgpt_lifts_system_and_developer_input_into_instructions(self):
+        config = ChatGPTResponsesAPIConfig()
+        reasoning_item = {"type": "reasoning", "id": "reasoning_1"}
+        request = config.transform_responses_api_request(
+            model="chatgpt/gpt-5.6-sol",
+            input=[
+                {"role": "system", "content": "System context"},
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "Developer context"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello"}],
+                },
+                reasoning_item,
+            ],
+            response_api_optional_request_params={"instructions": "Caller context"},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert request["input"] == [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello"}],
+            },
+            reasoning_item,
+        ]
+        assert request["instructions"].endswith("Caller context\n\nSystem context\n\nDeveloper context")
+
+    def test_chatgpt_preserves_non_text_privileged_input(self):
+        config = ChatGPTResponsesAPIConfig()
+        system_image = {
+            "type": "message",
+            "role": "system",
+            "content": [{"type": "input_image", "image_url": "https://example.test/a.png"}],
+        }
+        request = config.transform_responses_api_request(
+            model="chatgpt/gpt-5.6-sol",
+            input=[system_image, {"role": "user", "content": "Hello"}],
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert request["input"] == [
+            system_image,
+            {"role": "user", "content": "Hello"},
+        ]
+
     @pytest.mark.parametrize(
         "model_name",
         [
