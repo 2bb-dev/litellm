@@ -3,6 +3,42 @@
 from unittest.mock import MagicMock
 
 from litellm.llms.chatgpt.chat.transformation import ChatGPTConfig
+from litellm.llms.openai.openai import OpenAIConfig
+
+
+def test_chatgpt_normalizes_system_messages_without_reordering_content():
+    messages = [
+        {"role": "system", "content": "application instructions", "name": "app"},
+        {"role": "developer", "content": "existing developer instructions"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    request = ChatGPTConfig().transform_request(
+        model="gpt-5.6",
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+
+    assert request["messages"] == [
+        {"role": "developer", "content": "application instructions", "name": "app"},
+        {"role": "developer", "content": "existing developer instructions"},
+        {"role": "user", "content": "hello"},
+    ]
+    assert messages[0]["role"] == "system"
+
+
+def test_openai_chat_preserves_system_messages():
+    request = OpenAIConfig().transform_request(
+        model="gpt-5.6",
+        messages=[{"role": "system", "content": "application instructions"}],
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+
+    assert request["messages"][0]["role"] == "system"
 
 
 def test_prompt_cache_key_sets_session_id_header():

@@ -1,4 +1,4 @@
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, cast
 
 from litellm.exceptions import AuthenticationError
 from litellm.llms.openai.openai import OpenAIConfig
@@ -66,6 +66,12 @@ class ChatGPTConfig(OpenAIConfig):
 
     def post_stream_processing(self, stream: Any) -> Any:
         return ChatGPTToolCallNormalizer(stream)
+
+    def _transform_messages(self, messages: List[AllMessageValues], model: str) -> List[AllMessageValues]:
+        return [
+            cast(AllMessageValues, {**message, "role": "developer"}) if message["role"] == "system" else message
+            for message in messages
+        ]
 
     def map_openai_params(
         self,
