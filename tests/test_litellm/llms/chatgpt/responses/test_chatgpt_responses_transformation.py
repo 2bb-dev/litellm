@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, os.path.abspath("../../../../.."))
 
 from litellm.llms.openai.common_utils import OpenAIError
+from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
 from litellm.types.router import GenericLiteLLMParams
@@ -24,6 +25,62 @@ from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPICon
 
 
 class TestChatGPTResponsesAPITransformation:
+    def test_system_input_is_normalized_without_reordering_content(self):
+        input_items = [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": "application instructions"}],
+            },
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "existing developer instructions"}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        ]
+
+        request = ChatGPTResponsesAPIConfig().transform_responses_api_request(
+            model="gpt-5.6",
+            input=input_items,
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert request["input"] == [
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "application instructions"}],
+            },
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "existing developer instructions"}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        ]
+        assert input_items[0]["role"] == "system"
+
+    def test_openai_responses_preserves_system_input(self):
+        request = OpenAIResponsesAPIConfig().transform_responses_api_request(
+            model="gpt-5.6",
+            input=[
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "application instructions"}],
+                }
+            ],
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert request["input"][0]["role"] == "system"
+
     @pytest.mark.asyncio
     async def test_non_stream_caller_buffers_provider_forced_sse(self):
         config = ChatGPTResponsesAPIConfig()

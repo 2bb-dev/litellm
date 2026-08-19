@@ -12,7 +12,9 @@ Upstream syncs must preserve these behaviors:
 - **ChatGPT subscription routing:** Responses state remains persistent where
   required, upstream storage stays disabled, prompt-cache parameters survive
   transformation, the ChatGPT session header follows `prompt_cache_key`,
-  string inputs are normalized for the subscription backend, and
+  string inputs are normalized for the subscription backend, client `system`
+  messages are represented as `developer` messages without changing their
+  content or order, and
   provider-forced SSE is accumulated into one complete response for
   non-streaming callers without duplicate streaming hooks or spend logs.
 - **OpenClaw attribution:** trusted runtime context and supported OpenClaw

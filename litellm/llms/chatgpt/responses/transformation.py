@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.core_helpers import process_response_headers
@@ -73,12 +73,20 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             litellm_params,
             headers,
         )
-        if isinstance(request.get("input"), str):
+        request_input = cast(Dict[str, object], request).get("input")
+        if isinstance(request_input, str):
             request["input"] = [
                 {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": request["input"]}],
+                    "content": [{"type": "input_text", "text": request_input}],
                 }
+            ]
+        elif isinstance(request_input, list):
+            request["input"] = [
+                {**cast(Dict[str, object], item), "role": "developer"}
+                if isinstance(item, dict) and cast(Dict[str, object], item).get("role") == "system"
+                else item
+                for item in cast(List[object], request_input)
             ]
         prompt_cache_key = request.get("prompt_cache_key")
         if prompt_cache_key:
