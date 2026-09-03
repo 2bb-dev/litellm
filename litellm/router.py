@@ -55,6 +55,7 @@ from litellm.caching.caching import (
     RedisClusterCache,
 )
 from litellm.constants import (
+    ANTHROPIC_PROMPT_CACHE_OPT_OUT_HEADER,
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_HEALTH_CHECK_STALENESS_MULTIPLIER,
     DEFAULT_MAX_LRU_CACHE_SIZE,
@@ -4258,7 +4259,7 @@ class Router:
         """
         try:
             if "cache_control" in kwargs and kwargs["cache_control"] is None:
-                kwargs["_litellm_disable_cache_control"] = True
+                kwargs["_litellm_disable_cache_control"] = "forward"
             kwargs["model"] = model
             kwargs["original_generic_function"] = original_function
             kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
@@ -4314,7 +4315,7 @@ class Router:
         """
 
         passthrough_on_no_deployment = kwargs.pop("passthrough_on_no_deployment", False)
-        disable_cache_control = kwargs.pop("_litellm_disable_cache_control", False)
+        disable_cache_control = kwargs.pop("_litellm_disable_cache_control", None)
         function_name = "_ageneric_api_call_with_fallbacks"
         try:
             parent_otel_span = _get_parent_otel_span_from_kwargs(kwargs)
@@ -4359,6 +4360,12 @@ class Router:
             }
             if disable_cache_control:
                 response_kwargs.pop("cache_control", None)
+                if disable_cache_control == "forward":
+                    # Carry an explicit opt-out across one LiteLLM proxy hop.
+                    response_kwargs["extra_headers"] = {
+                        **(response_kwargs.get("extra_headers") or {}),
+                        ANTHROPIC_PROMPT_CACHE_OPT_OUT_HEADER: "1",
+                    }
             # Only set custom_llm_provider if it's not None
             if custom_llm_provider is not None:
                 response_kwargs["custom_llm_provider"] = custom_llm_provider

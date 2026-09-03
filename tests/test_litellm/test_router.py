@@ -1041,19 +1041,21 @@ async def test_router_v1_messages_fallbacks():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("request_kwargs", "expected_cache_control"),
+    ("request_kwargs", "expected_cache_control", "expected_forward_header"),
     [
-        ({}, {"type": "ephemeral"}),
-        ({"cache_control": None}, None),
-        ({"_litellm_disable_cache_control": True}, None),
+        ({}, {"type": "ephemeral"}, False),
+        ({"cache_control": None}, None, True),
+        ({"_litellm_disable_cache_control": "forward"}, None, True),
+        ({"_litellm_disable_cache_control": "consume"}, None, False),
         (
             {"cache_control": {"type": "ephemeral", "ttl": "1h"}},
             {"type": "ephemeral", "ttl": "1h"},
+            False,
         ),
     ],
 )
 async def test_router_anthropic_cache_control_default_and_override(
-    request_kwargs, expected_cache_control
+    request_kwargs, expected_cache_control, expected_forward_header
 ):
     router = litellm.Router(
         model_list=[
@@ -1086,6 +1088,12 @@ async def test_router_anthropic_cache_control_default_and_override(
             anthropic_messages.call_args.kwargs["cache_control"]
             == expected_cache_control
         )
+    assert (
+        anthropic_messages.call_args.kwargs.get("extra_headers", {}).get(
+            "x-litellm-disable-prompt-cache"
+        )
+        == ("1" if expected_forward_header else None)
+    )
 
 
 def test_add_invalid_provider_to_router():

@@ -272,6 +272,7 @@ MAX_IN_MEMORY_QUEUE_FLUSH_COUNT = int(os.getenv("MAX_IN_MEMORY_QUEUE_FLUSH_COUNT
 MINIMUM_PROMPT_CACHE_TOKEN_COUNT = int(
     os.getenv("MINIMUM_PROMPT_CACHE_TOKEN_COUNT", 1024)
 )  # minimum number of tokens to cache a prompt by Anthropic
+ANTHROPIC_PROMPT_CACHE_OPT_OUT_HEADER = "x-litellm-disable-prompt-cache"
 DEFAULT_TRIM_RATIO = float(
     os.getenv("DEFAULT_TRIM_RATIO", 0.75)
 )  # default ratio of tokens to trim from the end of a prompt
