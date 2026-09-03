@@ -320,6 +320,10 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                 responses_api_request["tool_choice"] = (  # type: ignore[assignment]
                     self._normalize_tool_choice_for_responses_api(value)
                 )
+            elif key == "prompt_cache_options":
+                responses_api_request.setdefault("extra_body", {})[  # type: ignore[typeddict-item]
+                    "prompt_cache_options"
+                ] = value
             elif key in ResponsesAPIOptionalRequestParams.__annotations__.keys():
                 responses_api_request[key] = value  # type: ignore
             elif key == "previous_response_id":

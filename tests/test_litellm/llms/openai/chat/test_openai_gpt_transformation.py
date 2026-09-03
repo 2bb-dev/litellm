@@ -346,7 +346,7 @@ class TestPromptCacheKeyIntegration:
 
 
 class TestPromptCacheParams:
-    """Tests for prompt_cache_key and prompt_cache_retention support."""
+    """Tests for OpenAI prompt cache parameters."""
 
     def setup_method(self):
         self.config = OpenAIGPTConfig()
@@ -361,19 +361,29 @@ class TestPromptCacheParams:
         supported_params = self.config.get_supported_openai_params("gpt-4o")
         assert "prompt_cache_retention" in supported_params
 
+    def test_prompt_cache_options_in_supported_params(self):
+        supported_params = self.config.get_supported_openai_params("gpt-5.6")
+        assert "prompt_cache_options" in supported_params
+
     def test_prompt_cache_params_passed_through(self):
         """Test that prompt_cache_key and prompt_cache_retention are passed through by map_openai_params."""
         optional_params = self.config.map_openai_params(
             non_default_params={
                 "prompt_cache_key": "my-cache-key",
                 "prompt_cache_retention": "24h",
+                "prompt_cache_options": {"mode": "implicit", "ttl": "30m"},
             },
-            optional_params={},
+            optional_params={
+                "extra_body": {"prompt_cache_options": {"mode": "explicit"}}
+            },
             model="gpt-4o",
             drop_params=False,
         )
         assert optional_params.get("prompt_cache_key") == "my-cache-key"
         assert optional_params.get("prompt_cache_retention") == "24h"
+        assert optional_params.get("extra_body") == {
+            "prompt_cache_options": {"mode": "implicit", "ttl": "30m"}
+        }
 
 
 class TestGPT5ReasoningEffortPreservation:
