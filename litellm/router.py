@@ -4257,6 +4257,8 @@ class Router:
         Helper function to make a generic LLM API call through the router, this allows you to use retries/fallbacks with litellm router
         """
         try:
+            if "cache_control" in kwargs and kwargs["cache_control"] is None:
+                kwargs["_litellm_disable_cache_control"] = True
             kwargs["model"] = model
             kwargs["original_generic_function"] = original_function
             kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
@@ -4312,6 +4314,7 @@ class Router:
         """
 
         passthrough_on_no_deployment = kwargs.pop("passthrough_on_no_deployment", False)
+        disable_cache_control = kwargs.pop("_litellm_disable_cache_control", False)
         function_name = "_ageneric_api_call_with_fallbacks"
         try:
             parent_otel_span = _get_parent_otel_span_from_kwargs(kwargs)
@@ -4354,6 +4357,8 @@ class Router:
                 **kwargs,
                 "model": model_name,
             }
+            if disable_cache_control:
+                response_kwargs.pop("cache_control", None)
             # Only set custom_llm_provider if it's not None
             if custom_llm_provider is not None:
                 response_kwargs["custom_llm_provider"] = custom_llm_provider
