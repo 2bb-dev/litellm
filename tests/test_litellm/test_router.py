@@ -1045,6 +1045,7 @@ async def test_router_v1_messages_fallbacks():
     [
         ({}, {"type": "ephemeral"}),
         ({"cache_control": None}, None),
+        ({"_litellm_disable_cache_control": True}, None),
         (
             {"cache_control": {"type": "ephemeral", "ttl": "1h"}},
             {"type": "ephemeral", "ttl": "1h"},

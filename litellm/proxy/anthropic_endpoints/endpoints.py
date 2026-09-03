@@ -23,6 +23,14 @@ from litellm.types.utils import TokenCountResponse
 
 router = APIRouter()
 
+_DISABLE_CACHE_CONTROL_MARKER = "_litellm_disable_cache_control"
+
+
+def _mark_explicit_cache_control_opt_out(data: Dict[str, Any]) -> None:
+    data.pop(_DISABLE_CACHE_CONTROL_MARKER, None)
+    if "cache_control" in data and data["cache_control"] is None:
+        data[_DISABLE_CACHE_CONTROL_MARKER] = True
+
 
 def _strip_total_tokens_from_anthropic_response(response: Any) -> None:
     """Remove the OpenAI-flavored `usage.total_tokens` field that LiteLLM
@@ -87,6 +95,7 @@ async def anthropic_response(
     )
 
     data = await _read_request_body(request=request)
+    _mark_explicit_cache_control_opt_out(data)
     base_llm_response_processor = ProxyBaseLLMRequestProcessing(data=data)
     try:
         result = await base_llm_response_processor.base_process_llm_request(
