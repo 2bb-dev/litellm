@@ -556,15 +556,20 @@ class LiteLLMAnthropicMessagesAdapter:
                                     type="thinking",
                                     thinking=content.get("thinking") or "",
                                     signature=content.get("signature") or "",
-                                    cache_control=content.get("cache_control", {}),
                                 )
+                                # Anthropic rejects `cache_control` on thinking blocks
+                                # ("Extra inputs are not permitted"), so only forward
+                                # one the client explicitly sent; never add an empty one.
+                                if content.get("cache_control"):
+                                    thinking_block["cache_control"] = content["cache_control"]
                                 thinking_blocks.append(thinking_block)
                             elif content.get("type") == "redacted_thinking":
                                 redacted_thinking_block = ChatCompletionRedactedThinkingBlock(
                                     type="redacted_thinking",
                                     data=content.get("data") or "",
-                                    cache_control=content.get("cache_control", {}),
                                 )
+                                if content.get("cache_control"):
+                                    redacted_thinking_block["cache_control"] = content["cache_control"]
                                 thinking_blocks.append(redacted_thinking_block)
 
             if (
@@ -1400,13 +1405,14 @@ class LiteLLMAnthropicMessagesAdapter:
                         assert isinstance(thinking, str)
                         assert isinstance(signature, str)
 
-                        if thinking and signature:
-                            raise ValueError(
-                                "Both `thinking` and `signature` in a single streaming chunk isn't supported."
-                            )
-
+                        # The synthesized content_block_start must be empty: the
+                        # triggering chunk is re-emitted as the block's first delta
+                        # (see AnthropicStreamWrapper), so carrying the text here
+                        # duplicated the first thinking token. A chunk may also carry
+                        # both thinking and signature (an Anthropic-backed upstream
+                        # closes the thought that way); that is not an error.
                         return "thinking", ChatCompletionThinkingBlock(
-                            type="thinking", thinking=thinking, signature=signature
+                            type="thinking", thinking="", signature=""
                         )
             # OpenAI-compatible reasoning backends (e.g. vLLM/SGLang reasoning
             # parsers) populate ``reasoning_content`` without ``thinking_blocks``.
@@ -1460,17 +1466,18 @@ class LiteLLMAnthropicMessagesAdapter:
                 if choice.delta.reasoning_content is not None:
                     reasoning_content += choice.delta.reasoning_content
 
-        if reasoning_content and reasoning_signature:
-            raise ValueError("Both `reasoning` and `signature` in a single streaming chunk isn't supported.")
-
+        # Anthropic-backed upstreams (e.g. another LiteLLM proxy) emit the closing
+        # thinking chunk with the accumulated thinking text AND the signature. The
+        # text was already streamed delta by delta, so only the signature is new;
+        # emitting it as a thinking_delta would duplicate the whole thought.
         if partial_json is not None:
             return "input_json_delta", ContentJsonBlockDelta(type="input_json_delta", partial_json=partial_json)
-        elif reasoning_content:
-            return "thinking_delta", ContentThinkingBlockDelta(type="thinking_delta", thinking=reasoning_content)
         elif reasoning_signature:
             return "signature_delta", ContentThinkingSignatureBlockDelta(
                 type="signature_delta", signature=reasoning_signature
             )
+        elif reasoning_content:
+            return "thinking_delta", ContentThinkingBlockDelta(type="thinking_delta", thinking=reasoning_content)
         else:
             return "text_delta", ContentTextBlockDelta(type="text_delta", text=text)
 
