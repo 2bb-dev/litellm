@@ -4260,6 +4260,13 @@ class Router:
         try:
             if "cache_control" in kwargs and kwargs["cache_control"] is None:
                 kwargs["_litellm_disable_cache_control"] = "forward"
+            elif "cache_control" not in kwargs and any(
+                self._contains_cache_control(kwargs.get(field))
+                for field in ("tools", "system", "messages")
+            ):
+                # Explicit Anthropic breakpoints are the caller's cache policy.
+                # Do not add the deployment's automatic breakpoint on top.
+                kwargs["_litellm_disable_cache_control"] = "consume"
             kwargs["model"] = model
             kwargs["original_generic_function"] = original_function
             kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
@@ -4279,6 +4286,16 @@ class Router:
                 )
             )
             raise e
+
+    @staticmethod
+    def _contains_cache_control(value: Any) -> bool:
+        if isinstance(value, dict):
+            if value.get("cache_control") is not None:
+                return True
+            return any(Router._contains_cache_control(item) for item in value.values())
+        if isinstance(value, list):
+            return any(Router._contains_cache_control(item) for item in value)
+        return False
 
     def _add_deployment_model_to_endpoint_for_llm_passthrough_route(
         self, kwargs: Dict[str, Any], model: str, model_name: str

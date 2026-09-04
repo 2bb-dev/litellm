@@ -1052,6 +1052,19 @@ async def test_router_v1_messages_fallbacks():
             {"type": "ephemeral", "ttl": "1h"},
             False,
         ),
+        (
+            {
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "input_schema": {"type": "object"},
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            },
+            None,
+            False,
+        ),
     ],
 )
 async def test_router_anthropic_cache_control_default_and_override(
