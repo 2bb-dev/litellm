@@ -353,10 +353,7 @@ class TestChatGPTResponsesAPITransformation:
             "function": {"name": "hello"},
         }
         assert request["prompt_cache_key"] == "agent:operator:thread-1"
-        assert request["prompt_cache_options"] == {
-            "mode": "implicit",
-            "ttl": "30m",
-        }
+        assert "prompt_cache_options" not in request
         assert "extra_body" not in request
         assert "prompt_cache_retention" not in request
         assert request["store"] is False
