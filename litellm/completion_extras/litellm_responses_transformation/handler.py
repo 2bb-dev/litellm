@@ -38,6 +38,27 @@ class ResponsesToCompletionBridgeHandler:
         return bool(stream)
 
     @staticmethod
+    def _provider_optional_params(optional_params: dict, custom_llm_provider: str) -> dict:
+        if custom_llm_provider != "chatgpt":
+            return optional_params
+
+        extra_body = optional_params.get("extra_body")
+        has_nested_options = isinstance(extra_body, dict) and "prompt_cache_options" in extra_body
+        if "prompt_cache_options" not in optional_params and not has_nested_options:
+            return optional_params
+
+        filtered = dict(optional_params)
+        filtered.pop("prompt_cache_options", None)
+        if has_nested_options:
+            filtered_extra_body = dict(extra_body)
+            filtered_extra_body.pop("prompt_cache_options", None)
+            if filtered_extra_body:
+                filtered["extra_body"] = filtered_extra_body
+            else:
+                filtered.pop("extra_body", None)
+        return filtered
+
+    @staticmethod
     def _is_preformatted_cached_chat_stream(result: Any) -> bool:
         from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 
@@ -168,6 +189,7 @@ class ResponsesToCompletionBridgeHandler:
         custom_llm_provider = validated_kwargs["custom_llm_provider"]
         if kwargs.get("stream") is True and "stream" not in optional_params:
             optional_params = {**optional_params, "stream": True}
+        optional_params = self._provider_optional_params(optional_params, custom_llm_provider)
 
         request_data = self.transformation_handler.transform_request(
             model=model,
@@ -256,6 +278,7 @@ class ResponsesToCompletionBridgeHandler:
         custom_llm_provider = validated_kwargs["custom_llm_provider"]
         if kwargs.get("stream") is True and "stream" not in optional_params:
             optional_params = {**optional_params, "stream": True}
+        optional_params = self._provider_optional_params(optional_params, custom_llm_provider)
 
         try:
             request_data = self.transformation_handler.transform_request(
