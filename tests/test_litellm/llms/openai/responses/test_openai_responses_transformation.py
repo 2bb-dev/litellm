@@ -44,6 +44,25 @@ class TestOpenAIResponsesAPIConfig:
         # The function should return the params unchanged
         assert result == test_params
 
+    def test_prompt_cache_options_use_extra_body_and_override_nested_value(self):
+        result = self.config.map_openai_params(
+            response_api_optional_params={
+                "extra_body": {
+                    "prompt_cache_options": {"mode": "explicit"},
+                    "custom": "value",
+                },
+                "prompt_cache_options": {"mode": "implicit", "ttl": "30m"},
+            },
+            model="gpt-5.6",
+            drop_params=False,
+        )
+
+        assert result["extra_body"] == {
+            "custom": "value",
+            "prompt_cache_options": {"mode": "implicit", "ttl": "30m"},
+        }
+        assert "prompt_cache_options" not in result
+
     def validate_responses_api_request_params(self, params, expected_fields):
         """
         Validate that the params dict has the expected structure of ResponsesAPIRequestParams

@@ -168,6 +168,7 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
             "safety_identifier",
             "prompt_cache_key",
             "prompt_cache_retention",
+            "prompt_cache_options",
             "store",
         ]  # works across all models
 
@@ -206,7 +207,13 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
         supported_openai_params = self.get_supported_openai_params(model)
         for param, value in non_default_params.items():
             if param in supported_openai_params:
-                optional_params[param] = value
+                if param == "prompt_cache_options":
+                    optional_params["extra_body"] = {
+                        **(optional_params.get("extra_body") or {}),
+                        "prompt_cache_options": value,
+                    }
+                else:
+                    optional_params[param] = value
         return optional_params
 
     def map_openai_params(

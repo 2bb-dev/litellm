@@ -55,6 +55,7 @@ from litellm.caching.caching import (
     RedisClusterCache,
 )
 from litellm.constants import (
+    ANTHROPIC_PROMPT_CACHE_OPT_OUT_HEADER,
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_HEALTH_CHECK_STALENESS_MULTIPLIER,
     DEFAULT_MAX_LRU_CACHE_SIZE,
@@ -4257,6 +4258,15 @@ class Router:
         Helper function to make a generic LLM API call through the router, this allows you to use retries/fallbacks with litellm router
         """
         try:
+            if "cache_control" in kwargs and kwargs["cache_control"] is None:
+                kwargs["_litellm_disable_cache_control"] = "forward"
+            elif "cache_control" not in kwargs and any(
+                self._contains_cache_control(kwargs.get(field))
+                for field in ("tools", "system", "messages")
+            ):
+                # Explicit Anthropic breakpoints are the caller's cache policy.
+                # Do not add the deployment's automatic breakpoint on top.
+                kwargs["_litellm_disable_cache_control"] = "consume"
             kwargs["model"] = model
             kwargs["original_generic_function"] = original_function
             kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
@@ -4276,6 +4286,16 @@ class Router:
                 )
             )
             raise e
+
+    @staticmethod
+    def _contains_cache_control(value: Any) -> bool:
+        if isinstance(value, dict):
+            if value.get("cache_control") is not None:
+                return True
+            return any(Router._contains_cache_control(item) for item in value.values())
+        if isinstance(value, list):
+            return any(Router._contains_cache_control(item) for item in value)
+        return False
 
     def _add_deployment_model_to_endpoint_for_llm_passthrough_route(
         self, kwargs: Dict[str, Any], model: str, model_name: str
@@ -4312,6 +4332,7 @@ class Router:
         """
 
         passthrough_on_no_deployment = kwargs.pop("passthrough_on_no_deployment", False)
+        disable_cache_control = kwargs.pop("_litellm_disable_cache_control", None)
         function_name = "_ageneric_api_call_with_fallbacks"
         try:
             parent_otel_span = _get_parent_otel_span_from_kwargs(kwargs)
@@ -4354,6 +4375,14 @@ class Router:
                 **kwargs,
                 "model": model_name,
             }
+            if disable_cache_control:
+                response_kwargs.pop("cache_control", None)
+                if disable_cache_control == "forward":
+                    # Carry an explicit opt-out across one LiteLLM proxy hop.
+                    response_kwargs["extra_headers"] = {
+                        **(response_kwargs.get("extra_headers") or {}),
+                        ANTHROPIC_PROMPT_CACHE_OPT_OUT_HEADER: "1",
+                    }
             # Only set custom_llm_provider if it's not None
             if custom_llm_provider is not None:
                 response_kwargs["custom_llm_provider"] = custom_llm_provider

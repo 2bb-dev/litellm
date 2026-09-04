@@ -12,6 +12,27 @@ from fastapi.testclient import TestClient
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 
 
+@pytest.mark.parametrize(
+    ("data", "headers", "marker"),
+    [
+        ({}, {}, None),
+        ({"cache_control": {"type": "ephemeral"}}, {}, None),
+        ({"cache_control": None}, {}, "forward"),
+        ({}, {"x-litellm-disable-prompt-cache": "1"}, "consume"),
+        ({"cache_control": None}, {"x-litellm-disable-prompt-cache": "1"}, "forward"),
+        ({"_litellm_disable_cache_control": "forward"}, {}, None),
+    ],
+)
+def test_marks_explicit_cache_control_opt_out(data, headers, marker):
+    from litellm.proxy.anthropic_endpoints.endpoints import (
+        _mark_explicit_cache_control_opt_out,
+    )
+
+    _mark_explicit_cache_control_opt_out(data, headers)
+
+    assert data.get("_litellm_disable_cache_control") == marker
+
+
 class TestAnthropicEndpoints(unittest.TestCase):
     @patch("litellm.litellm_core_utils.safe_json_dumps.safe_dumps")
     @pytest.mark.asyncio

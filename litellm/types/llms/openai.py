@@ -1142,6 +1142,11 @@ class ContextManagementEntry(TypedDict, total=False):
     """Token threshold at which compaction is triggered for this entry. Minimum 1000."""
 
 
+class PromptCacheOptions(TypedDict, total=False):
+    mode: Literal["implicit", "explicit"]
+    ttl: Literal["30m"]
+
+
 class ResponsesAPIOptionalRequestParams(TypedDict, total=False):
     """TypedDict for Optional parameters supported by the responses API."""
 
@@ -1168,6 +1173,7 @@ class ResponsesAPIOptionalRequestParams(TypedDict, total=False):
     max_tool_calls: Optional[int]
     prompt_cache_key: Optional[str]
     prompt_cache_retention: Optional[str]
+    prompt_cache_options: Optional[PromptCacheOptions]
     stream_options: Optional[dict]
     top_logprobs: Optional[int]
     partial_images: Optional[int]  # Number of partial images to generate (1-3) for streaming image generation

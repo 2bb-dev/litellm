@@ -2021,7 +2021,11 @@ class TestPromptCacheParams:
             for name, parameter in inspect.signature(func).parameters.items()
             if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
         ]
-        assert positional[-2:] == ["prompt_cache_key", "prompt_cache_retention"]
+        assert positional[-3:] == [
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "prompt_cache_options",
+        ]
 
     def test_completion_forwards_params_to_provider_request(self):
         mock_client = _mock_openai_client_for_chat()
@@ -2031,6 +2035,7 @@ class TestPromptCacheParams:
             messages=[{"role": "user", "content": "hi"}],
             prompt_cache_key="conversation-123",
             prompt_cache_retention="24h",
+            prompt_cache_options={"mode": "implicit", "ttl": "30m"},
             api_key="sk-test",
             client=mock_client,
         )
@@ -2038,6 +2043,9 @@ class TestPromptCacheParams:
         create_kwargs = mock_client.chat.completions.with_raw_response.create.call_args.kwargs
         assert create_kwargs.get("prompt_cache_key") == "conversation-123"
         assert create_kwargs.get("prompt_cache_retention") == "24h"
+        assert create_kwargs.get("extra_body") == {
+            "prompt_cache_options": {"mode": "implicit", "ttl": "30m"}
+        }
 
     def test_completion_omits_params_when_not_requested(self):
         mock_client = _mock_openai_client_for_chat()
@@ -2052,6 +2060,37 @@ class TestPromptCacheParams:
         create_kwargs = mock_client.chat.completions.with_raw_response.create.call_args.kwargs
         assert "prompt_cache_key" not in create_kwargs
         assert "prompt_cache_retention" not in create_kwargs
+        assert "prompt_cache_options" not in create_kwargs.get("extra_body", {})
+
+    @pytest.mark.parametrize(
+        ("request_value", "expected"),
+        [
+            ({"mode": "explicit"}, {"mode": "explicit"}),
+            (None, None),
+        ],
+    )
+    def test_router_prompt_cache_default_yields_to_caller(self, request_value, expected):
+        router = litellm.Router(
+            model_list=[
+                {
+                    "model_name": "openai/gpt-5.6-terra",
+                    "litellm_params": {
+                        "model": "openai/gpt-5.6-terra",
+                        "api_key": "sk-test",
+                        "prompt_cache_options": {"mode": "implicit", "ttl": "30m"},
+                    },
+                }
+            ]
+        )
+
+        with patch("litellm.completion", return_value=litellm.ModelResponse()) as completion:
+            router.completion(
+                model="openai/gpt-5.6-terra",
+                messages=[{"role": "user", "content": "hi"}],
+                prompt_cache_options=request_value,
+            )
+
+        assert completion.call_args.kwargs["prompt_cache_options"] == expected
 
     def test_responses_bridge_carries_prompt_cache_key(self):
         """ChatGPT subscription routes reach the provider through the
@@ -2064,9 +2103,14 @@ class TestPromptCacheParams:
             model="chatgpt/gpt-5.4",
             custom_llm_provider="litellm_proxy",
             prompt_cache_key="conversation-123",
+            prompt_cache_options={"mode": "implicit", "ttl": "30m"},
             drop_params=True,
         )
         assert optional_params.get("prompt_cache_key") == "conversation-123"
+        assert optional_params.get("prompt_cache_options") == {
+            "mode": "implicit",
+            "ttl": "30m",
+        }
 
         request = LiteLLMResponsesTransformationHandler().transform_request(
             model="chatgpt/gpt-5.4",
@@ -2077,3 +2121,6 @@ class TestPromptCacheParams:
             litellm_logging_obj=MagicMock(),
         )
         assert request.get("prompt_cache_key") == "conversation-123"
+        assert request.get("extra_body") == {
+            "prompt_cache_options": {"mode": "implicit", "ttl": "30m"}
+        }

@@ -2,12 +2,16 @@
 Unified /v1/messages endpoint - (Anthropic Spec)
 """
 
+from collections.abc import Mapping
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.anthropic_interface.exceptions import AnthropicExceptionMapping
+from litellm.constants import ANTHROPIC_PROMPT_CACHE_OPT_OUT_HEADER
 from litellm.integrations.custom_guardrail import ModifyResponseException
 from litellm.llms.anthropic.experimental_pass_through.context_management import (
     AnthropicContextManagementError,
@@ -22,6 +26,21 @@ from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
 from litellm.types.utils import TokenCountResponse
 
 router = APIRouter()
+
+_DISABLE_CACHE_CONTROL_MARKER = "_litellm_disable_cache_control"
+
+
+def _mark_explicit_cache_control_opt_out(
+    data: Dict[str, Any], request_headers: Optional[Mapping[str, str]] = None
+) -> None:
+    data.pop(_DISABLE_CACHE_CONTROL_MARKER, None)
+    if "cache_control" in data and data["cache_control"] is None:
+        data[_DISABLE_CACHE_CONTROL_MARKER] = "forward"
+    elif (
+        request_headers
+        and request_headers.get(ANTHROPIC_PROMPT_CACHE_OPT_OUT_HEADER) == "1"
+    ):
+        data[_DISABLE_CACHE_CONTROL_MARKER] = "consume"
 
 
 def _strip_total_tokens_from_anthropic_response(response: Any) -> None:
@@ -87,6 +106,7 @@ async def anthropic_response(
     )
 
     data = await _read_request_body(request=request)
+    _mark_explicit_cache_control_opt_out(data, request.headers)
     base_llm_response_processor = ProxyBaseLLMRequestProcessing(data=data)
     try:
         result = await base_llm_response_processor.base_process_llm_request(

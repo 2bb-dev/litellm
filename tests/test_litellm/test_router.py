@@ -1039,6 +1039,76 @@ async def test_router_v1_messages_fallbacks():
     assert result["content"][0]["text"] == "Hello, world I am a fallback!"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_kwargs", "expected_cache_control", "expected_forward_header"),
+    [
+        ({}, {"type": "ephemeral"}, False),
+        ({"cache_control": None}, None, True),
+        ({"_litellm_disable_cache_control": "forward"}, None, True),
+        ({"_litellm_disable_cache_control": "consume"}, None, False),
+        (
+            {"cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            {"type": "ephemeral", "ttl": "1h"},
+            False,
+        ),
+        (
+            {
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "input_schema": {"type": "object"},
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            },
+            None,
+            False,
+        ),
+    ],
+)
+async def test_router_anthropic_cache_control_default_and_override(
+    request_kwargs, expected_cache_control, expected_forward_header
+):
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "claude",
+                "litellm_params": {
+                    "model": "anthropic/claude-haiku-4-5-20251001",
+                    "api_key": "test-key",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            }
+        ]
+    )
+    anthropic_messages = AsyncMock(return_value={"content": []})
+    router.aanthropic_messages = router.factory_function(
+        anthropic_messages, call_type="anthropic_messages"
+    )
+
+    await router.aanthropic_messages(
+        model="claude",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=1,
+        **request_kwargs,
+    )
+
+    if expected_cache_control is None:
+        assert "cache_control" not in anthropic_messages.call_args.kwargs
+    else:
+        assert (
+            anthropic_messages.call_args.kwargs["cache_control"]
+            == expected_cache_control
+        )
+    assert (
+        anthropic_messages.call_args.kwargs.get("extra_headers", {}).get(
+            "x-litellm-disable-prompt-cache"
+        )
+        == ("1" if expected_forward_header else None)
+    )
+
+
 def test_add_invalid_provider_to_router():
     """
     Test that router.add_deployment raises an error if the provider is invalid

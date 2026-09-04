@@ -91,6 +91,12 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         Apply the same validation used by the chat completions path.
         """
         params = dict(response_api_optional_params)
+        prompt_cache_options = params.pop("prompt_cache_options", None)
+        if prompt_cache_options is not None:
+            params["extra_body"] = {
+                **(params.get("extra_body") or {}),
+                "prompt_cache_options": prompt_cache_options,
+            }
 
         if self._is_gpt_5_model(model=model):
             temperature = params.get("temperature")

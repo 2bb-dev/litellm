@@ -274,6 +274,7 @@ from .types.llms.openai import (
     HttpxBinaryResponseContent,
     OpenAIModerationResponse,
     OpenAIWebSearchOptions,
+    PromptCacheOptions,
 )
 from .types.utils import (
     AdapterCompletionStreamWrapper,
@@ -449,6 +450,7 @@ async def acompletion(
     enable_json_schema_validation: Optional[bool] = None,
     prompt_cache_key: Optional[str] = None,
     prompt_cache_retention: Optional[str] = None,
+    prompt_cache_options: Optional[PromptCacheOptions] = None,
     **kwargs,
 ) -> Union[ModelResponse, CustomStreamWrapper]:
     """
@@ -586,6 +588,7 @@ async def acompletion(
         "service_tier": service_tier,
         "prompt_cache_key": prompt_cache_key,
         "prompt_cache_retention": prompt_cache_retention,
+        "prompt_cache_options": prompt_cache_options,
         "extra_headers": extra_headers,
         "acompletion": True,  # assuming this is a required parameter
         "thinking": thinking,
@@ -4758,6 +4761,7 @@ def completion(  # type: ignore
     enable_json_schema_validation: Optional[bool] = None,
     prompt_cache_key: Optional[str] = None,
     prompt_cache_retention: Optional[str] = None,
+    prompt_cache_options: Optional[PromptCacheOptions] = None,
     **kwargs,
 ) -> Union[ModelResponse, CustomStreamWrapper]:
     """
@@ -4874,6 +4878,7 @@ def completion(  # type: ignore
                 service_tier=service_tier,
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
+                prompt_cache_options=prompt_cache_options,
                 base_url=base_url,
                 api_version=api_version,
                 api_key=api_key,
@@ -5171,6 +5176,7 @@ def completion(  # type: ignore
             "service_tier": service_tier,
             "prompt_cache_key": prompt_cache_key,
             "prompt_cache_retention": prompt_cache_retention,
+            "prompt_cache_options": prompt_cache_options,
             "allowed_openai_params": kwargs.get("allowed_openai_params"),
             "base_model": base_model,
         }

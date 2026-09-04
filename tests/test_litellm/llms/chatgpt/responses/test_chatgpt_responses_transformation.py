@@ -327,6 +327,7 @@ class TestChatGPTResponsesAPITransformation:
                 "tools": [{"type": "function", "function": {"name": "hello"}}],
                 "tool_choice": {"type": "function", "function": {"name": "hello"}},
                 "prompt_cache_key": "agent:operator:thread-1",
+                "prompt_cache_options": {"mode": "implicit", "ttl": "30m"},
                 # unsupported by ChatGPT Codex
                 "prompt_cache_retention": "24h",
                 "store": False,
@@ -352,6 +353,9 @@ class TestChatGPTResponsesAPITransformation:
             "function": {"name": "hello"},
         }
         assert request["prompt_cache_key"] == "agent:operator:thread-1"
+        assert request["extra_body"] == {
+            "prompt_cache_options": {"mode": "implicit", "ttl": "30m"}
+        }
         assert "prompt_cache_retention" not in request
         assert request["store"] is False
 
