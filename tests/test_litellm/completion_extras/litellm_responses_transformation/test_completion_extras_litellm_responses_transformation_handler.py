@@ -15,6 +15,55 @@ from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.types.utils import ModelResponse
 
 
+def test_chatgpt_bridge_drops_unsupported_prompt_cache_options():
+    optional_params = {
+        "prompt_cache_key": "conversation-123",
+        "extra_body": {
+            "prompt_cache_options": {"mode": "implicit", "ttl": "30m"},
+            "supported_field": "kept",
+        },
+    }
+
+    filtered = ResponsesToCompletionBridgeHandler._provider_optional_params(
+        optional_params, "chatgpt"
+    )
+
+    assert filtered == {
+        "prompt_cache_key": "conversation-123",
+        "extra_body": {"supported_field": "kept"},
+    }
+    assert "prompt_cache_options" in optional_params["extra_body"]
+
+
+def test_chatgpt_bridge_drops_direct_prompt_cache_options():
+    optional_params = {
+        "prompt_cache_key": "conversation-123",
+        "prompt_cache_options": {"mode": "implicit", "ttl": "30m"},
+    }
+
+    filtered = ResponsesToCompletionBridgeHandler._provider_optional_params(
+        optional_params, "chatgpt"
+    )
+
+    assert filtered == {"prompt_cache_key": "conversation-123"}
+    assert "prompt_cache_options" in optional_params
+
+
+def test_openai_bridge_preserves_prompt_cache_options():
+    optional_params = {
+        "extra_body": {
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+        },
+    }
+
+    assert (
+        ResponsesToCompletionBridgeHandler._provider_optional_params(
+            optional_params, "openai"
+        )
+        is optional_params
+    )
+
+
 def test_is_preformatted_cached_chat_stream_true():
     stream = MagicMock(spec=CustomStreamWrapper)
     stream.custom_llm_provider = "cached_response"
