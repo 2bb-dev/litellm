@@ -163,9 +163,10 @@ def test_translate_streaming_openai_chunk_to_anthropic_thinking_content_block():
     )
 
     assert block_type == "thinking"
+    # The start block is empty; the trigger chunk is re-emitted as the first delta.
     assert content_block_start == {
         "type": "thinking",
-        "thinking": "I need to summar",
+        "thinking": "",
         "signature": "",
     }
 
@@ -252,11 +253,12 @@ def test_translate_streaming_openai_chunk_to_anthropic_thinking_signature_block(
     assert content_block_start == {
         "type": "thinking",
         "thinking": "",
-        "signature": "sigsig",
+        "signature": "",
     }
 
 
-def test_translate_streaming_openai_chunk_to_anthropic_raises_when_thinking_and_signature_content_block():
+def test_translate_streaming_openai_chunk_to_anthropic_thinking_and_signature_content_block():
+    """A closing chunk with both thinking and signature still classifies as a thinking block."""
     choices = [
         StreamingChoices(
             finish_reason=None,
@@ -289,10 +291,15 @@ def test_translate_streaming_openai_chunk_to_anthropic_raises_when_thinking_and_
         )
     ]
 
-    with pytest.raises(ValueError):
-        LiteLLMAnthropicMessagesAdapter()._translate_streaming_openai_chunk_to_anthropic_content_block(
-            choices=choices
-        )
+    (
+        block_type,
+        content_block_start,
+    ) = LiteLLMAnthropicMessagesAdapter()._translate_streaming_openai_chunk_to_anthropic_content_block(
+        choices=choices
+    )
+
+    assert block_type == "thinking"
+    assert content_block_start == {"type": "thinking", "thinking": "", "signature": ""}
 
 
 def test_translate_anthropic_messages_to_openai_thinking_blocks():
@@ -738,7 +745,8 @@ def test_translate_streaming_openai_chunk_to_anthropic_with_thinking():
     assert content_block_delta["signature"] == "sigsig"
 
 
-def test_translate_streaming_openai_chunk_to_anthropic_raises_when_thinking_and_signature():
+def test_translate_streaming_openai_chunk_to_anthropic_thinking_and_signature_emits_signature_delta():
+    """Anthropic-backed upstreams close a thought with the accumulated text plus the signature."""
     choices = [
         StreamingChoices(
             finish_reason=None,
@@ -771,10 +779,16 @@ def test_translate_streaming_openai_chunk_to_anthropic_raises_when_thinking_and_
         )
     ]
 
-    with pytest.raises(ValueError):
-        LiteLLMAnthropicMessagesAdapter()._translate_streaming_openai_chunk_to_anthropic(
-            choices=choices
-        )
+    (
+        type_of_content,
+        content_block_delta,
+    ) = LiteLLMAnthropicMessagesAdapter()._translate_streaming_openai_chunk_to_anthropic(
+        choices=choices
+    )
+
+    # The thinking text was already streamed delta by delta; only the signature is new.
+    assert type_of_content == "signature_delta"
+    assert content_block_delta == {"type": "signature_delta", "signature": "sigsig"}
 
 
 def test_translate_anthropic_messages_to_openai_user_message_with_base64_image():
