@@ -73,12 +73,6 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             litellm_params,
             headers,
         )
-        prompt_cache_options = request.pop("prompt_cache_options", None)
-        if prompt_cache_options is not None:
-            request["extra_body"] = {
-                **(request.get("extra_body") or {}),
-                "prompt_cache_options": prompt_cache_options,
-            }
         request_input = cast(Dict[str, object], request).get("input")
         if isinstance(request_input, str):
             request["input"] = [
@@ -127,7 +121,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             "reasoning",
             "previous_response_id",
             "prompt_cache_key",
-            "extra_body",
+            "prompt_cache_options",
             "truncation",
         }
 
