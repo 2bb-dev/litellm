@@ -176,6 +176,19 @@ class DBSpendUpdateWriter:
             if team_id is not None and team_id != "":
                 payload["team_id"] = team_id
 
+            from litellm.litellm_core_utils.request_content_mode import encryption_enabled
+
+            if encryption_enabled():
+                from litellm.proxy.spend_tracking.request_content_metadata import (
+                    failed_spend_payload,
+                    protect_spend_payload,
+                )
+
+                try:
+                    payload = protect_spend_payload(payload)
+                except Exception:
+                    payload = failed_spend_payload(payload)
+
             # One deepcopy shared by all 6 daily spend helpers (was 5, fixes agent bug)
             payload_copy = copy.deepcopy(payload)
 
@@ -210,12 +223,13 @@ class DBSpendUpdateWriter:
                 )
             )
 
-            self._enqueue_tool_registry_upsert(
-                kwargs=kwargs,
-                completion_response=completion_response,
-                hashed_token=hashed_token,
-                team_id=team_id,
-            )
+            if not encryption_enabled():
+                self._enqueue_tool_registry_upsert(
+                    kwargs=kwargs,
+                    completion_response=completion_response,
+                    hashed_token=hashed_token,
+                    team_id=team_id,
+                )
 
             verbose_proxy_logger.debug("Runs spend update on all tables")
         except Exception:

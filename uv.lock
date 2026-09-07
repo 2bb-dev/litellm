@@ -2746,6 +2746,18 @@ wheels = [
 ]
 
 [[package]]
+name = "joserfc"
+version = "1.7.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/19/94/80fea1514b7c6d7d37804d3fe9ca81455f633347fc98731bd71ffe1faa17/joserfc-1.7.5.tar.gz", hash = "sha256:d5ff536e658e17664f8c1b1ab60dc4aa62aa973fcef1edd33cc44bda45d6f5ea", size = 234990, upload-time = "2026-08-29T13:05:42.057Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/67/c5/82addfd375e5ee6520644e0553e4aadde92d668c4fc99cc716d337fe7bb3/joserfc-1.7.5-py3-none-any.whl", hash = "sha256:add2c2c84e8373b084d526a8b53daba5d7a513a118cd2dcd9fc9f979d0922159", size = 71269, upload-time = "2026-08-29T13:05:40.718Z" },
+]
+
+[[package]]
 name = "jsonlines"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3288,6 +3300,7 @@ proxy = [
     { name = "fastapi-sso" },
     { name = "granian" },
     { name = "gunicorn" },
+    { name = "joserfc" },
     { name = "litellm-proxy-extras" },
     { name = "mcp" },
     { name = "orjson" },
@@ -3461,6 +3474,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.0,<1.0" },
     { name = "importlib-metadata", specifier = ">=8.0.0,<9.0" },
     { name = "jinja2", specifier = ">=3.1.6,<4.0" },
+    { name = "joserfc", marker = "extra == 'proxy'", specifier = ">=1.6.0,<2.0" },
     { name = "jsonschema", specifier = ">=4.0.0,<5.0" },
     { name = "langfuse", marker = "extra == 'proxy-runtime'", specifier = ">=2.59.7,<3.0" },
     { name = "litellm-proxy-extras", marker = "extra == 'proxy'", editable = "litellm-proxy-extras" },
