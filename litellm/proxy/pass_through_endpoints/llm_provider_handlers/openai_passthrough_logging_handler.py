@@ -254,6 +254,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             model=model,
             custom_llm_provider=custom_llm_provider,
             call_type="responses",
+            litellm_logging_obj=logging_obj,
         )
         return litellm_model_response, response_cost
 
@@ -342,6 +343,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     completion_response=litellm_model_response,
                     model=model,
                     custom_llm_provider=custom_llm_provider,
+                    litellm_logging_obj=logging_obj,
+                    request_time=start_time,
                 )
             elif is_image_generation:
                 # Handle image generation cost calculation
@@ -563,6 +566,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 completion_response=complete_response,
                 model=model,
                 custom_llm_provider=custom_llm_provider,
+                litellm_logging_obj=litellm_logging_obj,
             )
 
             # Preserve existing litellm_params to maintain metadata tags

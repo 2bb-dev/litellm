@@ -112,6 +112,8 @@ class BasePassthroughLoggingHandler(ABC):
             response_cost = litellm.completion_cost(
                 completion_response=litellm_model_response,
                 model=model,
+                litellm_logging_obj=logging_obj,
+                request_time=start_time,
             )
 
             kwargs["response_cost"] = response_cost

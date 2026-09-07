@@ -1,7 +1,8 @@
 # What is this?
 ## Helper utilities for cost_per_token()
 
-from typing import Any, Literal, Optional, Tuple, TypedDict, cast
+from datetime import datetime, timezone
+from typing import Any, Literal, Optional, Tuple, TypedDict, Union, cast
 
 import litellm
 from litellm._logging import verbose_logger
@@ -258,7 +259,9 @@ def _get_token_base_cost(
                 # Handle both formats: _above_128k_tokens and _above_128_tokens
                 threshold_str = key.split("_above_")[1].split("_tokens")[0]
                 threshold = _parse_above_token_threshold(key)
-                if usage.prompt_tokens > threshold:
+                if usage.prompt_tokens > threshold or (
+                    model_info.get("pricing_tier_threshold_inclusive") is True and usage.prompt_tokens == threshold
+                ):
                     # Prefer a service_tier-specific above-threshold key when available,
                     # e.g. input_cost_per_token_priority_above_200k_tokens for Gemini
                     # ON_DEMAND_PRIORITY.  Falls back to the standard key automatically
@@ -661,12 +664,53 @@ def _get_regional_uplift_multiplier(model_info: ModelInfo, data_residency: Optio
         return 1.0
 
 
+def _resolve_token_pricing_period(model_info: ModelInfo, request_time: Optional[Union[datetime, float]]) -> ModelInfo:
+    """Resolve on a copy: cached registry entries must never depend on request time."""
+    periods = model_info.get("pricing_periods")
+    if not periods:
+        return model_info
+    instant = request_time if request_time is not None else datetime.now(timezone.utc)
+    if isinstance(instant, (int, float)):
+        instant = datetime.fromtimestamp(instant, timezone.utc)
+    # LiteLLM logging uses naive local datetimes; astimezone preserves that instant.
+    instant = instant.astimezone(timezone.utc)
+    selected = None
+    for period in periods:
+        bounds = []
+        for key in ("effective_from", "effective_until"):
+            value = period.get(key)
+            bound = datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+            if bound is not None and bound.tzinfo is None:
+                raise ValueError("Pricing period boundaries must include a timezone")
+            bounds.append(bound)
+        start, end = bounds
+        if start is not None and end is not None and start >= end:
+            raise ValueError("Pricing period effective_from must precede effective_until")
+        if (start is None or start <= instant) and (end is None or instant < end):
+            if selected is not None:
+                raise ValueError("Overlapping token pricing periods")
+            selected = period
+    if selected is None:
+        return model_info
+    resolved = model_info.copy()
+    for key in (
+        "input_cost_per_token",
+        "output_cost_per_token",
+        "cache_read_input_token_cost",
+        "cache_creation_input_token_cost",
+    ):
+        if key in selected:
+            resolved[key] = selected[key]  # type: ignore[literal-required]
+    return resolved
+
+
 def generic_cost_per_token(
     model: str,
     usage: Usage,
     custom_llm_provider: str,
     service_tier: Optional[str] = None,
     data_residency: Optional[str] = None,
+    request_time: Optional[Union[datetime, float]] = None,
 ) -> Tuple[float, float]:
     """
     Calculates the cost per token for a given model, prompt tokens, and completion tokens.
@@ -685,6 +729,7 @@ def generic_cost_per_token(
 
     ## GET MODEL INFO
     model_info = get_model_info(model=model, custom_llm_provider=custom_llm_provider)
+    model_info = _resolve_token_pricing_period(model_info, request_time)
 
     ## CALCULATE INPUT COST
     ### Cost of processing (non-cache hit + cache hit) + Cost of cache-writing (cache writing)

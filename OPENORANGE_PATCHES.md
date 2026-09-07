@@ -43,8 +43,43 @@ Upstream syncs must preserve these behaviors:
 6. Run the focused suites below, build the OSS image, and test it on an
    OpenOrange canary before advancing the parent repository's submodule SHA.
 
+## Effective Token Pricing
+
+For OpenAI-compatible and Z.ai chat/Responses accounting, `model_info` (or
+`litellm_params`) can declare `pricing_periods`. Keep the normal rates at the
+top level; each period overrides only its supplied input, output, cache-read,
+or cache-creation per-token rates. `effective_from` is inclusive and
+`effective_until` is exclusive; both accept timezone-qualified ISO 8601
+strings and can be omitted for an unbounded interval. Overlapping active
+periods and timezone-less boundaries are rejected by the generic calculator.
+
+```yaml
+input_cost_per_token: 0.00000015
+output_cost_per_token: 0.0000005
+cache_read_input_token_cost: 0.00000003
+pricing_periods:
+  - effective_until: "2026-09-09T16:00:00Z"
+    input_cost_per_token: 0.000000075
+    output_cost_per_token: 0.00000025
+    cache_read_input_token_cost: 0.000000015
+```
+
+Native accounting uses the logging object's request start, including when
+completion or streaming logging happens after expiry. Direct `completion_cost`,
+`cost_per_token`, and `generic_cost_per_token` calls accept a `request_time`
+datetime or Unix timestamp for historical calculations; without a logging
+object or explicit time they use the current time. Resolution never mutates
+the model registry.
+Other provider-specific calculators and non-token billing are not extended.
+
+`pricing_tier_threshold_inclusive: true` opts a deployment into inclusive
+generic token thresholds. For example, the existing `*_above_200k_tokens`
+input, output and cache-read fields then apply at 200000 tokens, not 200001.
+Without the flag, existing exclusive thresholds are unchanged.
+
 ## Focused Regression Suites
 
+- `tests/litellm/test_effective_token_pricing.py`
 - `tests/test_litellm/llms/chatgpt/chat/test_chatgpt_transformation.py`
 - `tests/test_litellm/llms/chatgpt/responses/test_chatgpt_responses_transformation.py`
 - `tests/test_litellm/llms/custom_httpx/test_llm_http_handler.py`

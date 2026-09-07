@@ -177,7 +177,20 @@ class AgenticLoopParams(TypedDict, total=False):
     """The LLM provider name (e.g., 'bedrock', 'anthropic')"""
 
 
+class TokenPricingPeriod(TypedDict, total=False):
+    """UTC effective interval [from, until); omitted bounds are unbounded."""
+
+    effective_from: str
+    effective_until: str
+    input_cost_per_token: float
+    output_cost_per_token: float
+    cache_read_input_token_cost: float
+    cache_creation_input_token_cost: float
+
+
 class ModelInfoBase(ProviderSpecificModelInfo, total=False):
+    pricing_periods: Optional[List[TokenPricingPeriod]]
+    pricing_tier_threshold_inclusive: Optional[bool]
     key: Required[str]  # the key in litellm.model_cost which is returned
 
     max_tokens: Required[Optional[int]]
@@ -2984,6 +2997,8 @@ class StandardCallbackDynamicParams(TypedDict, total=False):
 
 class CustomPricingLiteLLMParams(BaseModel):
     ## CUSTOM PRICING ##
+    pricing_periods: Optional[List[TokenPricingPeriod]] = None
+    pricing_tier_threshold_inclusive: Optional[bool] = None
     input_cost_per_token: Optional[float] = None
     output_cost_per_token: Optional[float] = None
     input_cost_per_second: Optional[float] = None

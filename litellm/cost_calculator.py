@@ -2,6 +2,7 @@
 ## File for 'response_cost' calculation in Logging
 import logging
 import time
+from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union, cast
 
@@ -321,6 +322,7 @@ def cost_per_token(
     response: Optional[Any] = None,
     ### REQUEST MODEL ###
     request_model: Optional[str] = None,  # original request model for router detection
+    request_time: Optional[Union[datetime, float]] = None,
 ) -> Tuple[float, float]:  # type: ignore
     """
     Calculates the cost per token for a given model, prompt tokens, and completion tokens.
@@ -608,6 +610,7 @@ def cost_per_token(
             usage=usage_block,
             service_tier=service_tier,
             data_residency=data_residency,
+            request_time=request_time,
         )
     elif custom_llm_provider == "databricks":
         return databricks_cost_per_token(model=model, usage=usage_block)
@@ -627,7 +630,7 @@ def cost_per_token(
     elif custom_llm_provider == "perplexity":
         return perplexity_cost_per_token(model=model, usage=usage_block)
     elif custom_llm_provider == "xai":
-        return xai_cost_per_token(model=model, usage=usage_block)
+        return xai_cost_per_token(model=model, usage=usage_block, request_time=request_time)
     elif custom_llm_provider == "lemonade":
         return lemonade_cost_per_token(model=model, usage=usage_block)
     elif custom_llm_provider == "dashscope":
@@ -654,6 +657,7 @@ def cost_per_token(
                 custom_llm_provider=custom_llm_provider,
                 service_tier=service_tier,
                 data_residency=data_residency,
+                request_time=request_time,
             )
 
         if model_info.get("input_cost_per_second", None) is not None and response_time_ms is not None:
@@ -1124,6 +1128,7 @@ def completion_cost(
     service_tier: Optional[str] = None,  # for OpenAI service tier pricing
     ### DATA RESIDENCY ###
     data_residency: Optional[str] = None,  # for OpenAI regional-processing uplift (e.g. "eu", "us")
+    request_time: Optional[Union[datetime, float]] = None,
 ) -> float:
     """
     Calculate the cost of a given completion call fot GPT-3.5-turbo, llama2, any litellm supported llm.
@@ -1533,6 +1538,8 @@ def completion_cost(
                 request_model_for_cost = None
                 if litellm_logging_obj is not None:
                     request_model_for_cost = litellm_logging_obj.model
+                    if request_time is None:
+                        request_time = litellm_logging_obj.start_time
 
                 (
                     prompt_tokens_cost_usd_dollar,
@@ -1558,6 +1565,7 @@ def completion_cost(
                     data_residency=data_residency,
                     response=completion_response,
                     request_model=request_model_for_cost,
+                    request_time=request_time,
                 )
 
                 # Get additional costs from provider (e.g., routing fees, infrastructure costs)
