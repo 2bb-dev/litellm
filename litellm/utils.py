@@ -4969,6 +4969,21 @@ def _get_model_info_from_model_cost(key: str) -> dict:
     return litellm.model_cost[key]
 
 
+def _is_custom_pricing_deployment(model: str) -> bool:
+    entry = litellm.model_cost.get(model, {})
+    return entry.get("id") == model and any(
+        entry.get(cost_field) is not None
+        for cost_field in (
+            "input_cost_per_token",
+            "output_cost_per_token",
+            "input_cost_per_second",
+            "output_cost_per_second",
+            "input_cost_per_character",
+            "output_cost_per_character",
+        )
+    )
+
+
 def _check_provider_match(model_info: dict, custom_llm_provider: Optional[str]) -> bool:
     """
     Check if the model info provider matches the custom provider.
@@ -5160,6 +5175,8 @@ def _get_model_info_helper(
         verbose_logger.debug(f"checking potential_model_names in litellm.model_cost: {potential_model_names}")
 
         combined_model_name = potential_model_names["combined_model_name"]
+        if _is_custom_pricing_deployment(model):
+            combined_model_name = model
         stripped_model_name = potential_model_names["stripped_model_name"]
         combined_stripped_model_name = potential_model_names["combined_stripped_model_name"]
         split_model = potential_model_names["split_model"]
@@ -5303,6 +5320,8 @@ def _get_model_info_helper(
                 key=key,
                 pricing_periods=_model_info.get("pricing_periods"),
                 pricing_tier_threshold_inclusive=_model_info.get("pricing_tier_threshold_inclusive"),
+                off_peak_pricing=_model_info.get("off_peak_pricing"),
+                minimum_billable_duration_seconds=_model_info.get("minimum_billable_duration_seconds"),
                 max_tokens=_model_info.get("max_tokens", None),
                 max_input_tokens=_model_info.get("max_input_tokens", None),
                 max_output_tokens=_model_info.get("max_output_tokens", None),
@@ -5312,6 +5331,9 @@ def _get_model_info_helper(
                 cache_creation_input_token_cost=_model_info.get("cache_creation_input_token_cost", None),
                 cache_creation_input_token_cost_above_200k_tokens=_model_info.get(
                     "cache_creation_input_token_cost_above_200k_tokens", None
+                ),
+                cache_creation_input_token_cost_above_272k_tokens=_model_info.get(
+                    "cache_creation_input_token_cost_above_272k_tokens", None
                 ),
                 cache_read_input_token_cost=_model_info.get("cache_read_input_token_cost", None),
                 cache_read_input_token_cost_above_200k_tokens=_model_info.get(

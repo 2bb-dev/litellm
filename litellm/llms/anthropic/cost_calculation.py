@@ -3,15 +3,14 @@ Helper util for handling anthropic-specific cost calculation
 - e.g.: prompt caching
 """
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from datetime import datetime
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 from pydantic import BaseModel, ValidationError
 
 from litellm.litellm_core_utils.llm_cost_calc.utils import (
-    _get_token_base_cost,
     _get_web_search_requests,
-    _parse_prompt_tokens_details,
-    calculate_cache_writing_cost,
+    calculate_cache_costs,
     generic_cost_per_token,
 )
 
@@ -20,7 +19,12 @@ if TYPE_CHECKING:
 import litellm
 
 
-def _compute_cache_only_cost(model_info: "ModelInfo", usage: "Usage", service_tier: str | None = None) -> float:
+def _compute_cache_only_cost(
+    model_info: "ModelInfo",
+    usage: "Usage",
+    service_tier: str | None = None,
+    request_time: Optional[Union[datetime, float]] = None,
+) -> float:
     """
     Return only the cache-related portion of the prompt cost (cache read + cache write).
 
@@ -31,32 +35,15 @@ def _compute_cache_only_cost(model_info: "ModelInfo", usage: "Usage", service_ti
     if usage.prompt_tokens_details is None:
         return 0.0
 
-    prompt_tokens_details = _parse_prompt_tokens_details(usage)
-    (
-        _,
-        _,
-        cache_creation_cost,
-        cache_creation_cost_above_1hr,
-        cache_read_cost,
-    ) = _get_token_base_cost(model_info=model_info, usage=usage, service_tier=service_tier)
-
-    cache_cost = float(prompt_tokens_details["cache_hit_tokens"]) * cache_read_cost
-
-    if (
-        prompt_tokens_details["cache_creation_tokens"]
-        or prompt_tokens_details["cache_creation_token_details"] is not None
-    ):
-        cache_cost += calculate_cache_writing_cost(
-            cache_creation_tokens=prompt_tokens_details["cache_creation_tokens"],
-            cache_creation_token_details=prompt_tokens_details["cache_creation_token_details"],
-            cache_creation_cost_above_1hr=cache_creation_cost_above_1hr,
-            cache_creation_cost=cache_creation_cost,
-        )
-
-    return cache_cost
+    return sum(calculate_cache_costs(model_info, usage, service_tier, request_time))
 
 
-def cost_per_token(model: str, usage: "Usage", service_tier: str | None = None) -> Tuple[float, float]:
+def cost_per_token(
+    model: str,
+    usage: "Usage",
+    service_tier: str | None = None,
+    request_time: Optional[Union[datetime, float]] = None,
+) -> Tuple[float, float]:
     """
     Calculates the cost per token for a given model, prompt tokens, and completion tokens.
 
@@ -74,6 +61,7 @@ def cost_per_token(model: str, usage: "Usage", service_tier: str | None = None) 
         usage=usage,
         custom_llm_provider="anthropic",
         service_tier=service_tier,
+        request_time=request_time,
     )
 
     # Apply provider_specific_entry multipliers for geo/speed routing
@@ -92,7 +80,12 @@ def cost_per_token(model: str, usage: "Usage", service_tier: str | None = None) 
             multiplier *= provider_specific_entry.get("fast", 1.0)
 
         if multiplier != 1.0:
-            cache_cost = _compute_cache_only_cost(model_info=model_info, usage=usage, service_tier=service_tier)
+            cache_cost = _compute_cache_only_cost(
+                model_info=model_info,
+                usage=usage,
+                service_tier=service_tier,
+                request_time=request_time,
+            )
             prompt_cost = (prompt_cost - cache_cost) * multiplier + cache_cost
             completion_cost *= multiplier
     except Exception:
