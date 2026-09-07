@@ -7,6 +7,7 @@ If the ddtrace package is not installed, the tracer will be a no-op.
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+from litellm.litellm_core_utils.request_content_mode import encryption_enabled
 from litellm.secret_managers.main import get_secret_bool
 
 if TYPE_CHECKING:
@@ -54,11 +55,15 @@ class NullTracer:
 
 def _should_use_dd_tracer():
     """Returns True if `USE_DDTRACE` is set to True in .env"""
+    if encryption_enabled():
+        return False
     return get_secret_bool("USE_DDTRACE", False) is True
 
 
 def _should_use_dd_profiler():
     """Returns True if `USE_DDPROFILER` is set to True in .env"""
+    if encryption_enabled():
+        return False
     return get_secret_bool("USE_DDPROFILER", False) is True
 
 

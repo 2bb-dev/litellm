@@ -28,14 +28,16 @@ def encryption_enabled() -> bool:
         return True
 
 
-def require_protection_marker() -> bool:
+def require_protection_marker(instance_uid: str, kid: str) -> bool:
     marker = protection_marker_path()
     if marker is None:
         return False
+    expected = f"openorange.request-log.v1\n{instance_uid}\n{kid}\n".encode("ascii")
     try:
         descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.write(descriptor, b"openorange.request-log.v1\n")
+            if os.write(descriptor, expected) != len(expected):
+                return False
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -46,6 +48,12 @@ def require_protection_marker() -> bool:
             os.close(directory)
         return True
     except FileExistsError:
-        return marker.is_file() and not marker.is_symlink()
+        try:
+            if marker.is_symlink() or not marker.is_file():
+                return False
+            with marker.open("rb") as source:
+                return source.read(256) == expected
+        except OSError:
+            return False
     except OSError:
         return False

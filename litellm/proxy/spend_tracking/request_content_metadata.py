@@ -68,7 +68,15 @@ _ENUM_FIELDS = {
         "cron",
         "heartbeat",
     },
-    "openclaw_source_tool": {"sessions_send", "sessions_spawn", "cron", "heartbeat", "webchat", "code"},
+    "openclaw_source_tool": {
+        "sessions_send",
+        "sessions_spawn",
+        "subagent_announce",
+        "cron",
+        "heartbeat",
+        "webchat",
+        "code",
+    },
 }
 _USAGE_NUMBERS = frozenset(
     "prompt_tokens completion_tokens total_tokens input_tokens output_tokens "

@@ -1593,12 +1593,16 @@ class Logging(LiteLLMLoggingBaseClass):
     def should_run_callback(self, callback: litellm.CALLBACK_TYPES, litellm_params: dict, event_hook: str) -> bool:
         from litellm.litellm_core_utils.request_content_mode import encryption_enabled
 
-        if (
-            encryption_enabled()
-            and type(callback).__module__ == "litellm.proxy.hooks.proxy_track_cost_callback"
-            and type(callback).__name__ == "_ProxyDBLogger"
-        ):
-            return True
+        if encryption_enabled():
+            from litellm.proxy.spend_tracking.request_content_policy import approved_callback
+
+            if not approved_callback(callback):
+                return False
+            if (
+                type(callback).__module__ == "litellm.proxy.hooks.proxy_track_cost_callback"
+                and type(callback).__name__ == "_ProxyDBLogger"
+            ):
+                return True
         if litellm.global_disable_no_log_param:
             return True
 

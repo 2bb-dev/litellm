@@ -18,7 +18,11 @@ from joserfc.jwk import RSAKey
 from joserfc.registry import HeaderParameter
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, field_validator
 
-from litellm.litellm_core_utils.request_content_mode import CONFIG_ENV, encryption_enabled
+from litellm.litellm_core_utils.request_content_mode import (
+    CONFIG_ENV,
+    encryption_enabled,
+    require_protection_marker,
+)
 
 INSTANCE_ENV = "OPENORANGE_INSTANCE_UID"
 CONTENT_FORMAT = "openorange.request-log.v1"
@@ -213,7 +217,12 @@ def configured_encryptor() -> RequestContentEncryptor | CaptureFailure:
         file_stat = Path(path).lstat()
         if not stat.S_ISREG(file_stat.st_mode):
             return CaptureFailure("configuration_unavailable")
-        return _load_encryptor(path, os.getenv(INSTANCE_ENV, ""), file_stat.st_mtime_ns, file_stat.st_size)
+        encryptor = _load_encryptor(path, os.getenv(INSTANCE_ENV, ""), file_stat.st_mtime_ns, file_stat.st_size)
+        if isinstance(encryptor, CaptureFailure):
+            return encryptor
+        if not require_protection_marker(encryptor.key.instance_uid, encryptor.key.kid):
+            return CaptureFailure("configuration_unavailable")
+        return encryptor
     except OSError:
         return CaptureFailure("configuration_unavailable")
 

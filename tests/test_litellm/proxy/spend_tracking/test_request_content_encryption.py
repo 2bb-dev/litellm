@@ -30,7 +30,7 @@ from litellm.proxy.spend_tracking.request_content_encryption import (
     jwe_registry,
     parse_public_config,
 )
-from litellm.proxy.spend_tracking.request_content_metadata import safe_metadata
+from litellm.proxy.spend_tracking.request_content_metadata import protect_spend_payload, safe_metadata
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures/browser_jwe_test_only.json").read_text())
 CANARY = "SYNTHETIC_SECRET_DO_NOT_RETAIN_IN_PLAINTEXT with spaces"
@@ -117,7 +117,7 @@ def test_rejects_noncanonical_instance_and_nonregular_config(protected_config, m
 
 
 def test_missing_configuration_cannot_clear_protected_mode(protected_config, monkeypatch):
-    assert require_protection_marker()
+    assert require_protection_marker(FIXTURE["instanceUid"], FIXTURE["publicKey"]["kid"])
     monkeypatch.delenv(CONFIG_ENV)
     assert encryption_enabled()
     assert isinstance(encryption_readiness(), CaptureFailure)
@@ -275,6 +275,122 @@ def make_call(failed=False):
         "combined_usage_object": litellm.Usage(**usage),
     }
     return response, kwargs
+
+
+@pytest.mark.parametrize(
+    "usage,expected",
+    [
+        (
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "prompt_tokens_details": {"cached_tokens": 30},
+            },
+            {"prompt_tokens_details": {"cached_tokens": 30}},
+        ),
+        (
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 10,
+            },
+            {"cache_read_input_tokens": 30, "cache_creation_input_tokens": 10},
+        ),
+    ],
+)
+def test_actual_logging_payload_preserves_provider_cache_usage_for_sql(protected_config, monkeypatch, usage, expected):
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    monkeypatch.setattr(proxy_server, "general_settings", {"store_prompts_in_spend_logs": True})
+    response, kwargs = make_call(False)
+    response.usage = litellm.Usage(**usage)
+    row = get_logging_payload(
+        kwargs, response, datetime(2026, 9, 7, tzinfo=timezone.utc), datetime(2026, 9, 7, 0, 0, 1, tzinfo=timezone.utc)
+    )
+    protected = protect_spend_payload(row)
+    metadata = json.loads(protected["metadata"])
+    assert all(metadata["additional_usage_values"][name] == value for name, value in expected.items())
+    assert (protected["prompt_tokens"], protected["completion_tokens"], protected["total_tokens"]) == (100, 20, 120)
+    assert CANARY not in json.dumps(protected, default=str)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_full_long_content_survives_collection_and_jwe_with_credential_stripping(protected_config, monkeypatch, api):
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    monkeypatch.setattr(proxy_server, "general_settings", {"store_prompts_in_spend_logs": True})
+    monkeypatch.setenv("MAX_STRING_LENGTH_PROMPT_IN_DB", "2048")
+    prompt, answer, arguments = "prompt-" * 1024, "answer-" * 1024, "arguments-" * 1024
+    credentials = {"Authorization": "SYNTHETIC_CREDENTIAL_MUST_BE_STRIPPED"}
+    response, kwargs = make_call(False)
+    body = {
+        "messages" if api == "chat" else "input": [{"role": "user", "content": prompt}],
+        "tools": [{"type": "function", "function": {"name": "test", "description": prompt}}],
+        "secret_fields": credentials,
+    }
+    returned = (
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": answer,
+                        "tool_calls": [{"function": {"arguments": arguments}}],
+                    }
+                }
+            ]
+        }
+        if api == "chat"
+        else {
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": answer}]},
+                {"type": "function_call", "arguments": arguments},
+            ]
+        }
+    )
+    returned["secret_fields"] = credentials
+    kwargs["call_type"] = "acompletion" if api == "chat" else "aresponses"
+    kwargs["litellm_params"]["proxy_server_request"]["body"] = body
+    kwargs["litellm_params"]["metadata"]["error_information"] = {"error_message": answer, "traceback": arguments}
+    kwargs["standard_logging_object"]["response"] = returned
+    original = copy.deepcopy(kwargs)
+    raw = get_logging_payload(
+        kwargs, response, datetime(2026, 9, 7, tzinfo=timezone.utc), datetime(2026, 9, 7, 0, 0, 1, tzinfo=timezone.utc)
+    )
+    protected = protect_spend_payload(raw)
+    _, content = decrypt(json.loads(protected["proxy_server_request"]))
+    assert content["request"] == {name: value for name, value in body.items() if name != "secret_fields"}
+    assert content["response"] == {name: value for name, value in returned.items() if name != "secret_fields"}
+    assert content["metadata"]["error_information"] == {"error_message": answer, "traceback": arguments}
+    assert "SYNTHETIC_CREDENTIAL_MUST_BE_STRIPPED" not in json.dumps(content)
+    assert prompt not in json.dumps(protected, default=str)
+    assert kwargs == original
+
+
+def test_oversized_complete_request_is_capture_failure_not_silently_truncated(protected_config, monkeypatch):
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.request_content_encryption import MAX_CONTENT_BYTES
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    monkeypatch.setattr(proxy_server, "general_settings", {"store_prompts_in_spend_logs": True})
+    response, kwargs = make_call(False)
+    full_input = "x" * (MAX_CONTENT_BYTES + 1)
+    kwargs["litellm_params"]["proxy_server_request"]["body"] = {"input": full_input}
+    raw = get_logging_payload(
+        kwargs, response, datetime(2026, 9, 7, tzinfo=timezone.utc), datetime(2026, 9, 7, 0, 0, 1, tzinfo=timezone.utc)
+    )
+    assert json.loads(raw["proxy_server_request"])["input"] == full_input
+    protected = protect_spend_payload(raw)
+    marker = json.loads(protected["metadata"])["openorange_request_log"]
+    assert marker["content_status"] == "capture_failed"
+    assert marker["failure_code"] == "content_too_large"
+    assert protected["proxy_server_request"] == "{}"
+    assert protected["spend"] == 0.25
 
 
 @pytest.mark.asyncio
