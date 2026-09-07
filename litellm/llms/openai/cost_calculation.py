@@ -108,21 +108,28 @@ def cost_per_second(model: str, custom_llm_provider: Optional[str], duration: fl
 
     ## GET MODEL INFO
     model_info = get_model_info(model=model, custom_llm_provider=custom_llm_provider or "openai")
+    billable_duration = (
+        max(duration, model_info.get("minimum_billable_duration_seconds") or 0.0) if duration > 0 else 0.0
+    )
     prompt_cost = 0.0
     completion_cost = 0.0
     ## Speech / Audio cost calculation
-    if "output_cost_per_second" in model_info and model_info["output_cost_per_second"] is not None:
+    if model_info.get("output_cost_per_second") is not None and not (
+        model_info.get("mode") == "audio_transcription"
+        and model_info.get("output_cost_per_second") == 0
+        and model_info.get("input_cost_per_second") is not None
+    ):
         verbose_logger.debug(
             f"For model={model} - output_cost_per_second: {model_info.get('output_cost_per_second')}; duration: {duration}"
         )
         ## COST PER SECOND ##
-        completion_cost = model_info["output_cost_per_second"] * duration
+        completion_cost = model_info["output_cost_per_second"] * billable_duration
     elif "input_cost_per_second" in model_info and model_info["input_cost_per_second"] is not None:
         verbose_logger.debug(
             f"For model={model} - input_cost_per_second: {model_info.get('input_cost_per_second')}; duration: {duration}"
         )
         ## COST PER SECOND ##
-        prompt_cost = model_info["input_cost_per_second"] * duration
+        prompt_cost = model_info["input_cost_per_second"] * billable_duration
         completion_cost = 0.0
 
     return prompt_cost, completion_cost
