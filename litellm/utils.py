@@ -5301,6 +5301,8 @@ def _get_model_info_helper(
 
             returned_model_info = ModelInfoBase(
                 key=key,
+                pricing_periods=_model_info.get("pricing_periods"),
+                pricing_tier_threshold_inclusive=_model_info.get("pricing_tier_threshold_inclusive"),
                 max_tokens=_model_info.get("max_tokens", None),
                 max_input_tokens=_model_info.get("max_input_tokens", None),
                 max_output_tokens=_model_info.get("max_output_tokens", None),

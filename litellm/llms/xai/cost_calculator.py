@@ -4,7 +4,8 @@ Helper util for handling XAI-specific cost calculation
 - Handles XAI-specific reasoning token billing (billed as part of completion tokens)
 """
 
-from typing import TYPE_CHECKING, Tuple
+from datetime import datetime
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 from litellm.types.utils import Usage
 from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token
@@ -13,7 +14,9 @@ if TYPE_CHECKING:
     from litellm.types.utils import ModelInfo
 
 
-def cost_per_token(model: str, usage: Usage) -> Tuple[float, float]:
+def cost_per_token(
+    model: str, usage: Usage, request_time: Optional[Union[datetime, float]] = None
+) -> Tuple[float, float]:
     """
     Calculates the cost per token for a given XAI model, prompt tokens, and completion tokens.
     Uses the generic cost calculator for all pricing logic, with XAI-specific reasoning token handling.
@@ -47,7 +50,9 @@ def cost_per_token(model: str, usage: Usage) -> Tuple[float, float]:
         completion_tokens_details=None,
     )
 
-    prompt_cost, completion_cost = generic_cost_per_token(model=model, usage=modified_usage, custom_llm_provider="xai")
+    prompt_cost, completion_cost = generic_cost_per_token(
+        model=model, usage=modified_usage, custom_llm_provider="xai", request_time=request_time
+    )
 
     return prompt_cost, completion_cost
 
