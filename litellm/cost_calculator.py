@@ -2,6 +2,7 @@
 ## File for 'response_cost' calculation in Logging
 import logging
 import time
+from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union, cast
 
@@ -28,6 +29,7 @@ from litellm.litellm_core_utils.llm_cost_calc.utils import (
     _get_service_tier_cost_key,
     _parse_prompt_tokens_details,
     calculate_cost_component,
+    calculate_cache_costs,
     generic_cost_per_token,
     get_billable_input_tokens,
     select_cost_metric_for_model,
@@ -112,6 +114,7 @@ from litellm.utils import (
     TextCompletionResponse,
     TranscriptionResponse,
     _cached_get_model_info_helper,
+    _is_custom_pricing_deployment,
     token_counter,
 )
 
@@ -321,6 +324,7 @@ def cost_per_token(
     response: Optional[Any] = None,
     ### REQUEST MODEL ###
     request_model: Optional[str] = None,  # original request model for router detection
+    request_time: Optional[Union[datetime, float]] = None,
 ) -> Tuple[float, float]:  # type: ignore
     """
     Calculates the cost per token for a given model, prompt tokens, and completion tokens.
@@ -467,7 +471,7 @@ def cost_per_token(
     Option2. model = "openai/gpt-4"       - model = provider/model
     Option3. model = "anthropic.claude-3" - model = model
     """
-    if model_with_provider in model_cost_ref:  # Option 2. use model with provider, model = "openai/gpt-4"
+    if not _is_custom_pricing_deployment(model) and model_with_provider in model_cost_ref:
         model = model_with_provider
     elif model in model_cost_ref:  # Option 1. use model passed, model="gpt-4"
         model = model
@@ -599,7 +603,9 @@ def cost_per_token(
                 service_tier=service_tier,
             )
     elif custom_llm_provider == "anthropic":
-        return anthropic_cost_per_token(model=model, usage=usage_block, service_tier=service_tier)
+        return anthropic_cost_per_token(
+            model=model, usage=usage_block, service_tier=service_tier, request_time=request_time
+        )
     elif custom_llm_provider == "bedrock":
         return bedrock_cost_per_token(model=model, usage=usage_block, service_tier=service_tier)
     elif custom_llm_provider == "openai":
@@ -608,6 +614,7 @@ def cost_per_token(
             usage=usage_block,
             service_tier=service_tier,
             data_residency=data_residency,
+            request_time=request_time,
         )
     elif custom_llm_provider == "databricks":
         return databricks_cost_per_token(model=model, usage=usage_block)
@@ -621,13 +628,15 @@ def cost_per_token(
             service_tier=service_tier,
         )
     elif custom_llm_provider == "gemini":
-        return gemini_cost_per_token(model=model, usage=usage_block, service_tier=service_tier)
+        return gemini_cost_per_token(
+            model=model, usage=usage_block, service_tier=service_tier, request_time=request_time
+        )
     elif custom_llm_provider == "deepseek":
-        return deepseek_cost_per_token(model=model, usage=usage_block)
+        return deepseek_cost_per_token(model=model, usage=usage_block, request_time=request_time)
     elif custom_llm_provider == "perplexity":
         return perplexity_cost_per_token(model=model, usage=usage_block)
     elif custom_llm_provider == "xai":
-        return xai_cost_per_token(model=model, usage=usage_block)
+        return xai_cost_per_token(model=model, usage=usage_block, request_time=request_time)
     elif custom_llm_provider == "lemonade":
         return lemonade_cost_per_token(model=model, usage=usage_block)
     elif custom_llm_provider == "dashscope":
@@ -654,6 +663,7 @@ def cost_per_token(
                 custom_llm_provider=custom_llm_provider,
                 service_tier=service_tier,
                 data_residency=data_residency,
+                request_time=request_time,
             )
 
         if model_info.get("input_cost_per_second", None) is not None and response_time_ms is not None:
@@ -756,7 +766,19 @@ def _select_model_name_for_cost_calc(
     if custom_pricing is True:
         if router_model_id is not None and router_model_id in litellm.model_cost:
             entry = litellm.model_cost[router_model_id]
-            if entry.get("input_cost_per_token") is not None or entry.get("input_cost_per_second") is not None:
+            if any(
+                entry.get(field) is not None
+                for field in (
+                    "input_cost_per_token",
+                    "output_cost_per_token",
+                    "input_cost_per_second",
+                    "output_cost_per_second",
+                    "input_cost_per_character",
+                    "output_cost_per_character",
+                )
+            ):
+                if _is_custom_pricing_deployment(router_model_id):
+                    return router_model_id
                 return_model = router_model_id
             else:
                 return_model = model
@@ -1124,6 +1146,7 @@ def completion_cost(
     service_tier: Optional[str] = None,  # for OpenAI service tier pricing
     ### DATA RESIDENCY ###
     data_residency: Optional[str] = None,  # for OpenAI regional-processing uplift (e.g. "eu", "us")
+    request_time: Optional[Union[datetime, float]] = None,
 ) -> float:
     """
     Calculate the cost of a given completion call fot GPT-3.5-turbo, llama2, any litellm supported llm.
@@ -1198,6 +1221,9 @@ def completion_cost(
                 service_tier = cost_per_token_usage_object.get("service_tier")
 
         service_tier = _normalize_service_tier(service_tier)
+
+        if custom_pricing is True and _is_custom_pricing_deployment(router_model_id or ""):
+            custom_llm_provider = _get_provider_for_cost_calc(model, custom_llm_provider)
 
         selected_model = _select_model_name_for_cost_calc(
             model=model,
@@ -1533,6 +1559,8 @@ def completion_cost(
                 request_model_for_cost = None
                 if litellm_logging_obj is not None:
                     request_model_for_cost = litellm_logging_obj.model
+                    if request_time is None:
+                        request_time = litellm_logging_obj.start_time
 
                 (
                     prompt_tokens_cost_usd_dollar,
@@ -1558,6 +1586,7 @@ def completion_cost(
                     data_residency=data_residency,
                     response=completion_response,
                     request_model=request_model_for_cost,
+                    request_time=request_time,
                 )
 
                 # Get additional costs from provider (e.g., routing fees, infrastructure costs)
@@ -1630,24 +1659,21 @@ def completion_cost(
                 if litellm_logging_obj is not None:
                     _cache_read_cost: Optional[float] = None
                     _cache_creation_cost: Optional[float] = None
-                    if cost_per_token_usage_object is not None:
-                        _cr = getattr(cost_per_token_usage_object, "cache_read_input_tokens", None) or (
-                            cost_per_token_usage_object.model_extra or {}
-                        ).get("cache_read_input_tokens")
-                        _cc = getattr(
-                            cost_per_token_usage_object,
-                            "cache_creation_input_tokens",
-                            None,
-                        ) or (cost_per_token_usage_object.model_extra or {}).get("cache_creation_input_tokens")
-                        if (_cr or _cc) and model:
+                    if cost_per_token_usage_object is not None and model:
+                        _cache_details = _parse_prompt_tokens_details(cost_per_token_usage_object)
+                        if (
+                            _cache_details["cache_hit_tokens"]
+                            or _cache_details["cache_creation_tokens"]
+                            or _cache_details["cache_creation_token_details"] is not None
+                        ):
                             try:
                                 _mi = litellm.get_model_info(model=model, custom_llm_provider=custom_llm_provider)
-                                _cr_rate = _mi.get("cache_read_input_token_cost")
-                                if _cr and _cr_rate is not None:
-                                    _cache_read_cost = float(_cr) * float(_cr_rate)
-                                _cc_rate = _mi.get("cache_creation_input_token_cost")
-                                if _cc and _cc_rate is not None:
-                                    _cache_creation_cost = float(_cc) * float(_cc_rate)
+                                _cache_read_cost, _cache_creation_cost = calculate_cache_costs(
+                                    _mi,
+                                    cost_per_token_usage_object,
+                                    service_tier,
+                                    request_time,
+                                )
                             except Exception:
                                 pass
                     _store_cost_breakdown_in_logging_obj(

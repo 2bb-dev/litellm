@@ -36,10 +36,48 @@ from litellm.litellm_core_utils.llm_cost_calc.utils import (
     PromptTokensDetailsResult,
     _calculate_input_cost,
     _get_token_base_cost,
+    _parse_prompt_tokens_details,
     calculate_cache_writing_cost,
     generic_cost_per_token,
 )
 from litellm.types.utils import CacheCreationTokenDetails, Usage
+
+
+@pytest.mark.parametrize(
+    "writes,creation,expected",
+    ((None, None, 0), (0, 0, 0), (300, None, 300), (None, 300, 300), (300, 300, 300), (300, 100, 300), (0, 300, 300)),
+)
+def test_parse_prompt_tokens_details_cache_write_alias(writes: int | None, creation: int | None, expected: int) -> None:
+    usage = Usage(
+        prompt_tokens=1000,
+        completion_tokens=50,
+        prompt_tokens_details=PromptTokensDetailsWrapper(
+            cached_tokens=200,
+            cache_write_tokens=writes,
+            cache_creation_tokens=creation,
+        ),
+    )
+    result = _parse_prompt_tokens_details(usage)
+    assert result["cache_creation_tokens"] == expected
+    assert result["cache_hit_tokens"] == 200
+
+
+@pytest.mark.parametrize("write_rate", (None, 0.0, 3e-6))
+@pytest.mark.parametrize("tokens,input_rate", ((199999, 2e-6), (200001, 4e-6)))
+def test_cache_write_price_defaults_to_effective_input_rate(
+    write_rate: float | None, tokens: int, input_rate: float
+) -> None:
+    rates = _get_token_base_cost(
+        ModelInfo(
+            input_cost_per_token=2e-6,
+            output_cost_per_token=8e-6,
+            input_cost_per_token_above_200k_tokens=4e-6,
+            cache_creation_input_token_cost=write_rate,
+        ),
+        Usage(prompt_tokens=tokens, completion_tokens=0),
+    )
+    assert rates[0] == input_rate
+    assert rates[2] == (input_rate if write_rate is None else write_rate)
 
 
 def test_reasoning_tokens_no_price_set():

@@ -1,10 +1,14 @@
 # What is this?
 ## Helper utilities for cost_per_token()
 
-from typing import Any, Literal, Optional, Tuple, TypedDict, cast
+from datetime import datetime, timezone
+from math import isfinite
+import re
+from typing import Any, Literal, Optional, Tuple, TypedDict, Union, cast
 
 import litellm
 from litellm._logging import verbose_logger
+from litellm.litellm_core_utils.llm_cost_calc.off_peak_pricing import get_off_peak_pricing_overrides
 from litellm.types.utils import (
     CacheCreationTokenDetails,
     CallTypes,
@@ -15,6 +19,7 @@ from litellm.types.utils import (
     PassthroughCallTypes,
     PromptTokensDetailsWrapper,
     ServiceTier,
+    TokenPricingPeriod,
     Usage,
 )
 from litellm.utils import get_model_info
@@ -37,6 +42,10 @@ _VALID_DATA_RESIDENCIES = frozenset(r.value for r in DataResidency)
 # request in the cost-calc path, so the f-strings are built once here instead
 # of being rebuilt for every model_info key on every call.
 _SERVICE_TIER_SUFFIXES: tuple[str, ...] = tuple(f"_{st.value}" for st in ServiceTier)
+_TOKEN_PERIOD_RATE_KEY = re.compile(
+    r"(?:(?:input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|"
+    r"cache_creation_input_token_cost(?:_above_1hr)?)(?:_above_\d+k?_tokens)?|output_cost_per_reasoning_token)"
+)
 
 
 def _get_token_detail_value(details: object, key: str) -> Optional[int]:
@@ -89,7 +98,7 @@ def select_cost_metric_for_model(
     Select 'cost_per_character' if model_info has 'input_cost_per_character'
     Select 'cost_per_token' if model_info has 'input_cost_per_token'
     """
-    if model_info.get("input_cost_per_character"):
+    if model_info.get("input_cost_per_character") is not None:
         return "cost_per_character"
     elif model_info.get("input_cost_per_token"):
         return "cost_per_token"
@@ -193,7 +202,7 @@ def _get_service_tier_cost_key(base_key: str, service_tier: Optional[str]) -> st
 
 
 def _parse_above_token_threshold(key: str) -> float:
-    threshold_str = key.split("_above_")[1].split("_tokens")[0]
+    threshold_str = key.rsplit("_above_", 1)[1].split("_tokens")[0]
     return float(threshold_str.replace("k", "")) * (1000 if "k" in threshold_str else 1)
 
 
@@ -224,7 +233,7 @@ def _get_token_base_cost(
         output_image_cost = _get_cost_per_unit(model_info, "output_cost_per_image_token", None)
         if output_image_cost is not None:
             completion_base_cost = cast(float, output_image_cost)
-    cache_creation_cost = cast(float, _get_cost_per_unit(model_info, cache_creation_cost_key))
+    cache_creation_cost = _get_cost_per_unit(model_info, cache_creation_cost_key, None)
     cache_creation_cost_above_1hr = cast(
         float,
         _get_cost_per_unit(model_info, "cache_creation_input_token_cost_above_1hr"),
@@ -244,7 +253,7 @@ def _get_token_base_cost(
         return (
             prompt_base_cost,
             completion_base_cost,
-            cache_creation_cost,
+            cache_creation_cost if cache_creation_cost is not None else prompt_base_cost,
             cache_creation_cost_above_1hr,
             cache_read_cost,
         )
@@ -258,7 +267,9 @@ def _get_token_base_cost(
                 # Handle both formats: _above_128k_tokens and _above_128_tokens
                 threshold_str = key.split("_above_")[1].split("_tokens")[0]
                 threshold = _parse_above_token_threshold(key)
-                if usage.prompt_tokens > threshold:
+                if usage.prompt_tokens > threshold or (
+                    model_info.get("pricing_tier_threshold_inclusive") is True and usage.prompt_tokens == threshold
+                ):
                     # Prefer a service_tier-specific above-threshold key when available,
                     # e.g. input_cost_per_token_priority_above_200k_tokens for Gemini
                     # ON_DEMAND_PRIORITY.  Falls back to the standard key automatically
@@ -350,7 +361,7 @@ def _get_token_base_cost(
     return (
         prompt_base_cost,
         completion_base_cost,
-        cache_creation_cost,
+        cache_creation_cost if cache_creation_cost is not None else prompt_base_cost,
         cache_creation_cost_above_1hr,
         cache_read_cost,
     )
@@ -455,7 +466,8 @@ def _parse_prompt_tokens_details(usage: Usage) -> PromptTokensDetailsResult:
     cache_creation_tokens = (
         cast(
             Optional[int],
-            getattr(usage.prompt_tokens_details, "cache_creation_tokens", 0),
+            getattr(usage.prompt_tokens_details, "cache_write_tokens", 0)
+            or getattr(usage.prompt_tokens_details, "cache_creation_tokens", 0),
         )
         or 0
     )
@@ -578,12 +590,8 @@ def _calculate_input_cost(
 
     ### IMAGE TOKEN COST
     if prompt_tokens_details["image_tokens"]:
-        # For image token costs:
-        # First check if input_cost_per_image_token is available. If not, default to generic input_cost_per_token.
-        image_token_cost_key = "input_cost_per_image_token"
-        if model_info.get(image_token_cost_key) is None:
-            image_token_cost_key = "input_cost_per_token"
-        prompt_cost += calculate_cost_component(model_info, image_token_cost_key, prompt_tokens_details["image_tokens"])
+        image_token_cost = _get_cost_per_unit(model_info, "input_cost_per_image_token", prompt_base_cost)
+        prompt_cost += float(prompt_tokens_details["image_tokens"]) * cast(float, image_token_cost)
 
     ### CACHE WRITING COST - Now uses tiered pricing
     if (
@@ -661,12 +669,127 @@ def _get_regional_uplift_multiplier(model_info: ModelInfo, data_residency: Optio
         return 1.0
 
 
+def _pricing_instant(request_time: Optional[Union[datetime, float]]) -> datetime:
+    instant = request_time if request_time is not None else datetime.now(timezone.utc)
+    if isinstance(instant, (int, float)):
+        return datetime.fromtimestamp(instant, timezone.utc)
+    return instant.astimezone(timezone.utc)
+
+
+def _active_token_pricing_period(model_info: ModelInfo, instant: datetime) -> Optional[TokenPricingPeriod]:
+    periods = model_info.get("pricing_periods")
+    if not periods:
+        return None
+    selected = None
+    for period in periods:
+        bounds = []
+        for key in ("effective_from", "effective_until"):
+            value = period.get(key)
+            bound = datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+            if bound is not None and bound.tzinfo is None:
+                raise ValueError("Pricing period boundaries must include a timezone")
+            bounds.append(bound)
+        start, end = bounds
+        if start is not None and end is not None and start >= end:
+            raise ValueError("Pricing period effective_from must precede effective_until")
+        if (start is None or start <= instant) and (end is None or instant < end):
+            if selected is not None:
+                raise ValueError("Overlapping token pricing periods")
+            selected = period
+    return selected
+
+
+def _token_pricing_period_overrides(selected: Optional[TokenPricingPeriod]) -> dict[str, float]:
+    if selected is None:
+        return {}
+    values = cast(dict[str, object], selected)
+    rates = {key: value for key, value in values.items() if _TOKEN_PERIOD_RATE_KEY.fullmatch(key)}
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value < 0
+        for value in rates.values()
+    ):
+        raise ValueError("Token pricing period rates must be finite nonnegative numbers")
+    return cast(dict[str, float], rates)
+
+
+def _resolve_token_pricing_period(model_info: ModelInfo, request_time: Optional[Union[datetime, float]]) -> ModelInfo:
+    selected = _active_token_pricing_period(model_info, _pricing_instant(request_time))
+    return cast(ModelInfo, {**model_info, **_token_pricing_period_overrides(selected)})
+
+
+def resolve_token_pricing(
+    model_info: ModelInfo,
+    usage: Usage,
+    service_tier: Optional[str],
+    request_time: Optional[Union[datetime, float]],
+) -> ModelInfo:
+    """Resolve tiers and recurring overrides; dated fields retain their existing context-tier semantics."""
+    instant = _pricing_instant(request_time)
+    selected = _active_token_pricing_period(model_info, instant)
+    period = _token_pricing_period_overrides(selected)
+    dated_info = cast(ModelInfo, {**model_info, **period})
+    base_fields = (
+        "input_cost_per_token",
+        "output_cost_per_token",
+        "cache_creation_input_token_cost",
+        "cache_creation_input_token_cost_above_1hr",
+        "cache_read_input_token_cost",
+    )
+    tier_rates = dict(zip(base_fields, _get_token_base_cost(dated_info, usage, service_tier)))
+    recurring = (
+        {}
+        if selected is not None and "off_peak_pricing" in selected and selected["off_peak_pricing"] is None
+        else get_off_peak_pricing_overrides(model_info, instant)
+    )
+    dated_fields = frozenset(
+        field
+        for field in base_fields
+        if field in period
+        or any(
+            key.startswith(field + "_above_")
+            and (
+                usage.prompt_tokens > _parse_above_token_threshold(key)
+                or (
+                    model_info.get("pricing_tier_threshold_inclusive") is True
+                    and usage.prompt_tokens == _parse_above_token_threshold(key)
+                )
+            )
+            for key in period
+            if key.endswith("_tokens")
+        )
+    )
+    effective_rates = {**tier_rates, **{key: value for key, value in recurring.items() if key not in dated_fields}}
+    if "output_cost_per_reasoning_token" in period:
+        effective_rates["output_cost_per_reasoning_token"] = period["output_cost_per_reasoning_token"]
+    return cast(ModelInfo, {**dated_info, **effective_rates})
+
+
+def calculate_cache_costs(
+    model_info: ModelInfo,
+    usage: Usage,
+    service_tier: Optional[str] = None,
+    request_time: Optional[Union[datetime, float]] = None,
+) -> Tuple[float, float]:
+    rates = resolve_token_pricing(model_info, usage, service_tier, request_time)
+    details = _parse_prompt_tokens_details(usage)
+    return (
+        details["cache_hit_tokens"] * (rates.get("cache_read_input_token_cost") or 0.0),
+        calculate_cache_writing_cost(
+            details["cache_creation_tokens"],
+            details["cache_creation_token_details"],
+            rates.get("cache_creation_input_token_cost_above_1hr") or 0.0,
+            rates.get("cache_creation_input_token_cost") or 0.0,
+        ),
+    )
+
+
 def generic_cost_per_token(
     model: str,
     usage: Usage,
     custom_llm_provider: str,
     service_tier: Optional[str] = None,
     data_residency: Optional[str] = None,
+    request_time: Optional[Union[datetime, float]] = None,
 ) -> Tuple[float, float]:
     """
     Calculates the cost per token for a given model, prompt tokens, and completion tokens.
@@ -685,6 +808,7 @@ def generic_cost_per_token(
 
     ## GET MODEL INFO
     model_info = get_model_info(model=model, custom_llm_provider=custom_llm_provider)
+    model_info = resolve_token_pricing(model_info, usage, service_tier, request_time)
 
     ## CALCULATE INPUT COST
     ### Cost of processing (non-cache hit + cache hit) + Cost of cache-writing (cache writing)
@@ -733,7 +857,13 @@ def generic_cost_per_token(
         cache_creation_cost,
         cache_creation_cost_above_1hr,
         cache_read_cost,
-    ) = _get_token_base_cost(model_info=model_info, usage=usage, service_tier=service_tier)
+    ) = (
+        model_info["input_cost_per_token"],
+        model_info["output_cost_per_token"],
+        model_info["cache_creation_input_token_cost"],
+        model_info["cache_creation_input_token_cost_above_1hr"],
+        model_info["cache_read_input_token_cost"],
+    )
 
     prompt_cost = _calculate_input_cost(
         prompt_tokens_details=prompt_tokens_details,
