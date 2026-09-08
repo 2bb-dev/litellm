@@ -1,5 +1,3 @@
-// Adapted from @benvargas/pi-claude-code-use 2.2.0 (MIT).
-// Copyright (c) 2026 Ben Vargas. See THIRD_PARTY_NOTICES.md.
 import {
   createAssistantMessageEventStream,
   type Api,
