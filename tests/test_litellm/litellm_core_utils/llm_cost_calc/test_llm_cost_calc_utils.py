@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -39,6 +40,7 @@ from litellm.litellm_core_utils.llm_cost_calc.utils import (
     _parse_prompt_tokens_details,
     calculate_cache_writing_cost,
     generic_cost_per_token,
+    resolve_token_pricing,
 )
 from litellm.types.utils import CacheCreationTokenDetails, Usage
 
@@ -64,20 +66,25 @@ def test_parse_prompt_tokens_details_cache_write_alias(writes: int | None, creat
 
 @pytest.mark.parametrize("write_rate", (None, 0.0, 3e-6))
 @pytest.mark.parametrize("tokens,input_rate", ((199999, 2e-6), (200001, 4e-6)))
+@pytest.mark.parametrize("off_peak", (False, True))
 def test_cache_write_price_defaults_to_effective_input_rate(
-    write_rate: float | None, tokens: int, input_rate: float
+    write_rate: float | None, tokens: int, input_rate: float, off_peak: bool
 ) -> None:
-    rates = _get_token_base_cost(
+    rates = resolve_token_pricing(
         ModelInfo(
             input_cost_per_token=2e-6,
             output_cost_per_token=8e-6,
             input_cost_per_token_above_200k_tokens=4e-6,
             cache_creation_input_token_cost=write_rate,
+            off_peak_pricing={"hours_utc": "00:00-01:00", "input_cost_per_token": 1e-6},
         ),
         Usage(prompt_tokens=tokens, completion_tokens=0),
+        None,
+        datetime(2026, 9, 7, 0 if off_peak else 2, tzinfo=timezone.utc),
     )
-    assert rates[0] == input_rate
-    assert rates[2] == (input_rate if write_rate is None else write_rate)
+    expected_input_rate = 1e-6 if off_peak else input_rate
+    assert rates["input_cost_per_token"] == expected_input_rate
+    assert rates["cache_creation_input_token_cost"] == (expected_input_rate if write_rate is None else write_rate)
 
 
 def test_reasoning_tokens_no_price_set():
