@@ -53,9 +53,7 @@ dropped capabilities, and no host shell, Docker socket, home, or workspace mount
 Only its model configuration is bind-mounted read-only. Docker builds use this
 service directory as their entire context, an allowlist `.dockerignore`, pinned
 Node image digest, `npm ci --ignore-scripts`, and production-only dependencies
-in the final stage. No Enterprise or Pi agent package is installed. Package
-notices are retained at `/app/THIRD_PARTY_NOTICES.md` and in `node_modules`;
-base-image Node/Debian notices remain in that image
+in the final stage. No Enterprise or Pi agent package is installed
 
 ## Configuration and credentials
 
@@ -127,8 +125,7 @@ are not included
 
 This compatibility behavior does not grant API access or guarantee that requests
 use subscription credits rather than paid extra usage. Provider permissions,
-quota, and billing must be checked separately. The adapted source's MIT notice
-is included in `THIRD_PARTY_NOTICES.md`; no new runtime package is installed
+quota, and billing must be checked separately; no new runtime package is installed
 
 ## API and routing
 
@@ -204,8 +201,7 @@ built, reproduce that non-billable check from the fork root:
 npm run test:litellm --prefix services/pi-inference
 ```
 
-See `THIRD_PARTY_NOTICES.md` for the recursively reviewed locked production graph.
-When the lock changes, re-check every production package's installed metadata and
-bundled notices, regenerate this inventory/hash, and escalate unclear/restricted
-licenses under OpenOrange's `docs/compliance/third-party-licenses.md`. The parent
-repository's current scanner does not automatically discover this nested npm root
+When the lock changes, re-check every production package's installed metadata
+and licenses, and escalate unclear/restricted licenses under OpenOrange's
+`docs/compliance/third-party-licenses.md`. The parent repository's current
+scanner does not automatically discover this nested npm root

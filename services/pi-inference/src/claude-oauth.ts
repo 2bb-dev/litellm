@@ -1,3 +1,7 @@
+// Adapted in part from @benvargas/pi-claude-code-use@2.2.0
+// (https://github.com/ben-vargas/pi-packages, revision 4eaa1e26e44151a01c6977354e7c539322f048be)
+// MIT License, Copyright (c) 2026 Ben Vargas
+
 import {
   createAssistantMessageEventStream,
   type Api,
