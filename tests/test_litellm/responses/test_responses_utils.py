@@ -5,17 +5,15 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 
 sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
 
 import litellm
-from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.responses.utils import ResponseAPILoggingUtils, ResponsesAPIRequestUtils
-from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
+from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIOptionalRequestParams
 from litellm.types.utils import Usage
 
 
@@ -215,10 +213,38 @@ class TestResponseAPILoggingUtils:
         assert result.prompt_tokens == 10
         assert result.completion_tokens == 20
         assert result.total_tokens == 30
-        assert (
-            result.prompt_tokens_details
-            and result.prompt_tokens_details.cached_tokens == 2
-        )
+        assert result.prompt_tokens_details and result.prompt_tokens_details.cached_tokens == 2
+
+    @pytest.mark.parametrize("typed", (False, True))
+    @pytest.mark.parametrize("cache_write_tokens", (None, 0, 300))
+    def test_transform_response_api_usage_preserves_cache_writes(
+        self, typed: bool, cache_write_tokens: int | None
+    ) -> None:
+        raw_usage = {
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "total_tokens": 1050,
+            "input_tokens_details": {
+                "cached_tokens": 200,
+                **({"cache_write_tokens": cache_write_tokens} if cache_write_tokens is not None else {}),
+            },
+            "output_tokens_details": {"reasoning_tokens": 20},
+        }
+        original = json.dumps(raw_usage, sort_keys=True)
+        usage = ResponseAPIUsage(**raw_usage) if typed else raw_usage
+
+        result = ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(usage)
+
+        assert result.prompt_tokens == 1000
+        assert result.completion_tokens == 50
+        assert result.total_tokens == 1050
+        assert result.prompt_tokens_details is not None
+        assert result.prompt_tokens_details.cached_tokens == 200
+        assert getattr(result.prompt_tokens_details, "cache_write_tokens", None) == cache_write_tokens
+        assert result.completion_tokens_details is not None
+        assert result.completion_tokens_details.reasoning_tokens == 20
+        assert json.dumps(raw_usage, sort_keys=True) == original
+        assert result.model_dump()["prompt_tokens_details"].get("cache_write_tokens") == cache_write_tokens
 
     def test_transform_response_api_usage_with_none_values(self):
         """Test transformation handles None values properly"""
