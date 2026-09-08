@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { execFile } from "node:child_process";
@@ -16,10 +17,13 @@ const listen = async (server) => {
   await once(server, "listening");
   return `http://127.0.0.1:${server.address().port}`;
 };
+const received = [];
 const stub = createServer(async (req, res) => {
   const parts = [];
   for await (const p of req) parts.push(p);
   const body = JSON.parse(Buffer.concat(parts));
+  received.push(body);
+  const toolName = body.tools?.[0]?.name;
   res.writeHead(200, { "content-type": "text/event-stream" });
   if (req.url === "/v1/messages") {
     for (const ev of [
@@ -39,17 +43,24 @@ const stub = createServer(async (req, res) => {
       {
         type: "content_block_start",
         index: 0,
-        content_block: { type: "text", text: "" },
+        content_block: toolName
+          ? { type: "tool_use", id: "tool_fixture", name: toolName, input: {} }
+          : { type: "text", text: "" },
       },
       {
         type: "content_block_delta",
         index: 0,
-        delta: { type: "text_delta", text: "local routing works" },
+        delta: toolName
+          ? { type: "input_json_delta", partial_json: '{"city":"Vienna"}' }
+          : { type: "text_delta", text: "local routing works" },
       },
       { type: "content_block_stop", index: 0 },
       {
         type: "message_delta",
-        delta: { stop_reason: "end_turn", stop_sequence: null },
+        delta: {
+          stop_reason: toolName ? "tool_use" : "end_turn",
+          stop_sequence: null,
+        },
         usage: { output_tokens: 3 },
       },
       { type: "message_stop" },
@@ -99,8 +110,8 @@ const runtime = loadRuntime(
       },
       {
         alias: "claude-haiku-4-5",
-        provider: "stub-anthropic",
-        model: "stub",
+        provider: "anthropic",
+        model: "claude-haiku-4-5",
         baseUrl: stubUrl,
         metadata: metadata("anthropic-messages"),
       },
@@ -108,7 +119,12 @@ const runtime = loadRuntime(
   },
   {
     authContext: {
-      env: async () => "upstream-fixture-key",
+      env: async (name) =>
+        name === "ANTHROPIC_API_KEY"
+          ? "sk-ant-oat-fixture"
+          : name === "STUB_CHAT_API_KEY"
+            ? "upstream-fixture-key"
+            : undefined,
       fileExists: async () => false,
     },
   },
@@ -147,6 +163,31 @@ async def main():
       assert r['content'][0]['text']=='local routing works',r
       assert r['usage']['input_tokens']==10,r
     print('LiteLLM Messages stream='+str(stream)+' PASS')
+  schema={'type':'object','properties':{'city':{'type':'string'}}}
+  messages=[{'role':'user','content':'pi itself is user text'}]
+  for stream in (False,True):
+    r=await litellm.acompletion(model='litellm_proxy/claude-haiku-4-5',api_base=base+'/v1',api_key=key,messages=[{'role':'system','content':'pi itself and pi packages'},*messages],tools=[{'type':'function','function':{'name':'lookup_weather','parameters':schema}}],stream=stream)
+    if stream:
+      chunks=[x async for x in r]
+      calls=[c for x in chunks if x.choices for c in (x.choices[0].delta.tool_calls or [])]
+      assert ''.join(c.function.name or '' for c in calls)=='lookup_weather',calls
+      assert json.loads(''.join(c.function.arguments or '' for c in calls))=={'city':'Vienna'},calls
+    else:
+      call=r.choices[0].message.tool_calls[0]
+      assert call.function.name=='lookup_weather',r
+      assert json.loads(call.function.arguments)=={'city':'Vienna'},r
+    print('LiteLLM OAuth tools Chat stream='+str(stream)+' PASS')
+    r=await acreate(model='anthropic/claude-haiku-4-5',api_base=base,api_key=key,max_tokens=128,messages=messages,system='pi itself and pi packages',tools=[{'name':'lookup_weather','input_schema':schema}],tool_choice={'type':'tool','name':'lookup_weather'},stream=stream)
+    if stream:
+      chunks=[x async for x in r]
+      wire=''.join(x.decode() if isinstance(x,bytes) else x if isinstance(x,str) else json.dumps(x) for x in chunks)
+      assert 'lookup_weather' in wire and 'mcp__pi__' not in wire,wire
+      assert 'message_stop' in wire and 'output_tokens' in wire,wire
+    else:
+      assert r['content'][0]['name']=='lookup_weather',r
+      assert r['content'][0]['input']=={'city':'Vienna'},r
+      assert r['usage']['input_tokens']==10,r
+    print('LiteLLM OAuth tools Messages stream='+str(stream)+' PASS')
   await asyncio.sleep(0.1)
 asyncio.run(main())`;
 try {
@@ -167,6 +208,15 @@ try {
   );
   console.log(stdout);
   if (stderr) console.error(stderr);
+  const toolRequests = received.filter((payload) => payload.tools?.length);
+  assert.equal(toolRequests.length, 4);
+  for (const payload of toolRequests) {
+    assert.equal(payload.tools[0].name, "mcp__pi__lookup_weather");
+    assert.equal(payload.system.at(-1).text, "the cli itself and cli packages");
+    assert(JSON.stringify(payload.messages).includes("pi itself is user text"));
+    if (payload.tool_choice?.type === "tool")
+      assert.equal(payload.tool_choice.name, "mcp__pi__lookup_weather");
+  }
 } finally {
   backend.abortAll();
   backend.server.closeAllConnections();

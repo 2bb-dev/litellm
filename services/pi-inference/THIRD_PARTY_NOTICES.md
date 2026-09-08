@@ -26,6 +26,39 @@ copyright notices; this inventory is the additional npm runtime surface, not
 an OS-layer SBOM. No provider pricing or credential-use permission is granted
 by these software licenses
 
+## Adapted Claude OAuth compatibility source
+
+`src/claude-oauth.ts` adapts inference-related behavior from
+`@benvargas/pi-claude-code-use@2.2.0`, source revision
+[`4eaa1e26e44151a01c6977354e7c539322f048be`](https://github.com/ben-vargas/pi-packages/tree/4eaa1e26e44151a01c6977354e7c539322f048be/packages/pi-claude-code-use).
+This is adapted source, not an installed npm dependency; the production package
+inventory and recorded lockfile hash are unchanged. The agent/UI extension host is
+not bundled. Its license is reproduced in full:
+
+```text
+MIT License
+
+Copyright (c) 2026 Ben Vargas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## Production inventory
 
 | Package                                              | Declared license | Notice texts                                               |

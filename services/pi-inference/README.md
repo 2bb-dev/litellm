@@ -93,11 +93,42 @@ heartbeat lock: live owners fail closed, and an unclean exit requires at least
 10 seconds before a new process can recover the stale lock. Never delete a live
 lock. Back up credentials securely; `docker compose down -v` deletes the volume
 
-There is no login CLI or public OAuth/callback endpoint here. Import only
-credentials you are authorized to use and only where the provider permits this
+The inference service exposes no login or public OAuth/callback endpoint. Import
+only credentials you are authorized to use and only where the provider permits this
 usage. A hosted Claude subscription is not an API entitlement: subscription
 limits, enabled extra-usage billing, and permission for hosted/third-party access
 are separate questions. Refresh capability does not establish that permission
+
+## Claude OAuth compatibility
+
+For Anthropic OAuth, the backend includes an inference-only adaptation of
+[`@benvargas/pi-claude-code-use@2.2.0`](https://github.com/ben-vargas/pi-packages/tree/4eaa1e26e44151a01c6977354e7c539322f048be/packages/pi-claude-code-use).
+It does **not** install or load a Pi CodingAgent extension. There is no `pi install`
+or extension reload step; rebuild the image and restart the sidecar to update it,
+retaining its isolated credential volume
+
+The adapter runs only for provider `anthropic`, API `anthropic-messages`, and a
+resolved OAuth token matching Pi's `sk-ant-oat` check. API-key requests, other
+providers, and explicit SDK client overrides are unchanged. Credential lookup
+and refresh remain owned by Pi and the existing credential store
+
+Custom flat tool names become bounded, collision-safe `mcp__pi__…` aliases for
+upstream requests. Claude Code core names and existing `mcp__` names retain Pi's
+normal handling. Definitions, forced native tool choice, and history use the
+same per-request map; responses, including streaming, restore client names.
+There is no shared tool registry or tool execution. IDs, arguments, schemas,
+cache metadata, and signed/redacted thinking are not rewritten
+
+After native payload overlays, only system text receives these exact substitutions:
+`pi itself` → `the cli itself`, `pi .md files` → `cli .md files`, and
+`pi packages` → `cli packages`. User messages, tool results, and response prose
+are unchanged. The upstream extension's UI hooks and raw-payload debug logging
+are not included
+
+This compatibility behavior does not grant API access or guarantee that requests
+use subscription credits rather than paid extra usage. Provider permissions,
+quota, and billing must be checked separately. The adapted source's MIT notice
+is included in `THIRD_PARTY_NOTICES.md`; no new runtime package is installed
 
 ## API and routing
 
@@ -164,8 +195,10 @@ and a Docker build; it neither calls live providers nor pushes images
 
 The fork regression job also exercises real Python LiteLLM transport through a
 local sidecar and provider stub for Chat and native Messages, each streaming and
-non-streaming. With the fork's uv test dependencies already synced and this
-service built, reproduce that non-billable check from the fork root:
+non-streaming. It also verifies Anthropic OAuth tool aliases and system rewriting
+with fake credentials, including client-name restoration through real LiteLLM
+transport. With the fork's uv test dependencies already synced and this service
+built, reproduce that non-billable check from the fork root:
 
 ```bash
 npm run test:litellm --prefix services/pi-inference

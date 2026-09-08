@@ -21,6 +21,7 @@ import { piMessagesApi } from "@earendil-works/pi-ai/api/pi-messages.lazy";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { z } from "zod";
 import { invalid, type Result } from "./protocol.js";
+import { withClaudeOAuthCompatibility } from "./claude-oauth.js";
 
 const apiFactories = {
   "anthropic-messages": anthropicMessagesApi,
@@ -197,10 +198,12 @@ export function loadRuntime(
     [...routes.values()].map((model) => model.provider),
   )) {
     models.setProvider(
-      registerModels(
-        models.getProvider(id),
-        id,
-        [...routes.values()].filter((model) => model.provider === id),
+      withClaudeOAuthCompatibility(
+        registerModels(
+          models.getProvider(id),
+          id,
+          [...routes.values()].filter((model) => model.provider === id),
+        ),
       ),
     );
   }
