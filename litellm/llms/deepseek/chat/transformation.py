@@ -121,7 +121,14 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         """
         Legacy DeepSeek models require string content; Flash supports images.
         """
-        if model.removeprefix("deepseek/") != "deepseek-flash":
+        if model.removeprefix("deepseek/") == "deepseek-flash":
+            messages = [
+                message
+                if message.get("role") == "user"
+                else handle_messages_with_content_list_to_str_conversion([message.copy()])[0]
+                for message in messages
+            ]
+        else:
             messages = handle_messages_with_content_list_to_str_conversion(messages)
         if is_async:
             return super()._transform_messages(messages=messages, model=model, is_async=True)

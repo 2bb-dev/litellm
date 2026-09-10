@@ -26,8 +26,13 @@ async def test_flash_preserves_images_and_reasoning_history(is_async: bool) -> N
     config = DeepSeekChatConfig()
     image = {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
     messages = [
+        {"role": "system", "content": [{"type": "text", "text": "Help the user"}]},
         {"role": "user", "content": [{"type": "text", "text": "Describe"}, image]},
-        {"role": "assistant", "content": "Checking", "provider_specific_fields": {"reasoning_content": "I see red"}},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Checking"}],
+            "provider_specific_fields": {"reasoning_content": "I see red"},
+        },
         {"role": "user", "content": "Continue"},
     ]
     kwargs = {
@@ -38,8 +43,11 @@ async def test_flash_preserves_images_and_reasoning_history(is_async: bool) -> N
         "headers": {},
     }
     body = await config.async_transform_request(**kwargs) if is_async else config.transform_request(**kwargs)
-    assert body["messages"][0]["content"] == messages[0]["content"]
-    assert body["messages"][1]["reasoning_content"] == "I see red"
+    assert body["messages"][0]["content"] == "Help the user"
+    assert body["messages"][1]["content"] == messages[1]["content"]
+    assert body["messages"][2]["content"] == "Checking"
+    assert body["messages"][2]["reasoning_content"] == "I see red"
+    assert messages[0]["content"] == [{"type": "text", "text": "Help the user"}]
     assert "thinking" not in body
 
 
