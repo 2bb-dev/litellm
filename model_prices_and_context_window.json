@@ -23726,12 +23726,14 @@
     },
     "groq/whisper-large-v3": {
         "input_cost_per_second": 3.083e-05,
+        "minimum_billable_duration_seconds": 10,
         "litellm_provider": "groq",
         "mode": "audio_transcription",
         "output_cost_per_second": 0.0
     },
     "groq/whisper-large-v3-turbo": {
         "input_cost_per_second": 1.111e-05,
+        "minimum_billable_duration_seconds": 10,
         "litellm_provider": "groq",
         "mode": "audio_transcription",
         "output_cost_per_second": 0.0

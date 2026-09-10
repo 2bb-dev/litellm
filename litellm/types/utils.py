@@ -40,6 +40,7 @@ from pydantic import (
     SkipValidation,
     field_serializer,
     field_validator,
+    with_config,
 )
 from typing_extensions import Required, TypedDict
 
@@ -177,20 +178,47 @@ class AgenticLoopParams(TypedDict, total=False):
     """The LLM provider name (e.g., 'bedrock', 'anthropic')"""
 
 
+@with_config(ConfigDict(extra="allow"))
 class TokenPricingPeriod(TypedDict, total=False):
     """UTC effective interval [from, until); omitted bounds are unbounded."""
 
     effective_from: str
     effective_until: str
+    off_peak_pricing: None
     input_cost_per_token: float
     output_cost_per_token: float
     cache_read_input_token_cost: float
     cache_creation_input_token_cost: float
+    cache_creation_input_token_cost_above_1hr: float
+    output_cost_per_reasoning_token: float
+    input_cost_per_token_above_272k_tokens: float
+    output_cost_per_token_above_272k_tokens: float
+    cache_read_input_token_cost_above_272k_tokens: float
+    cache_creation_input_token_cost_above_272k_tokens: float
+
+
+class OffPeakWindow(TypedDict, total=False):
+    hours_utc: Union[str, List[str]]
+    weekdays: List[Union[int, str]]
+
+
+class OffPeakPricing(TypedDict, total=False):
+    hours_utc: Union[str, List[str]]
+    windows: List[OffPeakWindow]
+    weekday_timezone: str
+    input_cost_per_token: float
+    output_cost_per_token: float
+    output_cost_per_reasoning_token: float
+    cache_read_input_token_cost: float
+    cache_creation_input_token_cost: float
+    cache_creation_input_token_cost_above_1hr: float
 
 
 class ModelInfoBase(ProviderSpecificModelInfo, total=False):
     pricing_periods: Optional[List[TokenPricingPeriod]]
     pricing_tier_threshold_inclusive: Optional[bool]
+    off_peak_pricing: Optional[OffPeakPricing]
+    minimum_billable_duration_seconds: Optional[float]
     key: Required[str]  # the key in litellm.model_cost which is returned
 
     max_tokens: Required[Optional[int]]
@@ -201,6 +229,7 @@ class ModelInfoBase(ProviderSpecificModelInfo, total=False):
     input_cost_per_token_priority: Optional[float]  # OpenAI priority service tier pricing
     cache_creation_input_token_cost: Optional[float]
     cache_creation_input_token_cost_above_200k_tokens: Optional[float]
+    cache_creation_input_token_cost_above_272k_tokens: Optional[float]
     cache_creation_input_token_cost_above_1hr: Optional[float]
     cache_read_input_token_cost: Optional[float]
     cache_read_input_token_cost_flex: Optional[float]  # OpenAI flex service tier pricing
@@ -2999,6 +3028,8 @@ class CustomPricingLiteLLMParams(BaseModel):
     ## CUSTOM PRICING ##
     pricing_periods: Optional[List[TokenPricingPeriod]] = None
     pricing_tier_threshold_inclusive: Optional[bool] = None
+    off_peak_pricing: Optional[OffPeakPricing] = None
+    minimum_billable_duration_seconds: Optional[float] = None
     input_cost_per_token: Optional[float] = None
     output_cost_per_token: Optional[float] = None
     input_cost_per_second: Optional[float] = None
@@ -3014,6 +3045,7 @@ class CustomPricingLiteLLMParams(BaseModel):
     cache_creation_input_token_cost: Optional[float] = None
     cache_creation_input_token_cost_above_1hr: Optional[float] = None
     cache_creation_input_token_cost_above_200k_tokens: Optional[float] = None
+    cache_creation_input_token_cost_above_272k_tokens: Optional[float] = None
     cache_creation_input_audio_token_cost: Optional[float] = None
     cache_read_input_token_cost: Optional[float] = None
     cache_read_input_token_cost_flex: Optional[float] = None
