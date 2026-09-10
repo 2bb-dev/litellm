@@ -131,6 +131,8 @@ def _usage(value: object, depth: int = 0) -> dict[str, JsonValue]:
             result[key] = item
         elif key in _USAGE_CONTAINERS and isinstance(item, dict):
             result[key] = _usage(item, depth + 1)
+    if "cache_write_tokens" in result and "cache_creation_tokens" not in result:
+        result["cache_creation_tokens"] = result["cache_write_tokens"]
     return result
 
 

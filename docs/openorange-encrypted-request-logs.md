@@ -16,6 +16,8 @@ Plaintext metadata is a fixed projection of bounded attribution IDs, enumerated 
 
 The billing projection retains the nested five-minute/one-hour cache-creation breakdown, finite nonnegative audio durations, whole character/image counts and only the exact duration discriminator. The same narrow usage projection applies to encryption and transformation failures. Regression coverage checks these facts, model/provider identity and unchanged costs in actual writer copies and reopened SQLite rows; unknown keys, nonfinite values, booleans and content strings remain excluded (Refs 2bb-dev/openorange#1485)
 
+If a provider supplies `cache_write_tokens` without `cache_creation_tokens`, the numeric usage projection also supplies the canonical `cache_creation_tokens` field consumed by shared SQL. An existing canonical value, including zero, takes precedence. This applies to both ordinary and failed capture; it does not alter the ledger or automatically repair historical charges (Refs 2bb-dev/openorange#1493)
+
 The marker `metadata.openorange_request_log` reports `content_status=encrypted` or `capture_failed`, version 1, and available normalized conversation/session/cron facts. These facts are deliberately not reconstructed from ciphertext. Application-side attribution normalization must run before the writer
 
 If encryption fails after a billed request, the writer queues a metadata-only `capture_failed` row and continues the existing key/user/team/organization/end-user and daily spend updates. An unexpected row-transform exception uses an independent content-free fallback and records `transformation_failed`. There is no plaintext fallback. Content that could not be encrypted is not retained; the failure is explicit rather than reported as an encrypted log
@@ -75,5 +77,7 @@ LITELLM_LOCAL_MODEL_COST_MAP=true PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/pyt
 The cross-language fixture is explicitly test-only and includes a synthetic private key. It must never be used for a deployment
 
 The September 10 refresh incorporates the fork base at `43830bc15b1af6c97aff354b4c4ad44a37ff27d5`. The targeted encryption/policy, effective pricing/off-peak pricing, spend writer/utilities, retention and cooldown set passed 424 tests. The seven added or extended billing regression cases failed before the allowlist fix and passed afterward. Fork CI now includes the encryption and protected-profile suites. These are synthetic local results; final-head remote CI is a separate gate
+
+The subsequent canonical cache-write regression failed before normalization; the refreshed set passed 425 tests with one warning, and Ruff/strict targeted type checks passed. Repository Actions are disabled, so remote fork CI requires an authorized owner action or an approved equivalent CI path. That setting was not changed by this work
 
 Paid-provider curl proof, a complete activated-proxy soak, actual shared SQL billing reconciliation, a complete content-dump inventory and browser reveal audit integration remain unperformed. Test commands are local regression evidence, not end-to-end proof of production privacy

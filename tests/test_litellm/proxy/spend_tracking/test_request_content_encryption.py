@@ -230,6 +230,18 @@ def test_usage_allowlist_preserves_only_billing_modality_facts() -> None:
     ) == {"additional_usage_values": {"cache_creation_token_details": {"ephemeral_5m_input_tokens": 2}}}
 
 
+def test_cache_write_alias_supplies_canonical_sql_fact_without_overriding_explicit_zero() -> None:
+    for source, expected in (
+        ({"cache_write_tokens": 2}, {"cache_write_tokens": 2, "cache_creation_tokens": 2}),
+        ({"cache_write_tokens": 2, "cache_creation_tokens": 0}, {"cache_write_tokens": 2, "cache_creation_tokens": 0}),
+        ({"cache_write_tokens": True}, {}),
+        ({"cache_write_tokens": -1}, {}),
+    ):
+        assert safe_metadata({"additional_usage_values": {"prompt_tokens_details": source}}) == {
+            "additional_usage_values": {"prompt_tokens_details": expected}
+        }
+
+
 def test_diagnostic_filter_removes_content_extras_and_tracebacks(protected_config):
     record = logging.LogRecord(
         "LiteLLM", logging.ERROR, "test.py", 1, "error: %s", (CANARY,), (ValueError, ValueError(CANARY), None)
@@ -538,6 +550,7 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
             assert facts["prompt_tokens_details"]["audio_length_seconds"] == 1.25
             assert facts["prompt_tokens_details"]["character_count"] == 8
             assert facts["prompt_tokens_details"]["image_count"] == 2
+            assert facts["prompt_tokens_details"]["cache_creation_tokens"] == 2
             assert (facts["type"], facts["seconds"]) == ("duration", 1.25)
             assert persisted["model"] == "test-model"
             assert persisted["custom_llm_provider"] == "openai"
