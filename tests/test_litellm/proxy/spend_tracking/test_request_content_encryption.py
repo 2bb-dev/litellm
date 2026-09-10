@@ -185,6 +185,51 @@ def test_metadata_allowlist_drops_nested_content_and_arbitrary_numeric_keys():
     assert safe["status"] == "failure"
 
 
+def test_usage_allowlist_preserves_only_billing_modality_facts() -> None:
+    usage = {
+        "prompt_tokens_details": {
+            "cache_creation_token_details": {"ephemeral_5m_input_tokens": 2, "ephemeral_1h_input_tokens": 3},
+            "audio_length_seconds": 1.25,
+            "character_count": 8,
+            "image_count": 2,
+        },
+        "type": "duration",
+        "seconds": 1.25,
+        "duration_seconds": 0,
+        "audio_duration_seconds": 2.5,
+        "audio_seconds": 3.75,
+        "characters": 16,
+    }
+    assert safe_metadata({"additional_usage_values": usage}) == {"additional_usage_values": usage}
+    assert safe_metadata({"usage_object": usage}) == {"usage_object": usage}
+    for invalid in (True, False, -1, float("inf"), float("nan"), "1", CANARY):
+        injected = {
+            key: invalid
+            for key in (
+                "audio_length_seconds",
+                "seconds",
+                "duration_seconds",
+                "audio_duration_seconds",
+                "audio_seconds",
+                "characters",
+                "character_count",
+                "image_count",
+            )
+        }
+        assert safe_metadata({"additional_usage_values": injected}) == {"additional_usage_values": {}}
+    assert safe_metadata(
+        {
+            "additional_usage_values": {
+                "type": CANARY,
+                CANARY: 12,
+                "image_count": 1.5,
+                "characters": 2.5,
+                "cache_creation_token_details": {"ephemeral_5m_input_tokens": 2, CANARY: 99},
+            }
+        }
+    ) == {"additional_usage_values": {"cache_creation_token_details": {"ephemeral_5m_input_tokens": 2}}}
+
+
 def test_diagnostic_filter_removes_content_extras_and_tracebacks(protected_config):
     record = logging.LogRecord(
         "LiteLLM", logging.ERROR, "test.py", 1, "error: %s", (CANARY,), (ValueError, ValueError(CANARY), None)
@@ -226,7 +271,16 @@ def make_call(failed=False):
         "prompt_tokens": 9,
         "completion_tokens": 3,
         "total_tokens": 12,
-        "prompt_tokens_details": {"cached_tokens": 5, "cache_write_tokens": 2},
+        "prompt_tokens_details": {
+            "cached_tokens": 5,
+            "cache_write_tokens": 2,
+            "cache_creation_token_details": {"ephemeral_5m_input_tokens": 1, "ephemeral_1h_input_tokens": 1},
+            "audio_length_seconds": 1.25,
+            "character_count": 8,
+            "image_count": 2,
+        },
+        "type": "duration",
+        "seconds": 1.25,
     }
     response = litellm.ModelResponse(
         id="synthetic-spend-row",
@@ -474,6 +528,19 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
         assert daily["failed_requests"] == int(provider_failed)
         assert daily["successful_requests"] == int(not provider_failed)
         marker = json.loads(row["metadata"])["openorange_request_log"]
+        for persisted in (row, batch["payload_copy"]):
+            persisted_metadata = json.loads(persisted["metadata"])
+            facts = persisted_metadata["additional_usage_values"]
+            assert facts["prompt_tokens_details"]["cache_creation_token_details"] == {
+                "ephemeral_5m_input_tokens": 1,
+                "ephemeral_1h_input_tokens": 1,
+            }
+            assert facts["prompt_tokens_details"]["audio_length_seconds"] == 1.25
+            assert facts["prompt_tokens_details"]["character_count"] == 8
+            assert facts["prompt_tokens_details"]["image_count"] == 2
+            assert (facts["type"], facts["seconds"]) == ("duration", 1.25)
+            assert persisted["model"] == "test-model"
+            assert persisted["custom_llm_provider"] == "openai"
         assert marker["content_status"] == ("encrypted" if failure_mode == "none" else "capture_failed")
         if failure_mode != "transform":
             assert marker["facts"]["cron_id"] == "cron-1"

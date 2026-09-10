@@ -83,11 +83,13 @@ _USAGE_NUMBERS = frozenset(
     "cache_read_input_tokens cache_creation_input_tokens cached_tokens cache_write_tokens "
     "cache_creation_tokens reasoning_tokens audio_tokens text_tokens image_tokens "
     "accepted_prediction_tokens rejected_prediction_tokens ephemeral_5m_input_tokens "
-    "ephemeral_1h_input_tokens web_search_requests server_tool_use_tokens".split()
+    "ephemeral_1h_input_tokens web_search_requests server_tool_use_tokens "
+    "audio_length_seconds seconds duration_seconds audio_duration_seconds audio_seconds".split()
 )
+_USAGE_COUNTS = frozenset("characters character_count image_count".split())
 _USAGE_CONTAINERS = frozenset(
     "prompt_tokens_details completion_tokens_details input_tokens_details output_tokens_details "
-    "cache_creation server_tool_use".split()
+    "cache_creation cache_creation_token_details server_tool_use".split()
 )
 _COST_NUMBERS = frozenset(
     "input_cost cache_read_cost cache_creation_cost output_cost total_cost tool_usage_cost "
@@ -122,6 +124,10 @@ def _usage(value: object, depth: int = 0) -> dict[str, JsonValue]:
     result: dict[str, JsonValue] = {}
     for key, item in _object(value).items():
         if key in _USAGE_NUMBERS and isinstance(item, (float, int)) and _number(item) and item >= 0:
+            result[key] = item
+        elif key in _USAGE_COUNTS and isinstance(item, (float, int)) and _number(item) and item >= 0 and item % 1 == 0:
+            result[key] = item
+        elif key == "type" and item == "duration":
             result[key] = item
         elif key in _USAGE_CONTAINERS and isinstance(item, dict):
             result[key] = _usage(item, depth + 1)
