@@ -1,4 +1,46 @@
+import pytest
+
 from litellm.llms.deepseek.chat.transformation import DeepSeekChatConfig
+
+
+@pytest.mark.parametrize("model", ["deepseek-flash", "deepseek/deepseek-flash"])
+@pytest.mark.parametrize("thinking", [{"type": "enabled"}, {"type": "disabled"}])
+@pytest.mark.parametrize("effort", ["low", "high", "max"])
+def test_flash_preserves_thinking_controls(model: str, thinking: dict[str, str], effort: str) -> None:
+    params = {"thinking": thinking, "reasoning_effort": effort}
+    assert DeepSeekChatConfig().map_openai_params(params, {}, model, False) == params
+
+
+def test_flash_keeps_provider_defaults_and_legacy_mapping() -> None:
+    config = DeepSeekChatConfig()
+    assert config.map_openai_params({}, {}, "deepseek-flash", False) == {}
+    assert config._thinking_mode_active("deepseek-flash", {})
+    assert not config._thinking_mode_active("deepseek-flash", {"thinking": {"type": "disabled"}})
+    assert config.map_openai_params({"reasoning_effort": "high"}, {}, "deepseek-reasoner", False) == {
+        "thinking": {"type": "enabled"}
+    }
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+async def test_flash_preserves_images_and_reasoning_history(is_async: bool) -> None:
+    config = DeepSeekChatConfig()
+    image = {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "Describe"}, image]},
+        {"role": "assistant", "content": "Checking", "provider_specific_fields": {"reasoning_content": "I see red"}},
+        {"role": "user", "content": "Continue"},
+    ]
+    kwargs = {
+        "model": "deepseek-flash",
+        "messages": messages,
+        "optional_params": {},
+        "litellm_params": {},
+        "headers": {},
+    }
+    body = await config.async_transform_request(**kwargs) if is_async else config.transform_request(**kwargs)
+    assert body["messages"][0]["content"] == messages[0]["content"]
+    assert body["messages"][1]["reasoning_content"] == "I see red"
+    assert "thinking" not in body
 
 
 def _function_tool(name: str) -> dict:

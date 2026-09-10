@@ -35,12 +35,15 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         Map OpenAI params to DeepSeek params.
 
         Handles `thinking` and `reasoning_effort` parameters for DeepSeek reasoner models.
-        DeepSeek only supports `{"type": "enabled"}` - no budget_tokens like Anthropic.
+        Flash preserves native controls; legacy models map effort to thinking enabled.
 
         Reference: https://api-docs.deepseek.com/guides/thinking_mode
         """
         # Let parent handle standard params first
         optional_params = super().map_openai_params(non_default_params, optional_params, model, drop_params)
+
+        if model.removeprefix("deepseek/") == "deepseek-flash":
+            return optional_params
 
         # Pop thinking/reasoning_effort from optional_params first (parent may have added them)
         # Then re-add only if valid for DeepSeek
@@ -116,9 +119,10 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         self, messages: List[AllMessageValues], model: str, is_async: bool = False
     ) -> Union[List[AllMessageValues], Coroutine[Any, Any, List[AllMessageValues]]]:
         """
-        DeepSeek does not support content in list format.
+        Legacy DeepSeek models require string content; Flash supports images.
         """
-        messages = handle_messages_with_content_list_to_str_conversion(messages)
+        if model.removeprefix("deepseek/") != "deepseek-flash":
+            messages = handle_messages_with_content_list_to_str_conversion(messages)
         if is_async:
             return super()._transform_messages(messages=messages, model=model, is_async=True)
         else:
@@ -129,7 +133,11 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         Returns True only when thinking mode is actually active for this request:
           - model supports reasoning (capability check)
           - user explicitly passed thinking={"type": "enabled"} (opt-in check)
+
+        Flash enables thinking by default unless explicitly disabled.
         """
+        if model.removeprefix("deepseek/") == "deepseek-flash":
+            return (optional_params.get("thinking") or {}).get("type") != "disabled"
         return (
             supports_reasoning(model=model, custom_llm_provider="deepseek")
             and (optional_params.get("thinking") or {}).get("type") == "enabled"
