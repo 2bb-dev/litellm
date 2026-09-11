@@ -2895,7 +2895,7 @@ async def add_litellm_data_to_request(
         data["api_version"] = dynamic_api_version
 
     ## Forward any LLM API Provider specific headers in extra_headers
-    add_provider_specific_headers_to_request(data=data, headers=_headers)
+    add_provider_specific_headers_to_request(data=data, headers=_headers, raw_headers=request.headers)
 
     ## Cache Controls
     cache_control_header = _headers.get("Cache-Control", None)
@@ -4099,7 +4099,7 @@ async def add_guardrails_from_policy_engine(
     )
 
 
-def _get_venice_e2ee_headers(headers: dict) -> dict[str, str]:
+def _get_venice_e2ee_headers(headers: dict | Headers) -> dict[str, str]:
     # These public handshake values must survive the proxy hop together.
     # Forward only the explicit Venice allowlist, never proxy auth or cookies.
     venice_names = {
@@ -4123,7 +4123,7 @@ def _get_venice_e2ee_headers(headers: dict) -> dict[str, str]:
     return venice_headers
 
 
-def _add_venice_e2ee_headers(data: dict, headers: dict) -> None:
+def _add_venice_e2ee_headers(data: dict, headers: dict | Headers) -> None:
     venice_headers = _get_venice_e2ee_headers(headers)
     if not venice_headers:
         return
@@ -4146,9 +4146,12 @@ def _add_venice_e2ee_headers(data: dict, headers: dict) -> None:
 def add_provider_specific_headers_to_request(
     data: dict,
     headers: dict,
+    raw_headers: Headers | None = None,
 ):
     from litellm.llms.anthropic.common_utils import is_anthropic_oauth_key
 
+    if raw_headers is not None:
+        _get_venice_e2ee_headers(raw_headers)
     _add_venice_e2ee_headers(data, headers)
 
     anthropic_headers = {}

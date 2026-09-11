@@ -6360,3 +6360,30 @@ class TestVeniceE2EEHeaders:
         with pytest.raises(HTTPException) as error:
             add_provider_specific_headers_to_request({"extra_headers": extra_headers}, self._headers())
         assert error.value.status_code == 400
+
+
+    def test_raw_asgi_duplicate_headers_rejected_before_collapsing(self):
+        from fastapi import HTTPException
+        from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request
+
+        headers = self._headers()
+        raw = Headers(raw=[(k.encode(), v.encode()) for k, v in headers.items()] + [
+            (b"x-venice-tee-client-pub-key", b"different-key")
+        ])
+        with pytest.raises(HTTPException) as error:
+            add_provider_specific_headers_to_request({}, dict(raw), raw_headers=raw)
+        assert error.value.status_code == 400
+
+
+    def test_raw_headers_do_not_restore_a_filtered_auth_header(self):
+        from fastapi import HTTPException
+        from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request
+
+        raw = Headers(self._headers())
+        sanitized = dict(raw)
+        del sanitized["x-venice-tee-client-pub-key"]
+        data = {}
+        with pytest.raises(HTTPException) as error:
+            add_provider_specific_headers_to_request(data, sanitized, raw_headers=raw)
+        assert error.value.status_code == 400
+        assert "extra_headers" not in data
