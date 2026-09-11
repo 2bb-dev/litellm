@@ -4105,6 +4105,40 @@ def add_provider_specific_headers_to_request(
 ):
     from litellm.llms.anthropic.common_utils import is_anthropic_oauth_key
 
+    # These public handshake values must survive the proxy hop together.
+    # Forward only the explicit Venice allowlist, never proxy auth or cookies.
+    venice_names = {
+        "x-venice-tee-client-pub-key",
+        "x-venice-tee-model-pub-key",
+        "x-venice-tee-signing-algo",
+    }
+    venice_headers = {}
+    for name, value in headers.items():
+        normalized = name.lower()
+        if normalized in venice_names:
+            if normalized in venice_headers and venice_headers[normalized] != value:
+                raise HTTPException(status_code=400, detail="Conflicting Venice E2EE headers")
+            venice_headers[normalized] = value
+    if venice_headers:
+        if set(venice_headers) != venice_names or any(
+            not isinstance(value, str) or not value.strip() for value in venice_headers.values()
+        ):
+            raise HTTPException(status_code=400, detail="Incomplete Venice E2EE handshake headers")
+        existing = data.get("extra_headers")
+        if existing is None:
+            existing = {}
+        if not isinstance(existing, dict):
+            raise HTTPException(status_code=400, detail="extra_headers must be an object")
+        merged = {}
+        for name, value in existing.items():
+            normalized = name.lower()
+            if normalized in venice_names:
+                if value != venice_headers[normalized]:
+                    raise HTTPException(status_code=400, detail="Conflicting Venice E2EE headers")
+            else:
+                merged[name] = value
+        data["extra_headers"] = {**merged, **venice_headers}
+
     anthropic_headers = {}
     # boolean to indicate if a header was added
     added_header = False

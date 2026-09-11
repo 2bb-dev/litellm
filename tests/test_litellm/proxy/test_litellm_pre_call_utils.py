@@ -6281,3 +6281,82 @@ async def test_add_litellm_data_to_request_claude_code_drop_params(
     )
 
     assert updated.get("drop_params") == expected_drop_params
+
+
+class TestVeniceE2EEHeaders:
+    def _headers(self):
+        return {
+            "x-venice-tee-client-pub-key": "04" + "11" * 64,
+            "x-venice-tee-model-pub-key": "04" + "22" * 64,
+            "x-venice-tee-signing-algo": "ecdsa",
+        }
+
+    def test_preserves_encryption_headers_without_forwarding_proxy_auth(self):
+        from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request
+
+        headers = self._headers()
+        data = {"extra_headers": {"existing": "kept"}}
+        add_provider_specific_headers_to_request(
+            data, {**headers, "authorization": "Bearer proxy-secret", "cookie": "private"}
+        )
+        assert data["extra_headers"] == {"existing": "kept", **headers}
+
+    def test_case_insensitive_header_names(self):
+        from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request
+
+        data = {}
+        add_provider_specific_headers_to_request(data, {k.title(): v for k, v in self._headers().items()})
+        assert data["extra_headers"] == self._headers()
+
+    @pytest.mark.parametrize("missing", ["client", "model", "algo"])
+    def test_partial_handshake_rejected(self, missing):
+        from fastapi import HTTPException
+        from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request
+
+        headers = {k: v for k, v in self._headers().items() if missing not in k}
+        with pytest.raises(HTTPException) as error:
+            add_provider_specific_headers_to_request({}, headers)
+        assert error.value.status_code == 400
+
+    def test_conflicting_body_header_rejected(self):
+        from fastapi import HTTPException
+        from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request
+
+        data = {"extra_headers": {"X-Venice-Tee-Client-Pub-Key": "different-key"}}
+        with pytest.raises(HTTPException) as error:
+            add_provider_specific_headers_to_request(data, self._headers())
+        assert error.value.status_code == 400
+
+    def test_matching_body_header_is_normalized_without_duplicates(self):
+        from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request
+
+        headers = self._headers()
+        data = {"extra_headers": {"X-Venice-Tee-Client-Pub-Key": headers["x-venice-tee-client-pub-key"]}}
+        add_provider_specific_headers_to_request(data, headers)
+        assert data["extra_headers"] == headers
+
+    def test_ordinary_headers_leave_data_unchanged(self):
+        from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request
+
+        data = {"model": "ordinary"}
+        add_provider_specific_headers_to_request(data, {"authorization": "Bearer proxy-secret"})
+        assert data == {"model": "ordinary"}
+
+
+    def test_duplicate_header_casing_cannot_select_a_different_key(self):
+        from fastapi import HTTPException
+        from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request
+
+        headers = {**self._headers(), "X-Venice-Tee-Client-Pub-Key": "other"}
+        with pytest.raises(HTTPException) as error:
+            add_provider_specific_headers_to_request({}, headers)
+        assert error.value.status_code == 400
+
+    @pytest.mark.parametrize("extra_headers", [[], "invalid", 1])
+    def test_invalid_extra_headers_rejected(self, extra_headers):
+        from fastapi import HTTPException
+        from litellm.proxy.litellm_pre_call_utils import add_provider_specific_headers_to_request
+
+        with pytest.raises(HTTPException) as error:
+            add_provider_specific_headers_to_request({"extra_headers": extra_headers}, self._headers())
+        assert error.value.status_code == 400
