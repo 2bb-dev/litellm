@@ -82,7 +82,8 @@ RUN uv sync --frozen --no-default-groups --no-editable \
     --extra semantic-router \
     --python /usr/bin/python3.13
 
-RUN prisma generate --schema=./schema.prisma
+RUN prisma generate --schema=./schema.prisma && \
+    python -c "from prisma import Prisma"
 
 RUN sed -i 's/\r$//' docker/entrypoint.sh && chmod +x docker/entrypoint.sh && \
     sed -i 's/\r$//' docker/prod_entrypoint.sh && chmod +x docker/prod_entrypoint.sh
