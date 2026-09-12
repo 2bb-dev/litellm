@@ -71,6 +71,7 @@ jobs:
           uv run --no-sync pytest -q \
             tests/test_litellm/test_utils.py::test_json_provider_extras_reach_openai_sdk_http_body \
             tests/test_litellm/test_utils.py::test_json_provider_can_explicitly_drop_extra_body \
+            tests/test_litellm/litellm_core_utils/test_exception_mapping_utils.py::test_json_provider_sdk_error_status \
             tests/test_litellm/llms/openai_like/test_json_providers.py
 
       - name: Verify OSS dependency graph and imports
