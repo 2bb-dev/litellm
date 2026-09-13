@@ -58,6 +58,15 @@ class _ProxyDBLogger(CustomLogger):
                     "Failed to invalidate budget reservation counters after failure release failed"
                 )
 
+        from litellm.litellm_core_utils.accounting_context import accounting_request
+
+        accounting = accounting_request.get()
+        if (
+            accounting is not None
+            and accounting.dispatched
+            and not isinstance(request_data.get("combined_usage_object"), litellm.Usage)
+        ):
+            return
         request_route = user_api_key_dict.request_route
         if _ProxyDBLogger._should_track_errors_in_db() is False:
             return
@@ -240,17 +249,20 @@ class _ProxyDBLogger(CustomLogger):
 
                     # update cache (fire-and-forget for backward compat:
                     # cached object fields, soft budget alerts, etc.)
-                    asyncio.create_task(
-                        update_cache(
-                            token=user_api_key,
-                            user_id=user_id,
-                            end_user_id=end_user_id,
-                            response_cost=response_cost,
-                            team_id=team_id,
-                            parent_otel_span=parent_otel_span,
-                            tags=tags,
+                    from litellm.litellm_core_utils.accounting_context import accounting_request
+
+                    if accounting_request.get() is None:
+                        asyncio.create_task(
+                            update_cache(
+                                token=user_api_key,
+                                user_id=user_id,
+                                end_user_id=end_user_id,
+                                response_cost=response_cost,
+                                team_id=team_id,
+                                parent_otel_span=parent_otel_span,
+                                tags=tags,
+                            )
                         )
-                    )
 
                     await proxy_logging_obj.slack_alerting_instance.customer_spend_alert(
                         token=user_api_key,
@@ -290,6 +302,11 @@ class _ProxyDBLogger(CustomLogger):
                         f"Cost tracking failed for model={model}.\nDebug info - {cost_tracking_failure_debug_info}\nAdd custom pricing - https://docs.litellm.ai/docs/proxy/custom_pricing"
                     )
         except Exception as e:
+            from litellm.litellm_core_utils.accounting_context import accounting_request
+
+            accounting = accounting_request.get()
+            if accounting is not None:
+                accounting.failed = True
             error_msg = f"Error in tracking cost callback - {str(e)}\n Traceback:{traceback.format_exc()}"
             model = kwargs.get("model", "")
             metadata = get_litellm_metadata_from_kwargs(kwargs=kwargs)
@@ -408,6 +425,10 @@ def _should_track_cost_callback(
 
 
 def _get_budget_reservation_from_metadata(metadata: dict) -> Optional[dict]:
+    from litellm.litellm_core_utils.accounting_context import accounting_request
+
+    if accounting_request.get() is not None:
+        return None
     metadata_budget_reservation = metadata.get("user_api_key_budget_reservation")
     if isinstance(metadata_budget_reservation, dict):
         return metadata_budget_reservation
@@ -480,6 +501,10 @@ async def _update_database_and_spend_counters(
                     )
         raise
 
+    from litellm.litellm_core_utils.accounting_context import accounting_request
+
+    if accounting_request.get() is not None:
+        return
     try:
         await increment_spend_counters(
             token=user_api_key,

@@ -2187,6 +2187,13 @@ async def _run_centralized_common_checks(
     # else branch. After the for-loop above, the only BaseException that
     # can still appear here is HTTPException (other listed re-raises were
     # propagated; non-listed exceptions were already swallowed to None).
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is not None and user_api_key_auth_obj.team_id is not None:
+        if isinstance(team_result, BaseException):
+            raise team_result
+        if team_result is None:
+            raise HTTPException(503, "PostgreSQL accounting: authoritative Team unavailable")
     team_object: Optional[LiteLLM_TeamTableCachedObj]
     if isinstance(team_result, BaseException):
         # Token-derived fallback only valid when a team_id is set;
@@ -2308,7 +2315,7 @@ async def _reserve_budget_after_common_checks(
     end_user_object: Optional[LiteLLM_EndUserTable] = None,
 ) -> None:
     user_api_key_auth_obj.budget_reservation = None
-    if skip_budget_checks:
+    if skip_budget_checks and not general_settings.get("postgres_admission_accounting"):
         return
     if general_settings.get("disable_budget_reservation") is True:
         verbose_proxy_logger.warning(
@@ -2402,6 +2409,10 @@ async def user_api_key_auth(
     _ensure_parent_otel_span_on_request_state(request)
 
     request_data = await _read_request_body(request=request)
+    from litellm.litellm_core_utils.accounting_context import accounting_request
+    import copy
+
+    accounting_input = copy.deepcopy(request_data) if accounting_request.get() is not None else None
     request_data = populate_request_with_path_params(request_data=request_data, request=request)
     route: str = get_request_route(request=request)
     ## CHECK IF ROUTE IS ALLOWED
@@ -2431,6 +2442,10 @@ async def user_api_key_auth(
         # admin-only-route / model-access / budget checks) surface as
         # ProxyException consistently with pre-refactor behavior.
         try:
+            if accounting_input is not None:
+                from litellm.proxy.spend_tracking.postgres_accounting_config import validate_request
+
+                validate_request(accounting_input)
             await _run_centralized_common_checks(
                 user_api_key_auth_obj=user_api_key_auth_obj,
                 request=request,

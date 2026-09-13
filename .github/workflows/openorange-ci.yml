@@ -18,6 +18,21 @@ jobs:
     name: Fork regressions and OSS guards
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      accounting-postgres:
+        image: postgres@sha256:20edbde7749f822887a1a022ad526fde0a47d6b2be9a8364433605cf65099416
+        env:
+          POSTGRES_USER: accounting_test
+          POSTGRES_PASSWORD: isolated-ci-only
+          POSTGRES_DB: accounting_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U accounting_test -d accounting_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      LITELLM_TELEMETRY: "False"
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
@@ -40,10 +55,50 @@ jobs:
           --extra proxy --extra proxy-runtime --extra extra_proxy
           --extra semantic-router
 
+      - name: Configure isolated database connection
+        env:
+          DATABASE_URL: postgresql://accounting_test:isolated-ci-only@127.0.0.1:${{ job.services.accounting-postgres.ports['5432'] }}/accounting_test
+        run: printf 'DATABASE_URL=%s\n' "$DATABASE_URL" >> "$GITHUB_ENV"
+
       - name: Generate Prisma client
         env:
           PRISMA_BINARY_CACHE_DIR: ${{ runner.temp }}/prisma-cache
         run: uv run --no-sync prisma generate --schema litellm/proxy/schema.prisma
+
+      - name: Prepare isolated accounting database
+        run: |
+          uv run --no-sync python - <<'PY'
+          import os
+          from pathlib import Path
+          schema = Path('litellm/proxy/schema.prisma').read_text()
+          native, accounting = schema.split('\nmodel LiteLLM_AccountingProtocol {', 1)
+          assert 'model LiteLLM_AccountingRequest {' in accounting
+          Path(os.environ['RUNNER_TEMP'], 'accounting-base.prisma').write_text(native)
+          PY
+          uv run --no-sync prisma db push --skip-generate --schema "$RUNNER_TEMP/accounting-base.prisma"
+          for migration in \
+            20260912120000_shared_admission_accounting \
+            20260913090000_accounting_components \
+            20260913160000_accounting_native_user \
+            20260914090000_accounting_native_team; do
+            uv run --no-sync prisma db execute --schema litellm/proxy/schema.prisma \
+              --file "litellm-proxy-extras/litellm_proxy_extras/migrations/$migration/migration.sql"
+          done
+
+      - name: Run isolated accounting regressions
+        env:
+          LITELLM_ACCOUNTING_TEST_DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: |
+          uv run --no-sync pytest -q \
+            tests/test_litellm/proxy/spend_tracking/test_postgres_accounting.py \
+            tests/test_litellm/proxy/response_api_endpoints/test_endpoints.py::test_responses_native_body_schema_rejects_before_execution \
+            --junitxml=accounting-results.xml
+          uv run --no-sync python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse('accounting-results.xml').findall('.//testcase')
+          assert cases, 'accounting tests were not collected'
+          assert not any(case.find('skipped') is not None for case in cases), 'accounting tests must not skip in CI'
+          PY
 
       - name: Run focused fork regressions
         run: |

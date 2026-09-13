@@ -46,6 +46,13 @@ class ResetBudgetJob:
 
         Updates db
         """
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            await postgres_accounting.runtime.reset_keys()
+            await postgres_accounting.runtime.reset_users()
+            await postgres_accounting.runtime.reset_teams()
+            return
         if self.prisma_client is not None:
             ### RESET KEY BUDGET ###
             await self.reset_budget_for_litellm_keys()
@@ -374,6 +381,12 @@ class ResetBudgetJob:
         aborts the entire batch — silently leaving spend over the cap and
         budget_reset_at unchanged forever.
         """
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            for key in updated_keys:
+                await postgres_accounting.runtime.refresh_key(key.token)
+            return
         batcher = self.prisma_client.db.batch_()
         for k in updated_keys:
             token = getattr(k, "token", None)
@@ -393,6 +406,12 @@ class ResetBudgetJob:
         that trips Prisma's DataError on rows carrying unrecognised fields
         (see #27730).
         """
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            for user in updated_users:
+                await postgres_accounting.runtime.refresh_user(user.user_id)
+            return
         batcher = self.prisma_client.db.batch_()
         for u in updated_users:
             user_id = getattr(u, "user_id", None)
@@ -412,6 +431,12 @@ class ResetBudgetJob:
         that trips Prisma's DataError on rows carrying unrecognised fields
         (see #27730).
         """
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            for team in sorted(updated_teams, key=lambda t: t.team_id):
+                await postgres_accounting.runtime.refresh_team(team.team_id)
+            return
         batcher = self.prisma_client.db.batch_()
         for t in updated_teams:
             team_id = getattr(t, "team_id", None)
@@ -429,6 +454,11 @@ class ResetBudgetJob:
 
         Catches Exceptions and logs them
         """
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            await postgres_accounting.runtime.reset_keys()
+            return
         now = datetime.utcnow()
         start_time = time.time()
         keys_to_reset: Optional[List[LiteLLM_VerificationToken]] = None
@@ -503,6 +533,11 @@ class ResetBudgetJob:
         """
         Resets the budget for all LiteLLM Internal Users if their budget has expired
         """
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            await postgres_accounting.runtime.reset_users()
+            return
         now = datetime.utcnow()
         start_time = time.time()
         users_to_reset: Optional[List[LiteLLM_UserTable]] = None
@@ -578,6 +613,11 @@ class ResetBudgetJob:
         """
         Resets the budget for all LiteLLM Internal Teams if their budget has expired
         """
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            await postgres_accounting.runtime.reset_teams()
+            return
         now = datetime.utcnow()
         start_time = time.time()
         teams_to_reset: Optional[List[LiteLLM_TeamTable]] = None

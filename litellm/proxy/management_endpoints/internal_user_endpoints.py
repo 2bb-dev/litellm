@@ -440,6 +440,12 @@ async def new_user(
                 detail=f"Only proxy admins can create administrative users (proxy_admin, proxy_admin_viewer). Attempted to create user with role: {data.user_role}. Your role: {user_api_key_dict.user_role}",
             )
 
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            postgres_accounting.runtime.validate_user(data.model_dump(mode="json"))
+            if data.teams is None and check_if_default_team_set():
+                raise HTTPException(503, "PostgreSQL accounting: default team integration pending")
         data_json = data.json()  # type: ignore
         data_json = _update_internal_new_user_params(data_json, data)
         _hash_password_in_dict(data_json)
@@ -1079,7 +1085,12 @@ def _update_internal_user_params(
     if data.user_role == LitellmUserRoles.INTERNAL_USER:
         is_internal_user = True
 
-    if "budget_duration" in non_default_values:
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is not None and "budget_duration" in fields_set:
+        non_default_values["budget_duration"] = data_json.get("budget_duration")
+
+    if non_default_values.get("budget_duration") is not None:
         from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
 
         non_default_values["budget_reset_at"] = get_budget_reset_time(
@@ -1214,6 +1225,11 @@ async def _update_single_user_helper(
 
     _check_user_update_authz(user_request, user_api_key_dict, existing_user_row)
 
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is not None:
+        postgres_accounting.runtime.validate_user(user_request.model_dump(mode="json", exclude_unset=True))
+
     if existing_user_row is not None:
         existing_user_row = LiteLLM_UserTable(**existing_user_row.model_dump(exclude_none=True))
 
@@ -1226,7 +1242,11 @@ async def _update_single_user_helper(
     )
     _is_self_update = _target_user_id is not None and user_api_key_dict.user_id == _target_user_id
     if _is_self_update and user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN.value:
-        _protected_fields = ("max_budget", "soft_budget", "spend")
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        _protected_fields = ("max_budget", "soft_budget", "spend") + (
+            ("budget_duration",) if postgres_accounting.runtime is not None else ()
+        )
         for _field in _protected_fields:
             if _field in non_default_values:
                 raise HTTPException(

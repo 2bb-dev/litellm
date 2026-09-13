@@ -102,9 +102,14 @@ class IdentityStore:
         if self._prisma is None:
             raise NoDatabaseConnectionError()
 
-        cached = await self._cache.async_get_cache(key=hashed_token, model_type=UserAPIKeyAuth)
-        if cached is not None:
-            return _copy_user_api_key_auth_for_cache(user_api_key_obj=cached)
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is None:
+            cached = await self._cache.async_get_cache(key=hashed_token, model_type=UserAPIKeyAuth)
+            if cached is not None:
+                return _copy_user_api_key_auth_for_cache(user_api_key_obj=cached)
+        elif not self._check_cache_only:
+            await postgres_accounting.runtime.refresh_key(hashed_token)
 
         if self._check_cache_only:
             raise KeyNotInCacheError(hashed_token)

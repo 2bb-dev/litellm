@@ -253,6 +253,12 @@ async def patch_model(
                 param="blocked",
             )
 
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            from litellm.proxy.spend_tracking.postgres_accounting_config import validate_deployment
+
+            validate_deployment(patch_data.model_dump(exclude_none=True, mode="json"), partial=True)
         # Handle team model updates with proper alias management
         update_data = await _update_team_model_in_db(
             db_model=db_model,
@@ -474,6 +480,12 @@ async def _add_model_to_db(
     new_encryption_key: Optional[str] = None,
     should_create_model_in_db: bool = True,
 ) -> Optional[LiteLLM_ProxyModelTable]:
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is not None:
+        from litellm.proxy.spend_tracking.postgres_accounting_config import validate_deployment
+
+        validate_deployment(model_params.model_dump(exclude_none=True, mode="json"))
     # encrypt litellm params #
     _litellm_params_dict = model_params.litellm_params.dict(exclude_none=True)
     _original_litellm_model_name = model_params.litellm_params.model
@@ -1422,6 +1434,12 @@ async def update_model(
                 raise Exception("litellm_params not provided")
 
             _new_litellm_params_dict = model_params.litellm_params.dict(exclude_none=True)
+            from litellm.proxy.spend_tracking import postgres_accounting
+
+            if postgres_accounting.runtime is not None:
+                from litellm.proxy.spend_tracking.postgres_accounting_config import validate_deployment
+
+                validate_deployment(model_params.model_dump(exclude_none=True, mode="json"), partial=True)
 
             ### ENCRYPT PARAMS ###
             for k, v in _new_litellm_params_dict.items():

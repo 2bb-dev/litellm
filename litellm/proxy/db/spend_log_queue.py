@@ -185,6 +185,19 @@ class SQLiteSpendLogSpool:
         async with self._operation_lock:
             await asyncio.to_thread(self._acknowledge_sync, list(row_ids))
 
+    async def defer(self, row_id: int) -> None:
+        async with self._operation_lock:
+            await asyncio.to_thread(self._defer_sync, row_id)
+
+    def _defer_sync(self, row_id: int) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO spend_log_spool(payload, payload_bytes, created_at) "
+                "SELECT payload, payload_bytes, created_at FROM spend_log_spool WHERE id=?",
+                (row_id,),
+            )
+            connection.execute("DELETE FROM spend_log_spool WHERE id=?", (row_id,))
+
     async def quarantine(self, row_ids: Sequence[int], error: str) -> None:
         if not row_ids:
             return

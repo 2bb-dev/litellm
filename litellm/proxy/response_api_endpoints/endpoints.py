@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import fastapi
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from pydantic import TypeAdapter, ValidationError
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from litellm._logging import verbose_proxy_logger
@@ -17,10 +18,11 @@ from litellm.proxy.auth.user_api_key_auth import (
     user_api_key_auth_websocket,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
-from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
+from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIRequestParams, ResponsesAPIResponse
 from litellm.types.responses.main import DeleteResponseResult
 
 router = APIRouter()
+_responses_request = TypeAdapter(ResponsesAPIRequestParams)
 
 
 @router.post(
@@ -91,6 +93,10 @@ async def responses_api(
     )
 
     data = await _read_request_body(request=request)
+    try:
+        _responses_request.validate_python(data)
+    except ValidationError as exc:
+        raise HTTPException(422, detail=exc.errors(include_input=False, include_context=False))
 
     # Check if polling via cache should be used for this request
     from litellm.proxy.response_polling.polling_handler import (

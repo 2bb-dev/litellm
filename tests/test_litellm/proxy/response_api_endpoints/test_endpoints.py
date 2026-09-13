@@ -11,6 +11,28 @@ from fastapi.testclient import TestClient
 from litellm.proxy.proxy_server import app
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"model": "gpt-4o", "input": 123},
+        {"model": "gpt-4o", "input": "private-prompt", "max_output_tokens": "invalid"},
+    ],
+)
+def test_responses_native_body_schema_rejects_before_execution(body):
+    from fastapi import FastAPI
+    from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
+    from litellm.proxy.response_api_endpoints.endpoints import router
+
+    isolated = FastAPI()
+    isolated.include_router(router)
+    isolated.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(api_key="local-test-key")
+    with TestClient(isolated) as client:
+        response = client.post("/v1/responses", json=body)
+    assert response.status_code == 422
+    assert "private-prompt" not in response.text
+    assert all("input" not in error for error in response.json()["detail"])
+
+
 class TestResponsesAPIEndpoints(unittest.TestCase):
     @pytest.mark.asyncio
     @patch("litellm.proxy.proxy_server.llm_router")

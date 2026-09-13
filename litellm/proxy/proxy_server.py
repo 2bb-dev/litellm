@@ -871,6 +871,11 @@ async def proxy_startup_event(app: FastAPI):
             user_api_key_cache=user_api_key_cache,
         )
 
+    if general_settings.get("postgres_admission_accounting"):
+        from litellm.proxy.spend_tracking.postgres_accounting import initialize as initialize_accounting
+
+        await initialize_accounting(prisma_client, general_settings, llm_router)
+
     if prisma_client is not None:
 
         async def _run_pw_migration():
@@ -1732,6 +1737,9 @@ app.add_middleware(
 
 app.add_middleware(PrometheusAuthMiddleware)
 app.add_middleware(InFlightRequestsMiddleware)
+from litellm.proxy.spend_tracking.postgres_accounting_middleware import AccountingMiddleware
+
+app.add_middleware(AccountingMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 
 
@@ -2045,6 +2053,10 @@ async def get_current_spend(
     and cached in-process for a few seconds, so a persistently stale counter
     drives at most one read per counter per window rather than one per request.
     """
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is not None:
+        return await postgres_accounting.runtime.current_spend(counter_key)
     current, verified = await _read_spend_counter_estimate(counter_key=counter_key, fallback_spend=fallback_spend)
     if fallback_authoritative:
         verified = True
@@ -3959,6 +3971,10 @@ class ProxyConfig:
 
         config: dict = await self.get_config(config_file_path=config_file_path)
 
+        if (config.get("general_settings") or {}).get("postgres_admission_accounting"):
+            from litellm.proxy.spend_tracking.postgres_accounting_config import validate_config
+
+            validate_config(config)
         self._load_environment_variables(config=config)
 
         ## Callback settings
@@ -4924,6 +4940,15 @@ class ProxyConfig:
                 )
                 continue  # skip to next model
             _model_info = self.get_model_info_with_id(model=m, db_model=True)  ## 👈 FLAG = True for db_models
+            if general_settings.get("postgres_admission_accounting"):
+                from litellm.proxy.spend_tracking.postgres_accounting_config import validate_deployment
+
+                validate_deployment(
+                    {
+                        "litellm_params": _litellm_params.model_dump(exclude_none=True, mode="json"),
+                        "model_info": _model_info.model_dump(exclude_none=True, mode="json"),
+                    }
+                )
 
             added = llm_router.upsert_deployment(
                 deployment=Deployment(
@@ -4955,6 +4980,15 @@ class ProxyConfig:
                 continue  # skip to next model
 
             _model_info = self.get_model_info_with_id(model=m)
+            if general_settings.get("postgres_admission_accounting"):
+                from litellm.proxy.spend_tracking.postgres_accounting_config import validate_deployment
+
+                validate_deployment(
+                    {
+                        "litellm_params": _litellm_params.model_dump(exclude_none=True, mode="json"),
+                        "model_info": _model_info.model_dump(exclude_none=True, mode="json"),
+                    }
+                )
             _model_list.append(
                 Deployment(
                     model_name=m.model_name,

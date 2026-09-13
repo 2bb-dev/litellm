@@ -1399,3 +1399,78 @@ model LiteLLM_WorkflowMessage {
   @@unique([run_id, sequence_number])
   @@index([run_id])
 }
+
+model LiteLLM_AccountingProtocol {
+  id String @id
+  version Int
+}
+
+model LiteLLM_AccountingGeneration {
+  id String @id
+  version Int
+  accepting Boolean @default(true)
+  created_at DateTime @default(now())
+  requests LiteLLM_AccountingRequest[]
+}
+
+model LiteLLM_AccountingRequest {
+  id String @id
+  generation_id String
+  key_token String?
+  user_id String?
+  team_id String?
+  dispatched Boolean @default(false)
+  input_cost Float @default(0)
+  generation LiteLLM_AccountingGeneration @relation(fields: [generation_id], references: [id], onDelete: Restrict)
+  sealed Boolean @default(false)
+  failed Boolean @default(false)
+  closed Boolean @default(false)
+  expected String[]
+  created_at DateTime @default(now())
+  components LiteLLM_AccountingComponent[]
+  holds LiteLLM_AccountingHold[]
+  @@index([generation_id, closed])
+}
+
+model LiteLLM_AccountingComponent {
+  id String @id
+  request_id String
+  request LiteLLM_AccountingRequest @relation(fields: [request_id], references: [id], onDelete: Restrict)
+  actual Boolean @default(false)
+  total Float @default(0)
+  liability Float @default(0)
+  dispatched Boolean @default(false)
+  nonexecution Boolean @default(false)
+  receipts LiteLLM_AccountingReceipt[]
+}
+
+model LiteLLM_AccountingScope {
+  id String @id
+  kind String
+  entity_id String
+  epoch String
+  holds LiteLLM_AccountingHold[]
+  @@unique([kind, entity_id, epoch])
+}
+
+model LiteLLM_AccountingHold {
+  request_id String
+  scope_id String
+  request LiteLLM_AccountingRequest @relation(fields: [request_id], references: [id], onDelete: Restrict)
+  scope LiteLLM_AccountingScope @relation(fields: [scope_id], references: [id], onDelete: Restrict)
+  amount Float
+  disposition String @default("held")
+  @@id([request_id, scope_id])
+  @@index([scope_id, disposition])
+}
+
+model LiteLLM_AccountingReceipt {
+  id String @id
+  component_id String
+  component LiteLLM_AccountingComponent @relation(fields: [component_id], references: [id], onDelete: Restrict)
+  basis String
+  payload_hash String
+  total Float
+  created_at DateTime @default(now())
+  @@unique([component_id, basis])
+}

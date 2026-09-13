@@ -787,6 +787,7 @@ async def _check_user_team_limits(
     user_api_key_dict: UserAPIKeyAuth,
     prisma_client: PrismaClient,
     user_api_key_cache: Any,
+    user_object: Optional[LiteLLM_UserTable] = None,
 ) -> None:
     """
     Enforce the caller's personal limits when CREATING a standalone team.
@@ -802,7 +803,7 @@ async def _check_user_team_limits(
     """
     # Validate team budget against user's max_budget
     if data.max_budget is not None and user_api_key_dict.user_id is not None:
-        user_obj = await get_user_object(
+        user_obj = user_object or await get_user_object(
             user_id=user_api_key_dict.user_id,
             prisma_client=prisma_client,
             user_api_key_cache=user_api_key_cache,
@@ -1122,6 +1123,13 @@ async def new_team(
             if creating_user_in_list is False:
                 data.members_with_roles.append(Member(role="admin", user_id=user_api_key_dict.user_id))
 
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            postgres_accounting.runtime.validate_team(data.model_dump(mode="json"))
+            if any(not member.user_id for member in data.members_with_roles):
+                raise HTTPException(503, "PostgreSQL accounting: email-only Team membership pending")
+
         _check_passthrough_routes_caller_permission(data, user_api_key_dict, entity="team")
 
         ## ADD TO MODEL TABLE
@@ -1225,25 +1233,30 @@ async def new_team(
         if complete_team_data_dict.get("metadata") is not None:
             complete_team_data_dict["metadata"] = encrypt_callback_vars(complete_team_data_dict["metadata"])
 
-        complete_team_data_dict = prisma_client.jsonify_team_object(db_data=complete_team_data_dict)
+        if postgres_accounting.runtime is not None:
+            team_row = await postgres_accounting.runtime.create_team(
+                complete_team_data_dict,
+                members_with_roles,
+                user_api_key_dict,
+            )
+        else:
+            team_row = await TeamRepository(prisma_client).table.create(
+                data=prisma_client.jsonify_team_object(db_data=complete_team_data_dict),
+                include={"litellm_model_table": True},  # type: ignore
+            )
 
-        team_row: LiteLLM_TeamTable = await TeamRepository(prisma_client).table.create(
-            data=complete_team_data_dict,
-            include={"litellm_model_table": True},  # type: ignore
-        )
-
-        ## ADD TEAM ID TO USER TABLE ##
-        team_member_add_request = TeamMemberAddRequest(
-            team_id=data.team_id,
-            member=members_with_roles,
-        )
-        await _add_team_members_to_team(
-            data=team_member_add_request,
-            complete_team_data=team_row,
-            prisma_client=prisma_client,
-            user_api_key_dict=user_api_key_dict,
-            litellm_proxy_admin_name=litellm_proxy_admin_name,
-        )
+            ## ADD TEAM ID TO USER TABLE ##
+            team_member_add_request = TeamMemberAddRequest(
+                team_id=data.team_id,
+                member=members_with_roles,
+            )
+            await _add_team_members_to_team(
+                data=team_member_add_request,
+                complete_team_data=team_row,
+                prisma_client=prisma_client,
+                user_api_key_dict=user_api_key_dict,
+                litellm_proxy_admin_name=litellm_proxy_admin_name,
+            )
 
         # Enterprise Feature - Audit Logging. Enable with litellm.store_audit_logs = True
         if litellm.store_audit_logs is True:
@@ -1654,6 +1667,13 @@ async def update_team(
         if data.team_id is None:
             raise HTTPException(status_code=400, detail={"error": "No team id passed in"})
         verbose_proxy_logger.debug("/team/update - %s", data)
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            changes = data.model_dump(mode="json", exclude_unset=True)
+            if "budget_reset_at" in changes:
+                raise HTTPException(503, "PostgreSQL accounting: Team reset boundary is server-owned")
+            postgres_accounting.runtime.validate_team_update(changes)
 
         # Validate budget values are not negative
         if data.max_budget is not None and (not math.isfinite(data.max_budget) or data.max_budget < 0):
@@ -1683,6 +1703,9 @@ async def update_team(
                 status_code=404,
                 detail={"error": f"Team not found, passed team_id={data.team_id}"},
             )
+
+        if postgres_accounting.runtime is not None:
+            postgres_accounting.runtime.validate_team(existing_team_row.model_dump(mode="json"))
 
         # Verify caller has access to manage this team
         await _verify_team_access(
@@ -1874,17 +1897,15 @@ async def update_team(
             updated_kv["router_settings"] = safe_dumps(updated_kv["router_settings"])
 
         updated_kv = prisma_client.jsonify_team_object(db_data=updated_kv)
-        team_row: Optional[LiteLLM_TeamTable] = await TeamRepository(prisma_client).table.update(
-            where={"team_id": data.team_id},
-            data=updated_kv,
-            # `object_permission` is included so `_refresh_cached_team`
-            # doesn't write a cached team with the relation nulled out —
-            # see team_model_add for the full rationale.
-            include={
-                "litellm_model_table": True,
-                "object_permission": True,
-            },  # type: ignore
-        )
+        if postgres_accounting.runtime is not None:
+            team_row = await postgres_accounting.runtime.update_team(data.team_id, updated_kv, user_api_key_dict)
+        else:
+            team_row = await TeamRepository(prisma_client).table.update(
+                where={"team_id": data.team_id},
+                data=updated_kv,
+                # Preserve loaded relations when refreshing the native cache.
+                include={"litellm_model_table": True, "object_permission": True},  # type: ignore
+            )
 
         if team_row is None or team_row.team_id is None:
             raise HTTPException(
