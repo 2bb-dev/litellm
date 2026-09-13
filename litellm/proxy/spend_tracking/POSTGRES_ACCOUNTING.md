@@ -31,9 +31,12 @@ operator, bot, Code and external-client attribution with primary recurring caps,
 through `POST /chat/completions`, `/v1/chat/completions`, `/responses` and
 `/v1/responses`. Foreground Responses supports native events, encrypted reasoning
 continuation and `max_output_tokens` with the same soft-budget semantics as Chat.
-The native Responses request schema validates standard body fields; accounting
-checks only execution overrides and unfinished scopes, not a second parameter
-catalogue. Token-priced `openai/` and `litellm_proxy/` deployments
+The Responses endpoint validates the inference envelope (input shape, model and
+output-token limit) before execution. Nested tools/input items keep the native
+transformation's optional/default and pass-through semantics, including omitted
+function `strict` and image `detail`; SDK TypedDict `Required` annotations are not
+an HTTP-default contract. Accounting checks execution overrides and unfinished
+scopes, not a second full Responses parameter catalogue. Token-priced `openai/` and `litellm_proxy/` deployments
 support the normal router/SDK retry policy, including retries=2, simple-shuffle or
 usage-based routing, and DB-managed model creation, update, deletion and visibility.
 Local response caching and the actual OpenOrange request-context callback remain
@@ -45,7 +48,13 @@ native encrypted-content affinity. The native `litellm_enc` format embeds the
 originating deployment in reasoning content and preserves streaming `rs_*` IDs;
 no process-local or PostgreSQL affinity map is introduced. Continuation restores
 provider content only after routing to the native binding. Configured
-rate/concurrency limits remain guarded pending their own adapters.
+rate/concurrency limits remain guarded pending their own adapters, including native
+key creation fields and metadata, generation defaults, per-model budget policies,
+deployment default API-key RPM/TPM and router default concurrency. Nonempty limit
+maps containing zero are policies, not disabled values. Native null/empty key maps
+and a router default concurrency of zero (no native semaphore) remain no-limit
+settings. Configuration and effective runtime initialization both enforce these
+guards; existing keys and prepared/updated key policy are rechecked before dispatch.
 This managed-key slice is not full enabled-product or deployment acceptance.
 Configuration/request guards remain for unqualified effective contracts; production
 defaults are not weakened to make the supported slice pass.
@@ -61,6 +70,10 @@ Redis transaction buffering and background model health checks. Per-key scopes
 are rechecked from PostgreSQL on every admission, rather than inferred solely
 from cached authentication objects. Key policy/auth cache reads are bypassed in
 this mode; supported key mutations and admission share the stable key-scope lock.
+Locked admission reuses native Key and Team model authorization with fresh locked
+rows, not cached Team permissions. Native sentinel, wildcard, literal and global
+alias semantics remain subject to both Key and Team restrictions. Team-specific
+model aliases and access-group policies remain unqualified and refused.
 
 Authenticated `user_id` is persisted on the admitted request and remains the
 raw/daily dimension even when no native user row exists. Personal requests retain
@@ -232,7 +245,9 @@ recheck native actor, source/destination Team authority and cap permissions unde
 locks. Team admins can lower caps; only proxy admins can increase/remove them.
 Member budgets, defaults, rates, organizations, linked BudgetTable policy and
 sibling member/delete/block/model/permission routes remain explicitly guarded.
-BudgetTable is configuration, not a pooled spend balance.
+BudgetTable is configuration, not a pooled spend balance. The direct member-route
+guard does not remove the inherited `/user/new` transitive membership helper;
+concurrent membership mutation through that helper is not newly qualified here.
 
 Key insertion shares the native preparation and idempotent upsert leaves with
 ordinary mode, using the already-locked transaction without a nested transaction.
@@ -247,7 +262,10 @@ Team recurrence uses PostgreSQL time after locks and fresh due-state rechecks in
 all native reset entry points. It resets only Team spend, preserving holds and
 cumulative User/member/raw/daily totals. Duration changes preserve spend; late
 actual books in the current primary period. Stale reset updates cannot erase it.
-This UTC slice does not qualify arbitrary timezone policies or rolling migration.
+This UTC slice refuses non-UTC budget timezones in resolved configuration and
+again from the native effective timezone at initialization, before generation
+registration. Absent/default and explicit UTC remain supported. This does not
+qualify arbitrary timezone policies or rolling migration.
 The additive Team column uses explicit SQL and does not require regenerating the
 frozen native client. This implementation is not a full Team/deployment certificate;
 consult exact-source runtime evidence for qualified scenarios and remaining gaps.

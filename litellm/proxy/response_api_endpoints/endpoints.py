@@ -6,7 +6,7 @@ from uuid import uuid4
 
 import fastapi
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, JsonValue, ValidationError
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from litellm._logging import verbose_proxy_logger
@@ -18,11 +18,18 @@ from litellm.proxy.auth.user_api_key_auth import (
     user_api_key_auth_websocket,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
-from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIRequestParams, ResponsesAPIResponse
+from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.responses.main import DeleteResponseResult
 
 router = APIRouter()
-_responses_request = TypeAdapter(ResponsesAPIRequestParams)
+
+
+class _ResponsesInferenceBody(BaseModel):
+    # Nested SDK TypedDict Required fields are not HTTP defaults. Leave their
+    # optional/pass-through semantics to the native Responses transformation.
+    input: str | list[dict[str, JsonValue]]
+    model: Optional[str] = None
+    max_output_tokens: Optional[int] = None
 
 
 @router.post(
@@ -94,7 +101,7 @@ async def responses_api(
 
     data = await _read_request_body(request=request)
     try:
-        _responses_request.validate_python(data)
+        _ResponsesInferenceBody.model_validate(data)
     except ValidationError as exc:
         raise HTTPException(422, detail=exc.errors(include_input=False, include_context=False))
 

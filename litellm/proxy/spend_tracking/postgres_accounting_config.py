@@ -17,6 +17,25 @@ def _reject_features(data: dict[str, JsonValue], unsupported: set[str], area: st
         raise ValueError(f"PostgreSQL accounting: {area} integration pending: {enabled}")
 
 
+def validate_timezone(value: object) -> None:
+    if (value or "UTC") != "UTC":
+        raise ValueError("PostgreSQL accounting: only UTC budget reset timezone is supported")
+
+
+def validate_limit_settings(general: dict[str, JsonValue], router_default: object) -> None:
+    if any(general.get(name) is not None for name in ("max_parallel_requests", "global_max_parallel_requests")):
+        raise ValueError("PostgreSQL accounting: general concurrency integration pending")
+    if router_default:
+        raise ValueError("PostgreSQL accounting: router default concurrency integration pending")
+
+
+def validate_key_defaults(value: object) -> None:
+    from litellm.proxy.spend_tracking.postgres_accounting import PostgresAccounting
+
+    if value is not None:
+        PostgresAccounting.validate_key(_OBJECT.validate_python(value))
+
+
 def validate_config(value: object) -> None:
     config = _OBJECT.validate_python(value)
     _only(config, {"model_list", "general_settings", "router_settings", "litellm_settings"}, "config")
@@ -40,6 +59,8 @@ def validate_config(value: object) -> None:
         "general settings",
     )
     sdk = _OBJECT.validate_python(config.get("litellm_settings", {}))
+    validate_timezone(sdk.get("timezone"))
+    validate_key_defaults(sdk.get("default_key_generate_params"))
     _reject_features(
         sdk,
         {
@@ -59,6 +80,7 @@ def validate_config(value: object) -> None:
     if sdk.get("cache_params") not in (None, {"type": "local"}):
         raise ValueError("PostgreSQL accounting first vertical: external cache integration pending")
     router = _OBJECT.validate_python(config.get("router_settings", {}))
+    validate_limit_settings(general, router.get("default_max_parallel_requests"))
     _reject_features(
         router,
         {
@@ -98,6 +120,8 @@ def validate_deployment(value: object, *, partial: bool = False) -> None:
         "tpm",
         "rpm",
         "max_parallel_requests",
+        "default_api_key_rpm_limit",
+        "default_api_key_tpm_limit",
         "max_budget",
         "budget_duration",
         "budget_reset_at",
@@ -108,8 +132,10 @@ def validate_deployment(value: object, *, partial: bool = False) -> None:
         "fallbacks",
         "context_window_fallbacks",
     }
-    if any(settings.get(name) is not None for settings in (params, info) for name in unsupported):
+    if any(settings.get(name) is not None for settings in (model, params, info) for name in unsupported):
         raise ValueError("PostgreSQL accounting: deployment scope/limiter/client integration pending")
+    if info.get("access_groups"):
+        raise ValueError("PostgreSQL accounting: deployment model access-group integration pending")
 
 
 def validate_request(value: object) -> None:

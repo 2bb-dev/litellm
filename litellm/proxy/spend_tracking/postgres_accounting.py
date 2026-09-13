@@ -117,6 +117,10 @@ class PostgresAccounting:
         self._settlement_transaction = settlement_transaction or (lambda: client.db.tx(timeout=timedelta(seconds=60)))
 
     async def initialize(self) -> None:
+        from litellm.proxy.common_utils.timezone_utils import get_budget_reset_timezone
+        from litellm.proxy.spend_tracking.postgres_accounting_config import validate_timezone
+
+        validate_timezone(get_budget_reset_timezone())
         rows = await self.client.db.query_raw('SELECT version FROM "LiteLLM_AccountingProtocol" WHERE id=$1', _PROTOCOL)
         if rows != [{"version": 4}]:
             raise RuntimeError("PostgreSQL accounting requires the explicit team-v4 migration")
@@ -827,10 +831,8 @@ class PostgresAccounting:
         async with self.client.db.tx() as tx:
             await tx.query_raw('SELECT id FROM "LiteLLM_AccountingRequest" WHERE id=$1 FOR UPDATE', request.request_id)
             key = await self.key_state(tx, token)
-            if key.get("blocked") or (
-                model is not None and key.get("models") and model not in cast(list, key["models"])
-            ):
-                raise HTTPException(403, "Accounting key blocked or model not allowed")
+            if key.get("blocked"):
+                raise HTTPException(403, "Accounting key blocked")
             expires = key.get("expires")
             if expires and datetime.fromisoformat(str(expires)).replace(
                 tzinfo=timezone.utc
@@ -865,6 +867,17 @@ class PostgresAccounting:
                     from litellm.proxy._types import LiteLLM_UserTable
 
                     await can_user_call_model(model=model, llm_router=llm_router, user_object=LiteLLM_UserTable(**user))
+            if model is not None:
+                from litellm.proxy._types import UserAPIKeyAuth
+                from litellm.proxy.auth.auth_checks import can_key_call_model
+                from litellm.proxy.proxy_server import llm_model_list, llm_router
+
+                await can_key_call_model(
+                    model=model,
+                    llm_model_list=llm_model_list,
+                    valid_token=UserAPIKeyAuth(**{**key, "team_models": team.get("models", []) if team else []}),
+                    llm_router=llm_router,
+                )
             reset_at = key.get("budget_reset_at")
             epoch = (
                 datetime.fromisoformat(str(reset_at)).replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds")
@@ -978,6 +991,9 @@ class PostgresAccounting:
             "rpm_limit",
             "max_parallel_requests",
             "model_max_budget",
+            "model_rpm_limit",
+            "model_tpm_limit",
+            "access_group_ids",
             "config",
         )
         if any(key.get(field) for field in unsupported) or any(
@@ -995,7 +1011,16 @@ class PostgresAccounting:
         if metadata:
             trusted_metadata = _JSON_OBJECT.validate_python(metadata)
             if any(
-                trusted_metadata.get(name) for name in ("tags", "budget_id", "guardrails", "model_group", "model_info")
+                trusted_metadata.get(name)
+                for name in (
+                    "tags",
+                    "budget_id",
+                    "guardrails",
+                    "model_group",
+                    "model_info",
+                    "model_rpm_limit",
+                    "model_tpm_limit",
+                )
             ):
                 raise HTTPException(503, "PostgreSQL accounting: key metadata scope/routing integration pending")
         if key.get("budget_duration") is not None:
@@ -1449,6 +1474,17 @@ async def initialize(client: Optional[PrismaClient], settings: object, router: o
     config = _JSON_OBJECT.validate_python(settings)
     if not config.get("postgres_admission_accounting"):
         return
+    from litellm.proxy.common_utils.timezone_utils import get_budget_reset_timezone
+    from litellm.proxy.spend_tracking.postgres_accounting_config import (
+        validate_deployment,
+        validate_key_defaults,
+        validate_limit_settings,
+        validate_timezone,
+    )
+
+    validate_timezone(get_budget_reset_timezone())
+    validate_limit_settings(config, getattr(router, "default_max_parallel_requests", None))
+    validate_key_defaults(litellm.default_key_generate_params)
     if os.getenv("DATABASE_URL_READ_REPLICA"):
         raise RuntimeError(
             "PostgreSQL accounting first vertical requires writer-only reads; read replica integration pending"
@@ -1479,8 +1515,6 @@ async def initialize(client: Optional[PrismaClient], settings: object, router: o
         )
     ):
         raise RuntimeError("PostgreSQL accounting first vertical: global budget and retry/fallback integration pending")
-    from litellm.proxy.spend_tracking.postgres_accounting_config import validate_deployment
-
     for model in getattr(router, "model_list", ()):
         validate_deployment(model)
     if litellm.aclient_session is not None:

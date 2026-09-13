@@ -1217,14 +1217,19 @@ async def test_cancel_during_dispatch_intent_ack_does_not_claim_nonexecution(pro
                 'SELECT id FROM "LiteLLM_AccountingRequest" WHERE id=$1 FOR UPDATE', request.request_id
             )
             task = asyncio.create_task(instance.dispatch())
-            for _ in range(100):
-                if request.dispatched:
-                    break
-                await asyncio.sleep(0.01)
-            assert request.dispatched
+            async with asyncio.timeout(5):
+                while True:
+                    await gate.query_raw("SELECT pg_stat_clear_snapshot()::text")
+                    blocked = await gate.query_raw(
+                        "SELECT pid FROM pg_stat_activity WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))"
+                    )
+                    if blocked:
+                        break
+                    await asyncio.sleep(0.01)
+            assert request.dispatched and not task.done()
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        with pytest.raises(asyncio.CancelledError):
+            await task
         await request.finish()
         await apply_all(instance)
         assert await instance.client.db.query_raw(
@@ -1948,6 +1953,491 @@ async def test_native_team_row_barrier_blocks_every_projection(team_protocol):
     assert await instance.drain() == 0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_native_responses_http_optional_fields_and_predispatch_denials(protocol, monkeypatch, enabled):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+    import httpx
+    import litellm
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking import postgres_accounting
+    from litellm.proxy.utils import hash_token
+
+    instance, original, _ = protocol
+    await instance.reject_component(original.component_id)
+    await original.finish()
+    await apply_all(instance)
+    received = []
+
+    class Provider(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            payload = json.dumps(
+                {
+                    "id": "resp_native_test",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "gpt-4o",
+                    "output": [
+                        {
+                            "id": "msg_test",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+                        }
+                    ],
+                    "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    thread = Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    token, team = "sk-native-http-" + str(uuid4()), str(uuid4())
+    await instance.create_team({"team_id": team, "models": ["gpt-4o"], "admins": [], "members": []}, [], team_admin())
+    await instance.client.db.execute_raw(
+        'INSERT INTO "LiteLLM_VerificationToken" (token, models, team_id, max_budget) VALUES ($1,$2::text[],$3,1)',
+        hash_token(token),
+        ["all-team-models"],
+        team,
+    )
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "gpt-4o",
+                "litellm_params": {
+                    "model": "openai/gpt-4o",
+                    "api_key": "local-provider-only",
+                    "api_base": f"http://127.0.0.1:{provider.server_port}/v1",
+                },
+            }
+        ],
+        num_retries=0,
+    )
+    monkeypatch.setattr(proxy_server, "prisma_client", instance.client)
+    monkeypatch.setattr(proxy_server, "master_key", "sk-test-master")
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    monkeypatch.setattr(proxy_server, "llm_model_list", router.model_list)
+    monkeypatch.setattr(proxy_server, "general_settings", {"postgres_admission_accounting": enabled})
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", instance.client.proxy_logging_obj)
+    monkeypatch.setattr(proxy_server, "user_api_key_cache", DualCache())
+    monkeypatch.setattr(postgres_accounting, "runtime", instance if enabled else None)
+    context = accounting_request.set(None)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy_server.app), base_url="http://proxy"
+        ) as client:
+            for strict, detail in [(None, None), (False, "auto"), (True, "low")]:
+                body = {
+                    "model": "gpt-4o",
+                    "max_output_tokens": 10,
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}],
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "read",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                                "required": [],
+                            },
+                        }
+                    ],
+                }
+                if strict is not None:
+                    body["tools"][0]["strict"] = strict
+                if detail is not None:
+                    body["input"][0]["content"][0]["detail"] = detail
+                response = await client.post("/v1/responses", headers={"Authorization": "Bearer " + token}, json=body)
+                assert response.status_code == 200, response.text
+                assert received[-1]["input"] == body["input"]
+                assert received[-1]["tools"] == body["tools"]
+            before = len(received)
+            for body in [
+                {"model": "gpt-4o", "input": 123},
+                {"model": "gpt-4o", "input": "hello", "max_output_tokens": "invalid"},
+                {"model": "other", "input": "hello"},
+            ]:
+                response = await client.post("/v1/responses", headers={"Authorization": "Bearer " + token}, json=body)
+                assert 400 <= response.status_code < 500, response.text
+                assert len(received) == before
+            if enabled:
+                await instance.update_team(team, {"models": ["changed"]}, team_admin())
+                response = await client.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer " + token},
+                    json={"model": "gpt-4o", "input": "hello"},
+                )
+                assert response.status_code == 403, response.text
+                assert len(received) == before
+                assert await instance.client.db.query_raw(
+                    'SELECT COUNT(*)::int AS n FROM "LiteLLM_AccountingRequest" WHERE key_token=$1 AND dispatched',
+                    hash_token(token),
+                ) == [{"n": 3}]
+                for field in ("model_rpm_limit", "model_tpm_limit"):
+                    for policy in ({field: {"gpt-4o": 0}}, {"metadata": {field: {"gpt-4o": 1}}}):
+                        response = await client.post(
+                            "/key/generate", headers={"Authorization": "Bearer sk-test-master"}, json=policy
+                        )
+                        assert response.status_code == 503, response.text
+                    response = await client.post(
+                        "/key/update",
+                        headers={"Authorization": "Bearer sk-test-master"},
+                        json={"key": token, "metadata": {field: {"gpt-4o": 0}}},
+                    )
+                    assert response.status_code == 503, response.text
+                assert len(received) == before
+    finally:
+        accounting_request.reset(context)
+        await asyncio.to_thread(provider.shutdown)
+        provider.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("zone", [None, "UTC", "America/Los_Angeles"])
+async def test_native_timezone_config_and_startup_refusal(tmp_path, monkeypatch, zone):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import litellm
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    monkeypatch.setattr(proxy_server, "prisma_client", None)
+    monkeypatch.setenv("ACCOUNTING_TEST_ZONE", zone or "UTC")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "general_settings:\n  postgres_admission_accounting: true\n"
+        + ("litellm_settings:\n  timezone: os.environ/ACCOUNTING_TEST_ZONE\n" if zone else "")
+    )
+    config = await proxy_server.ProxyConfig().get_config(str(config_path))
+    client = SimpleNamespace(db=SimpleNamespace(query_raw=AsyncMock(), execute_raw=AsyncMock()))
+    monkeypatch.setattr(litellm, "timezone", zone, raising=False)
+    monkeypatch.setattr(postgres_accounting, "runtime", None)
+    if zone == "America/Los_Angeles":
+        with pytest.raises(ValueError, match="only UTC"):
+            validate_config(config)
+        with pytest.raises(ValueError, match="only UTC"):
+            await PostgresAccounting(client).initialize()
+        with pytest.raises(ValueError, match="only UTC"):
+            await postgres_accounting.initialize(client, {"postgres_admission_accounting": True}, None)
+        assert postgres_accounting.runtime is None
+        client.db.query_raw.assert_not_awaited()
+        client.db.execute_raw.assert_not_awaited()
+    else:
+        validate_config(config)
+        from litellm.proxy.common_utils.timezone_utils import get_budget_reset_timezone
+        from litellm.litellm_core_utils.duration_parser import get_next_standardized_reset_time
+
+        now = datetime(2026, 9, 13, 12, tzinfo=timezone.utc)
+        assert (
+            PostgresAccounting.next_reset("1d", now)
+            == get_next_standardized_reset_time("1d", now, get_budget_reset_timezone())
+            == datetime(2026, 9, 14, tzinfo=timezone.utc)
+        )
+    await postgres_accounting.initialize(None, {"postgres_admission_accounting": False}, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("zone", [None, "UTC"])
+async def test_native_timezone_runtime_registration_has_no_rejected_side_effects(protocol, monkeypatch, zone):
+    import litellm
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    instance, _, _ = protocol
+    generation = str(uuid4())
+    monkeypatch.setenv("LITELLM_ACCOUNTING_GENERATION_ID", generation)
+    monkeypatch.setattr(postgres_accounting, "runtime", None)
+    monkeypatch.setattr(litellm, "timezone", "America/Los_Angeles", raising=False)
+    settings = {"postgres_admission_accounting": True, "disable_prisma_schema_update": True}
+    with pytest.raises(ValueError, match="only UTC"):
+        await postgres_accounting.initialize(instance.client, settings, None)
+    assert postgres_accounting.runtime is None
+    assert (
+        await instance.client.db.query_raw('SELECT id FROM "LiteLLM_AccountingGeneration" WHERE id=$1', generation)
+        == []
+    )
+    assert (
+        await instance.client.db.query_raw(
+            'SELECT id FROM "LiteLLM_AccountingRequest" WHERE generation_id=$1', generation
+        )
+        == []
+    )
+    monkeypatch.setattr(litellm, "timezone", zone)
+    await postgres_accounting.initialize(instance.client, settings, None)
+    runtime = postgres_accounting.runtime
+    assert runtime is not None and runtime.generation_id == generation
+    assert (await runtime.status()).pending_requests == 0
+    request = await runtime.begin()
+    await request.finish()
+    await apply_all(runtime)
+    assert await runtime.drain() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [None, 0, 1])
+async def test_native_router_default_concurrency_and_effective_startup(monkeypatch, limit):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import litellm
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    deployment = {"model_name": "gpt-4o", "litellm_params": {"model": "openai/gpt-4o", "api_key": "local-test-key"}}
+    config = {"model_list": [deployment], "router_settings": {"default_max_parallel_requests": limit}}
+    router = litellm.Router(model_list=[deployment], default_max_parallel_requests=limit)
+    semaphore = router._get_client(deployment=router.model_list[0], client_type="max_parallel_requests", kwargs={})
+    assert (semaphore is not None) == bool(limit)
+    monkeypatch.setattr(postgres_accounting, "runtime", None)
+    if limit:
+        client = SimpleNamespace(db=SimpleNamespace(query_raw=AsyncMock()))
+        with pytest.raises(ValueError, match="concurrency"):
+            validate_config(config)
+        with pytest.raises(ValueError, match="concurrency"):
+            await postgres_accounting.initialize(client, {"postgres_admission_accounting": True}, router)
+        client.db.query_raw.assert_not_awaited()
+        assert postgres_accounting.runtime is None
+    else:
+        validate_config(config)
+    await postgres_accounting.initialize(None, {"postgres_admission_accounting": False}, router)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,placement",
+    [
+        (field, "litellm_params")
+        for field in ("default_api_key_rpm_limit", "default_api_key_tpm_limit", "rpm", "tpm", "max_parallel_requests")
+    ]
+    + [(field, placement) for field in ("rpm", "tpm") for placement in ("top", "model_info")],
+)
+@pytest.mark.parametrize("limit", [0, 1])
+async def test_native_deployment_limits_rejected_at_config_and_runtime(monkeypatch, field, placement, limit):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import litellm
+    from litellm.proxy import proxy_server
+    from litellm.proxy.auth.auth_utils import get_key_model_rpm_limit, get_key_model_tpm_limit
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    deployment = {
+        "model_name": "gpt-4o",
+        "litellm_params": {"model": "openai/gpt-4o", "api_key": "local-test-key"},
+    }
+    if placement == "top":
+        deployment[field] = limit
+    else:
+        deployment.setdefault(placement, {})[field] = limit
+    router = litellm.Router(model_list=[deployment])
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    if field.startswith("default_api_key"):
+        reader = get_key_model_rpm_limit if "rpm" in field else get_key_model_tpm_limit
+        assert reader(UserAPIKeyAuth(), "gpt-4o") == {"gpt-4o": limit}
+    with pytest.raises(ValueError, match="deployment"):
+        validate_config({"model_list": [deployment]})
+    client = SimpleNamespace(_spend_log_spool=object(), db=SimpleNamespace(query_raw=AsyncMock()))
+    monkeypatch.setattr(postgres_accounting, "runtime", None)
+    with pytest.raises(ValueError, match="deployment"):
+        await postgres_accounting.initialize(
+            client, {"postgres_admission_accounting": True, "disable_prisma_schema_update": True}, router
+        )
+    client.db.query_raw.assert_not_awaited()
+    assert postgres_accounting.runtime is None
+    await postgres_accounting.initialize(None, {"postgres_admission_accounting": False}, router)
+
+
+@pytest.mark.parametrize("groups", [None, [], ["group"]])
+def test_native_deployment_access_groups_remain_guarded(groups):
+    deployment = {
+        "model_name": "gpt-4o",
+        "litellm_params": {"model": "openai/gpt-4o"},
+        "model_info": {"access_groups": groups},
+    }
+    if groups:
+        with pytest.raises(ValueError, match="access-group"):
+            validate_config({"model_list": [deployment]})
+    else:
+        validate_config({"model_list": [deployment]})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["max_parallel_requests", "global_max_parallel_requests"])
+@pytest.mark.parametrize("limit", [0, 1])
+async def test_native_general_concurrency_refused_before_startup(field, limit):
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    settings = {"postgres_admission_accounting": True, field: limit}
+    with pytest.raises(ValueError, match="concurrency|integration pending"):
+        validate_config({"general_settings": settings})
+    with pytest.raises(ValueError, match="concurrency"):
+        await postgres_accounting.initialize(None, settings, None)
+    await postgres_accounting.initialize(None, {**settings, "postgres_admission_accounting": False}, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["model_rpm_limit", "model_tpm_limit"])
+@pytest.mark.parametrize("limit", [None, {}, {"gpt-4o": 0}, {"gpt-4o": 1}])
+@pytest.mark.parametrize("placement", ["field", "metadata"])
+async def test_native_key_rate_preparation_and_defaults(native_preparation_io, monkeypatch, field, limit, placement):
+    import litellm
+    from fastapi import HTTPException
+    from litellm.proxy.spend_tracking import postgres_accounting
+    from litellm.proxy.management_endpoints.key_management_endpoints import generate_key_helper_fn
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.auth.auth_utils import get_key_model_rpm_limit, get_key_model_tpm_limit
+
+    instance, rows, calls = native_preparation_io
+    policy = {field: limit} if placement == "field" else {"metadata": {field: limit}}
+    values = {"token": "sk-native-rate-test", "table_name": "key", "accounting_auth": team_admin(), **policy}
+    if limit:
+        with pytest.raises(HTTPException) as error:
+            await generate_key_helper_fn(request_type="key", **values)
+        assert error.value.status_code == 503
+        assert not rows["key"] and not [call for call in calls if call[0] == "write"]
+        with pytest.raises(HTTPException):
+            validate_config({"litellm_settings": {"default_key_generate_params": policy}})
+        monkeypatch.setattr(litellm, "default_key_generate_params", policy)
+        with pytest.raises(HTTPException):
+            await postgres_accounting.initialize(None, {"postgres_admission_accounting": True}, None)
+    else:
+        created = await generate_key_helper_fn(request_type="key", **values)
+        key = rows["key"][created["token_id"]]
+        reader = get_key_model_rpm_limit if "rpm" in field else get_key_model_tpm_limit
+        assert reader(UserAPIKeyAuth(**key)) is None
+        validate_config({"litellm_settings": {"default_key_generate_params": policy}})
+    monkeypatch.setattr(postgres_accounting, "runtime", None)
+    off = await generate_key_helper_fn(request_type="key", **{**values, "token": "sk-native-rate-off"})
+    assert rows["key"][off["token_id"]]["metadata"].get(field) == limit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["model_rpm_limit", "model_tpm_limit"])
+@pytest.mark.parametrize("limit", [0, 1])
+async def test_native_existing_key_rate_update_and_admission_refused(protocol, field, limit):
+    from fastapi import HTTPException
+
+    instance, original, key = protocol
+    await instance.reject_component(original.component_id)
+    await original.finish()
+    await apply_all(instance)
+    with pytest.raises(HTTPException) as error:
+        await instance.update_key(key, {"metadata": {field: {"gpt-4o": limit}}})
+    assert error.value.status_code == 503
+    await instance.client.db.execute_raw(
+        'UPDATE "LiteLLM_VerificationToken" SET metadata=$2::jsonb WHERE token=$1',
+        key,
+        json.dumps({field: {"gpt-4o": limit}}),
+    )
+    request = await instance.begin()
+    context = accounting_request.set(request)
+    try:
+        with pytest.raises(HTTPException) as error:
+            await instance.admit(key, 0.01, 0.001, model="gpt-4o")
+        assert error.value.status_code == 503
+        assert not request.admitted and not request.dispatched
+        assert (
+            await instance.client.db.query_raw(
+                'SELECT request_id FROM "LiteLLM_AccountingHold" WHERE request_id=$1', request.request_id
+            )
+            == []
+        )
+        await request.finish()
+        await apply_all(instance)
+    finally:
+        accounting_request.reset(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "key_models,team_models,model,allowed",
+    [
+        (["all-team-models"], ["gpt-4o"], "gpt-4o", True),
+        (["all-team-models"], ["gpt-4o"], "other", False),
+        (["*"], ["gpt-4o"], "gpt-4o", True),
+        (["*"], ["other"], "gpt-4o", False),
+        (["gpt-*"], ["gpt-4o"], "gpt-4o", True),
+        (["all-proxy-models"], ["gpt-4o"], "gpt-4o", True),
+        (["gpt-4o"], ["gpt-4o"], "gpt-4o", True),
+        (["other"], ["gpt-4o"], "gpt-4o", False),
+        (["gpt-4o"], ["gpt-4o"], "alias", True),
+        (["all-team-models"], [], "gpt-4o", True),
+        (["all-team-models"], ["all-team-models"], "gpt-4o", True),
+    ],
+)
+async def test_native_locked_key_team_models_and_stale_auth(
+    protocol, monkeypatch, key_models, team_models, model, allowed
+):
+    import litellm
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import UserAPIKeyAuth, ProxyException
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+
+    instance, original, key = protocol
+    await instance.reject_component(original.component_id)
+    await original.finish()
+    await apply_all(instance)
+    team = str(uuid4())
+    await instance.create_team({"team_id": team, "models": ["*"], "admins": [], "members": []}, [], team_admin())
+    await instance.update_key(key, {"models": key_models, "team_id": team}, auth=team_admin())
+    await instance.update_team(team, {"models": team_models}, team_admin())
+    router = litellm.Router(
+        model_list=[{"model_name": "gpt-4o", "litellm_params": {"model": "openai/gpt-4o", "api_key": "local-test-key"}}]
+    )
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    monkeypatch.setattr(litellm, "model_alias_map", {"alias": "gpt-4o"})
+    stale = UserAPIKeyAuth(
+        token=key, team_id=team, models=["all-team-models"], team_models=["*"], team_model_aliases={"other": "gpt-4o"}
+    )
+    assert await can_key_call_model(model, None, stale, router)
+    request = await instance.begin()
+    context = accounting_request.set(request)
+    try:
+        if allowed:
+            await instance.admit(key, 0.01, 0.001, model=model, auth=stale)
+            assert request.admitted and request.team_id == team
+            await instance.dispatch()
+            await instance.reject_component(request.component_id)
+        else:
+            with pytest.raises(ProxyException) as error:
+                await instance.admit(key, 0.01, 0.001, model=model, auth=stale)
+            assert int(error.value.code) == 403
+            assert not request.admitted and not request.dispatched
+        await request.finish()
+        await apply_all(instance)
+    finally:
+        accounting_request.reset(context)
+    if allowed:
+        await instance.update_team(team, {"models": ["no-longer-allowed"]}, team_admin())
+        later = await instance.begin()
+        context = accounting_request.set(later)
+        try:
+            with pytest.raises(ProxyException) as error:
+                await instance.admit(key, 0.01, 0.001, model=model, auth=stale)
+            assert int(error.value.code) == 403
+            assert not later.admitted and not later.dispatched
+            await later.finish()
+            await apply_all(instance)
+        finally:
+            accounting_request.reset(context)
+
+
 @pytest.fixture
 def native_preparation_io(monkeypatch):
     from contextlib import asynccontextmanager
@@ -2116,6 +2606,8 @@ def test_native_preparation_policy_shapes(kind, value):
         ("key", "config", '{"model":"other"}'),
         ("key", "router_settings", '{"num_retries":2}'),
         ("key", "budget_limits", '[{"max_budget":1}]'),
+        ("key", "access_group_ids", ["unqualified-group"]),
+        ("team", "access_group_ids", ["unqualified-group"]),
         ("user", "model_max_budget", '{"model":1}'),
         ("team", "model_max_budget", '{"model":1}'),
         ("team", "metadata", '{"guardrails":[]}'),
