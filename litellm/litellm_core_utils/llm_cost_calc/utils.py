@@ -733,11 +733,13 @@ def resolve_token_pricing(
         "cache_read_input_token_cost",
     )
     tier_rates = dict(zip(base_fields, _get_token_base_cost(dated_info, usage, service_tier)))
-    recurring = (
-        {}
-        if selected is not None and "off_peak_pricing" in selected and selected["off_peak_pricing"] is None
-        else get_off_peak_pricing_overrides(model_info, instant)
+    has_period_schedule = selected is not None and "off_peak_pricing" in selected
+    recurring_info = (
+        cast(ModelInfo, {**model_info, "off_peak_pricing": selected["off_peak_pricing"]})
+        if selected is not None and has_period_schedule
+        else model_info
     )
+    recurring = get_off_peak_pricing_overrides(recurring_info, instant)
     dated_fields = frozenset(
         field
         for field in base_fields
@@ -755,7 +757,10 @@ def resolve_token_pricing(
             if key.endswith("_tokens")
         )
     )
-    effective_rates = {**tier_rates, **{key: value for key, value in recurring.items() if key not in dated_fields}}
+    effective_rates = {
+        **tier_rates,
+        **{key: value for key, value in recurring.items() if has_period_schedule or key not in dated_fields},
+    }
     if "output_cost_per_reasoning_token" in period:
         effective_rates["output_cost_per_reasoning_token"] = period["output_cost_per_reasoning_token"]
     write_rate = effective_rates["cache_creation_input_token_cost"]

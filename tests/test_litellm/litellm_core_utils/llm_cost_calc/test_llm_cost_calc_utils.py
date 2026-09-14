@@ -87,6 +87,36 @@ def test_cache_write_price_defaults_to_effective_input_rate(
     assert rates["cache_creation_input_token_cost"] == (expected_input_rate if write_rate is None else write_rate)
 
 
+@pytest.mark.parametrize("write_rate", (None, 0.0, 3e-6))
+@pytest.mark.parametrize(
+    "instant,expected_input",
+    (("2026-09-07T00:30:00+00:00", 1e-6), ("2026-09-07T02:00:00+00:00", 2e-6), ("2026-09-10T00:00:00+00:00", 4e-6)),
+)
+def test_cache_write_fallback_uses_dated_recurring_rate(
+    write_rate: float | None, instant: str, expected_input: float
+) -> None:
+    rates = resolve_token_pricing(
+        ModelInfo(
+            input_cost_per_token=8e-6,
+            output_cost_per_token=9e-6,
+            cache_creation_input_token_cost=write_rate,
+            off_peak_pricing={"hours_utc": "00:00-01:00", "input_cost_per_token": 4e-6},
+            pricing_periods=[
+                {
+                    "effective_until": "2026-09-10T00:00:00Z",
+                    "input_cost_per_token": 2e-6,
+                    "off_peak_pricing": {"hours_utc": "00:00-01:00", "input_cost_per_token": 1e-6},
+                }
+            ],
+        ),
+        Usage(prompt_tokens=1000, completion_tokens=0),
+        None,
+        datetime.fromisoformat(instant),
+    )
+    assert rates["input_cost_per_token"] == expected_input
+    assert rates["cache_creation_input_token_cost"] == (expected_input if write_rate is None else write_rate)
+
+
 def test_reasoning_tokens_no_price_set():
     # Use o1 - o1-mini was deprecated/renamed; o1 has same reasoning-token semantics
     # (no separate output_cost_per_reasoning_token, so all completion tokens use output_cost_per_token)
@@ -1813,3 +1843,49 @@ def test_threshold_keys_exclude_service_tier_variants():
     usage = Usage(prompt_tokens=350_000, completion_tokens=1_000, total_tokens=351_000)
     prompt_base, *_ = _get_token_base_cost(model_info=model_info, usage=usage)
     assert prompt_base == 3e-6
+@pytest.mark.parametrize(
+    "instant,expected",
+    [
+        ("2026-09-07T00:59:59+00:00", 0.22),
+        ("2026-09-07T01:00:00+00:00", 0.44),
+        ("2026-09-10T03:59:59+00:00", 0.44),
+        ("2026-09-10T04:00:00+00:00", 0.15),
+        ("2026-09-12T02:00:00+00:00", 0.15),
+    ],
+)
+def test_explicit_dated_recurring_schedule(instant: str, expected: float) -> None:
+    from copy import deepcopy
+    from datetime import datetime
+    from typing import cast
+
+    from pydantic import TypeAdapter
+
+    from litellm.litellm_core_utils.llm_cost_calc.utils import resolve_token_pricing
+    from litellm.types.utils import TokenPricingPeriod
+
+    windows = [
+        {"hours_utc": ["00:00-01:00", "04:00-06:00", "10:00-00:00"], "weekdays": [1, 2, 3, 4, 5]},
+        {"hours_utc": "00:00-00:00", "weekdays": [6, 7]},
+    ]
+    period = {
+        "effective_until": "2026-09-10T04:00:00Z",
+        "input_cost_per_token": 0.44,
+        "off_peak_pricing": {"windows": windows, "input_cost_per_token": 0.22},
+    }
+    TypeAdapter(TokenPricingPeriod).validate_python(period)
+    info = cast(
+        ModelInfo,
+        {
+            "input_cost_per_token": 0.3,
+            "output_cost_per_token": 1.2,
+            "off_peak_pricing": {"windows": windows, "input_cost_per_token": 0.15},
+            "pricing_periods": [period],
+        },
+    )
+    original = deepcopy(info)
+    result = resolve_token_pricing(
+        info, Usage(prompt_tokens=10, completion_tokens=1), None, datetime.fromisoformat(instant)
+    )
+    assert result["input_cost_per_token"] == expected
+    assert result["output_cost_per_token"] == 1.2
+    assert info == original
