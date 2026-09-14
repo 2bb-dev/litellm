@@ -1199,6 +1199,8 @@ class PostgresAccounting:
         async with self.client.db.tx() as tx:
             await tx.query_raw('SELECT id FROM "LiteLLM_AccountingRequest" WHERE id=$1 FOR UPDATE', request.request_id)
             if request.token is None and token:
+                if not await tx.query_raw('SELECT token FROM "LiteLLM_VerificationToken" WHERE token=$1', token):
+                    return
                 key = await self.key_state(tx, token)
                 request.token = token
                 request.user_id = cast(Optional[str], key.get("user_id"))

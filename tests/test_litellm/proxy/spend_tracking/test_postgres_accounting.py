@@ -2104,6 +2104,51 @@ async def test_native_responses_http_optional_fields_and_predispatch_denials(pro
                     )
                     assert response.status_code == 503, response.text
                 assert len(received) == before
+                from litellm.proxy.utils import update_spend_logs_job
+
+                for path, body in (
+                    ("/v1/chat/completions", {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
+                    ("/v1/responses", {"model": "gpt-4o", "input": "hello"}),
+                ):
+                    denied = await client.post(
+                        path, headers={"Authorization": "Bearer sk-not-issued-" + str(uuid4())}, json=body
+                    )
+                    assert denied.status_code == 401, denied.text
+                    assert len(received) == before
+                    rejected = await instance.client.db.query_raw(
+                        'SELECT id FROM "LiteLLM_AccountingRequest" WHERE generation_id=$1 ORDER BY created_at DESC LIMIT 1',
+                        instance.generation_id,
+                    )
+                    request_id = rejected[0]["id"]
+                    async with asyncio.timeout(5):
+                        while True:
+                            await update_spend_logs_job(instance.client, None, instance.client.proxy_logging_obj)
+                            state = await instance.client.db.query_raw(
+                                'SELECT key_token, dispatched, sealed, failed, closed FROM "LiteLLM_AccountingRequest" WHERE id=$1',
+                                request_id,
+                            )
+                            if state[0]["closed"]:
+                                break
+                            await asyncio.sleep(0.01)
+                    assert state == [
+                        {"key_token": None, "dispatched": False, "sealed": True, "failed": False, "closed": True}
+                    ]
+                    assert await instance.client.db.query_raw(
+                        'SELECT nonexecution, liability FROM "LiteLLM_AccountingComponent" WHERE request_id=$1',
+                        request_id,
+                    ) == [{"nonexecution": True, "liability": 0}]
+                    diagnostics = await instance.client.db.query_raw(
+                        'SELECT l.api_key, l.spend FROM "LiteLLM_AccountingComponent" c '
+                        'JOIN "LiteLLM_SpendLogs" l ON l.request_id=c.id WHERE c.request_id=$1',
+                        request_id,
+                    )
+                    assert all(row == {"api_key": "", "spend": 0} for row in diagnostics)
+                    assert (
+                        await instance.client.db.query_raw(
+                            'SELECT amount FROM "LiteLLM_AccountingHold" WHERE request_id=$1', request_id
+                        )
+                        == []
+                    )
     finally:
         accounting_request.reset(context)
         await asyncio.to_thread(provider.shutdown)
