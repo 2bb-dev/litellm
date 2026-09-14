@@ -184,7 +184,7 @@ class TokenPricingPeriod(TypedDict, total=False):
 
     effective_from: str
     effective_until: str
-    off_peak_pricing: None
+    off_peak_pricing: Optional["OffPeakPricing"]
     input_cost_per_token: float
     output_cost_per_token: float
     cache_read_input_token_cost: float
