@@ -24,6 +24,14 @@ class _PROXY_MaxBudgetLimiter(CustomLogger):
     ):
         try:
             verbose_proxy_logger.debug("Inside Max Budget Limiter Pre-Call Hook")
+            from litellm.litellm_core_utils.accounting_context import accounting_request
+            from litellm.proxy.spend_tracking import postgres_accounting
+
+            if postgres_accounting.runtime is not None:
+                request = accounting_request.get()
+                if request is None or request.store is not postgres_accounting.runtime or not request.admitted:
+                    raise HTTPException(503, "PostgreSQL budget admission missing")
+                return
             max_budget = user_api_key_dict.user_max_budget
             user_id = user_api_key_dict.user_id
 

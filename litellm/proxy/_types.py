@@ -2087,6 +2087,10 @@ class PluginConfig(LiteLLMPydanticObjectBase):
 
 
 class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
+    postgres_admission_accounting: bool = Field(
+        default=False,
+        description="Unfinished opt-in PostgreSQL key admission/accounting vertical. Requires explicit migration and a durable local outbox; unsupported scopes/routes/limiters fail closed. Not a legacy live-adoption mechanism.",
+    )
     """
     Documents all the fields supported by `general_settings` in config.yaml
     """

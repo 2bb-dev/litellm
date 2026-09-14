@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import inspect
+import json
 import os
 import socket
 import ssl
@@ -9,6 +10,7 @@ import time
 from typing import (
     TYPE_CHECKING,
     Any,
+    AsyncIterator,
     Callable,
     Dict,
     List,
@@ -506,6 +508,106 @@ class MaskedHTTPStatusError(httpx.HTTPStatusError):
         self.status_code = original_error.response.status_code
 
 
+async def _accounting_dispatch_hook(request: httpx.Request) -> None:
+    from litellm.litellm_core_utils.accounting_context import accounting_call, accounting_request
+
+    owner = accounting_request.get()
+    call = accounting_call.get()
+    if owner is None or call is None:
+        return
+    if request.method != "POST" or call.call_type not in {"acompletion", "aresponses"}:
+        owner.failed = True
+        raise RuntimeError("PostgreSQL accounting: native dispatch type not supported")
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    runtime = postgres_accounting.runtime
+    if runtime is None:
+        return
+    await runtime.dispatch()
+    request.extensions["litellm_accounting_component"] = call.component_id
+
+
+def _accounting_preexecution_error(status: int, body: bytes) -> bool:
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeError):
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict) or not isinstance(error.get("type"), str) or not isinstance(error.get("code"), str):
+        return False
+    documented = {
+        400: {"context_length_exceeded", "invalid_encrypted_content", "unsupported_parameter"},
+        401: {"invalid_api_key"},
+        403: {"permission_denied"},
+        404: {"model_not_found"},
+        422: {"unsupported_parameter"},
+        429: {"rate_limit_exceeded", "insufficient_quota"},
+    }
+    return error.get("type") in {
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "rate_limit_error",
+        "insufficient_quota",
+        "tokens",
+        "requests",
+    } and error.get("code") in documented.get(status, set())
+
+
+async def _accounting_acknowledge_rejection(status: int, body: bytes, component_id: str) -> None:
+    from litellm.litellm_core_utils.accounting_context import accounting_request
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    runtime = postgres_accounting.runtime
+    if runtime is None or not _accounting_preexecution_error(status, body):
+        return
+    try:
+        await runtime.reject_component(component_id)
+    except Exception:
+        owner = accounting_request.get()
+        if owner is not None:
+            owner.failed = True
+        verbose_logger.exception("Accounting rejection acknowledgement unknown; liability retained")
+
+
+class _AccountingErrorStream(httpx.AsyncByteStream):
+    def __init__(self, stream: httpx.AsyncByteStream, status: int, component_id: str):
+        self.stream = stream
+        self.status = status
+        self.component_id = component_id
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        body = bytearray()
+        oversized = False
+        async for chunk in self.stream:
+            if not oversized:
+                if len(body) + len(chunk) <= 65536:
+                    body.extend(chunk)
+                else:
+                    oversized = True
+                    body.clear()
+            yield chunk
+        if not oversized:
+            await _accounting_acknowledge_rejection(self.status, bytes(body), self.component_id)
+
+    async def aclose(self) -> None:
+        await self.stream.aclose()
+
+
+async def _accounting_response_hook(response: httpx.Response) -> None:
+    component_id = response.request.extensions.get("litellm_accounting_component")
+    if not isinstance(component_id, str) or response.status_code not in {400, 401, 403, 404, 422, 429}:
+        return
+    if response.headers.get("content-encoding", "identity") != "identity":
+        return
+    if response.is_stream_consumed:
+        if len(response.content) <= 65536:
+            await _accounting_acknowledge_rejection(response.status_code, response.content, component_id)
+    elif isinstance(response.stream, httpx.AsyncByteStream):
+        # Observe only the error body the native client already consumes, before its SDK retry.
+        response.stream = _AccountingErrorStream(response.stream, response.status_code, component_id)
+
+
 class AsyncHTTPHandler:
     def __init__(
         self,
@@ -555,7 +657,11 @@ class AsyncHTTPHandler:
 
         return httpx.AsyncClient(
             transport=transport,
-            event_hooks=event_hooks,
+            event_hooks={
+                **(event_hooks or {}),
+                "request": [*(event_hooks or {}).get("request", []), _accounting_dispatch_hook],
+                "response": [*(event_hooks or {}).get("response", []), _accounting_response_hook],
+            },
             timeout=timeout,
             verify=ssl_config,
             cert=cert,

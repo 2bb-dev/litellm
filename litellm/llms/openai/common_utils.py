@@ -211,8 +211,10 @@ class BaseOpenAILLM:
 
         # Get unified SSL configuration
         ssl_config = get_ssl_configuration()
+        from litellm.llms.custom_httpx.http_handler import _accounting_dispatch_hook, _accounting_response_hook
 
         return httpx.AsyncClient(
+            event_hooks={"request": [_accounting_dispatch_hook], "response": [_accounting_response_hook]},
             verify=ssl_config,
             transport=AsyncHTTPHandler._create_async_transport(
                 ssl_context=(ssl_config if isinstance(ssl_config, ssl.SSLContext) else None),

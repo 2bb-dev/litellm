@@ -1663,7 +1663,9 @@ class ProxyBaseLLMRequestProcessing:
                 if _deferred_fn is not None:
                     logging_obj._on_deferred_stream_complete = None  # type: ignore[union-attr]
                     try:
-                        asyncio.create_task(
+                        from litellm.litellm_core_utils.accounting_context import spawn_accounting
+
+                        spawn_accounting(
                             logging_obj.dispatch_success_handlers(
                                 response,
                                 cache_hit=None,
@@ -2215,7 +2217,9 @@ class ProxyBaseLLMRequestProcessing:
                 # callbacks fire regardless of the call-type heuristic in
                 # _is_sync_litellm_request (which only recognizes a subset of
                 # async markers stored in litellm_params).
-                asyncio.create_task(
+                from litellm.litellm_core_utils.accounting_context import spawn_accounting
+
+                spawn_accounting(
                     captured_logging_obj.dispatch_success_handlers(
                         _response,
                         cache_hit=cache_hit,

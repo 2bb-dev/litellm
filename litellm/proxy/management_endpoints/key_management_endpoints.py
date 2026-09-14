@@ -758,6 +758,13 @@ async def _common_key_generation_helper(
             )
         )
 
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is not None:
+        postgres_accounting.runtime.validate_key(data.model_dump(mode="json"))
+        if data.soft_budget is not None or data.object_permission is not None:
+            raise HTTPException(503, "PostgreSQL accounting: key budget/permission creation pending")
+
     # TODO: @ishaan-jaff: Migrate all budget tracking to use LiteLLM_BudgetTable
     _budget_id = data.budget_id
     if prisma_client is not None and data.soft_budget is not None:
@@ -921,7 +928,9 @@ async def _common_key_generation_helper(
                 prisma_client=prisma_client,
             )
 
-    response = await generate_key_helper_fn(request_type="key", **data_json, table_name="key")
+    response = await generate_key_helper_fn(
+        request_type="key", **data_json, table_name="key", accounting_auth=user_api_key_dict
+    )
 
     response["soft_budget"] = data.soft_budget  # include the user-input soft budget in the response
 
@@ -2414,6 +2423,19 @@ async def update_key_fn(
 
         data_json: dict = data.model_dump(exclude_unset=True)
         key = data_json.pop("key")
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None and data_json.keys() - {
+            "max_budget",
+            "budget_duration",
+            "models",
+            "metadata",
+            "blocked",
+            "key_alias",
+            "user_id",
+            "team_id",
+        }:
+            raise HTTPException(503, "PostgreSQL accounting: key update fields not qualified")
 
         # get the row from db
         existing_key_row = await _get_and_validate_existing_key(
@@ -2468,7 +2490,10 @@ async def update_key_fn(
         _data = {**non_default_values, "token": key}
         if prisma_client is None:
             raise Exception("Not connected to DB!")
-        response = await prisma_client.update_data(token=key, data=_data)
+        if postgres_accounting.runtime is not None:
+            response = await postgres_accounting.runtime.update_key(key, data_json, auth=user_api_key_dict)
+        else:
+            response = await prisma_client.update_data(token=key, data=_data)
 
         # Delete - key from cache, since it's been updated!
         # key updated - a new model could have been added to this key. it should not block requests after this is done
@@ -3407,6 +3432,7 @@ async def generate_key_helper_fn(
     router_settings: Optional[dict] = None,
     access_group_ids: Optional[list] = None,
     budget_limits: Optional[list] = None,  # multiple concurrent budget windows
+    accounting_auth: Optional[UserAPIKeyAuth] = None,
 ):
     from litellm.proxy.proxy_server import premium_user, prisma_client
 
@@ -3429,7 +3455,13 @@ async def generate_key_helper_fn(
     if key_budget_duration is None:  # one-time budget
         key_reset_at = None
     else:
-        key_reset_at = get_budget_reset_time(budget_duration=key_budget_duration)
+        from litellm.proxy.spend_tracking import postgres_accounting
+
+        if postgres_accounting.runtime is not None:
+            now = await postgres_accounting.runtime.database_time(postgres_accounting.runtime.client.db)
+            key_reset_at = postgres_accounting.runtime.next_reset(key_budget_duration, now)
+        else:
+            key_reset_at = get_budget_reset_time(budget_duration=key_budget_duration)
 
     if budget_duration is None:  # one-time budget
         reset_at = None
@@ -3601,7 +3633,14 @@ async def generate_key_helper_fn(
 
             ## CREATE KEY
             verbose_proxy_logger.debug("prisma_client: Creating Key= %s", key_data)
-            create_key_response = await prisma_client.insert_data(data=key_data, table_name="key")
+            from litellm.proxy.spend_tracking import postgres_accounting
+
+            if postgres_accounting.runtime is not None and accounting_auth is not None:
+                create_key_response = await postgres_accounting.runtime.create_key(key_data, accounting_auth)
+            elif postgres_accounting.runtime is not None and team_id:
+                raise HTTPException(503, "PostgreSQL accounting: Team key creation requires native actor")
+            else:
+                create_key_response = await prisma_client.insert_data(data=key_data, table_name="key")
 
             key_data["token_id"] = getattr(create_key_response, "token", None)
             key_data["litellm_budget_table"] = getattr(create_key_response, "litellm_budget_table", None)

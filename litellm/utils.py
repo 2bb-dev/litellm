@@ -1595,6 +1595,13 @@ def client(original_function):
         is_completion_with_fallbacks = kwargs.get("fallbacks") is not None
         kwargs.pop("_is_litellm_internal_call", None)  # discard if injected
         _is_litellm_internal_call = is_internal_call.get()
+        from litellm.litellm_core_utils.accounting_context import AccountingCall, accounting_call, accounting_request
+
+        accounting_token = (
+            accounting_call.set(AccountingCall(call_type=call_type))
+            if accounting_request.get() is not None and not _is_litellm_internal_call
+            else None
+        )
 
         try:
             if logging_obj is None:
@@ -1741,7 +1748,9 @@ def client(original_function):
                 if getattr(logging_obj, "_defer_async_logging", False):
 
                     def _enqueue_deferred_logging() -> None:
-                        asyncio.create_task(
+                        from litellm.litellm_core_utils.accounting_context import spawn_accounting
+
+                        spawn_accounting(
                             _client_async_logging_helper(
                                 logging_obj=logging_obj,
                                 result=result,
@@ -1753,7 +1762,9 @@ def client(original_function):
 
                     logging_obj._enqueue_deferred_logging = _enqueue_deferred_logging  # type: ignore
                 else:
-                    asyncio.create_task(
+                    from litellm.litellm_core_utils.accounting_context import spawn_accounting
+
+                    spawn_accounting(
                         _client_async_logging_helper(
                             logging_obj=logging_obj,
                             result=result,
@@ -1865,6 +1876,9 @@ def client(original_function):
             timeout = _get_wrapper_timeout(kwargs=kwargs, exception=e)
             setattr(e, "timeout", timeout)
             raise e
+        finally:
+            if accounting_token is not None:
+                accounting_call.reset(accounting_token)
 
     get_coroutine_checker = getattr(sys.modules[__name__], "get_coroutine_checker")
     is_coroutine = get_coroutine_checker().is_async_callable(original_function)

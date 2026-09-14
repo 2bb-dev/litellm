@@ -2,10 +2,12 @@
 ## Helper utils for the management endpoints (keys/users/teams)
 from datetime import datetime
 from functools import wraps
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple, cast
 
 from fastapi import HTTPException, Request
 from pydantic import BaseModel
+from prisma import Prisma
+from prisma.types import LiteLLM_UserTableCreateInput
 
 import litellm
 from litellm._logging import verbose_logger
@@ -252,6 +254,18 @@ async def _resolve_member_budget_id(
     return response.budget_id
 
 
+async def add_team_to_user(
+    database: Prisma,
+    user_id: str,
+    team_id: str,
+    defaults: LiteLLM_UserTableCreateInput,
+) -> BaseModel:
+    return await database.litellm_usertable.upsert(
+        where={"user_id": user_id},
+        data={"update": {"teams": {"push": [team_id]}}, "create": {**defaults, "teams": [team_id]}},
+    )
+
+
 async def add_new_member(
     new_member: Member,
     max_budget_in_team: Optional[float],
@@ -276,12 +290,8 @@ async def add_new_member(
     ## ADD TEAM ID, to USER TABLE IF NEW ##
     if new_member.user_id is not None:
         new_user_defaults = get_new_internal_user_defaults(user_id=new_member.user_id)
-        _returned_user = await UserRepository(prisma_client).table.upsert(
-            where={"user_id": new_member.user_id},
-            data={
-                "update": {"teams": {"push": [team_id]}},
-                "create": {"teams": [team_id], **new_user_defaults},  # type: ignore
-            },
+        _returned_user = await add_team_to_user(
+            prisma_client.db, new_member.user_id, team_id, cast(LiteLLM_UserTableCreateInput, new_user_defaults)
         )
         if _returned_user is not None:
             returned_user = LiteLLM_UserTable(**_returned_user.model_dump())

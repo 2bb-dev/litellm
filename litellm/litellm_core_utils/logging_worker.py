@@ -6,9 +6,10 @@ import contextvars
 import logging
 from typing import Coroutine, Optional
 import atexit
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from litellm._logging import verbose_logger
+from litellm.litellm_core_utils.accounting_context import AccountingProducer, accounting_request
 from litellm.constants import (
     LOGGING_WORKER_CONCURRENCY,
     LOGGING_WORKER_MAX_QUEUE_SIZE,
@@ -28,6 +29,8 @@ class LoggingTask(TypedDict):
 
     coroutine: Coroutine
     context: contextvars.Context
+    counted_in_queue: NotRequired[bool]
+    producer: NotRequired[AccountingProducer]
 
 
 class LoggingWorker:
@@ -71,6 +74,8 @@ class LoggingWorker:
         if self._queue is not None and self._bound_loop is not current_loop:
             verbose_logger.debug("LoggingWorker: Event loop changed, reinitializing queue and worker")
             # Clear old state - these are bound to the old loop
+            while not self._queue.empty():
+                self._discard_log_task(self._queue.get_nowait())
             self._queue = None
             self._sem = None
             self._worker_task = None
@@ -88,6 +93,27 @@ class LoggingWorker:
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._worker_loop())
 
+    @staticmethod
+    def _discard_log_task(task: LoggingTask) -> None:
+        producer = task.get("producer")
+        if producer is not None and not producer.started:
+            task["coroutine"].close()
+            producer.discard()
+
+    @staticmethod
+    def _start_log_task(task: LoggingTask) -> asyncio.Task:
+        started = task["context"].run(asyncio.create_task, task["coroutine"])
+        producer = task.get("producer")
+        if producer is not None:
+            started.add_done_callback(lambda _: producer.discard())
+        return started
+
+    def _schedule_queue_task(self, coroutine: Coroutine, task: LoggingTask) -> None:
+        scheduled = asyncio.create_task(coroutine)
+        self._running_tasks.add(scheduled)
+        scheduled.add_done_callback(self._running_tasks.discard)
+        scheduled.add_done_callback(lambda done: self._discard_log_task(task) if done.cancelled() else None)
+
     async def _process_log_task(self, task: LoggingTask, sem: asyncio.Semaphore):
         """Runs the logging task and handles cleanup. Releases semaphore when done."""
         try:
@@ -95,7 +121,7 @@ class LoggingWorker:
                 try:
                     # Run the coroutine in its original context
                     await asyncio.wait_for(
-                        task["context"].run(asyncio.create_task, task["coroutine"]),
+                        self._start_log_task(task),
                         timeout=self.timeout,
                     )
                 except Exception as e:
@@ -122,6 +148,9 @@ class LoggingWorker:
                     processing_task = asyncio.create_task(self._process_log_task(task, self._sem))
                     self._running_tasks.add(processing_task)
                     processing_task.add_done_callback(self._running_tasks.discard)
+                    processing_task.add_done_callback(
+                        lambda done, item=task: self._discard_log_task(item) if done.cancelled() else None
+                    )
                 except Exception:
                     # If task creation fails, release semaphore to prevent deadlock
                     self._sem.release()
@@ -137,14 +166,19 @@ class LoggingWorker:
         Add a coroutine to the logging queue.
         Hot path: never blocks, aggressively clears queue if full.
         """
+        request = accounting_request.get()
+        producer = AccountingProducer(coroutine, request) if request is not None else None
+        tracked = producer.run() if producer is not None else coroutine
+        task = LoggingTask(coroutine=tracked, context=contextvars.copy_context(), counted_in_queue=False)
+        if producer is not None:
+            task["producer"] = producer
         if self._queue is None:
+            self._discard_log_task(task)
             return
-
-        # Capture the current context when enqueueing
-        task = LoggingTask(coroutine=coroutine, context=contextvars.copy_context())
 
         try:
             self._queue.put_nowait(task)
+            task["counted_in_queue"] = True
         except asyncio.QueueFull:
             # Queue is full - handle it appropriately
             verbose_logger.exception("LoggingWorker queue is full")
@@ -191,7 +225,7 @@ class LoggingWorker:
         if self._should_start_aggressive_clear():
             self._mark_aggressive_clear_started()
             # Schedule clearing as async task so enqueue returns immediately (non-blocking)
-            asyncio.create_task(self._aggressively_clear_queue_async(task))
+            self._schedule_queue_task(self._aggressively_clear_queue_async(task), task)
         else:
             # Cooldown active or clear in progress, schedule a delayed retry
             self._schedule_delayed_enqueue_retry(task)
@@ -228,10 +262,10 @@ class LoggingWorker:
             delay = self._calculate_retry_delay()
 
             # Schedule the retry as a background task
-            asyncio.create_task(self._retry_enqueue_task(task, delay))
+            self._schedule_queue_task(self._retry_enqueue_task(task, delay), task)
         except RuntimeError:
             # No event loop, drop the task as we can't schedule a retry
-            pass
+            self._discard_log_task(task)
 
     async def _retry_enqueue_task(self, task: LoggingTask, delay: float) -> None:
         """
@@ -242,10 +276,12 @@ class LoggingWorker:
 
         # Try to enqueue the task directly, preserving its original context
         if self._queue is None:
+            self._discard_log_task(task)
             return
 
         try:
             self._queue.put_nowait(task)
+            task["counted_in_queue"] = True
         except asyncio.QueueFull:
             # Still full - handle it appropriately (clear or retry again)
             self._handle_queue_full(task)
@@ -284,6 +320,8 @@ class LoggingWorker:
         """
         try:
             if self._queue is None:
+                if new_task is not None:
+                    self._discard_log_task(new_task)
                 return
 
             extracted_tasks = self._extract_tasks_from_queue()
@@ -304,18 +342,20 @@ class LoggingWorker:
     async def _process_single_task(self, task: LoggingTask) -> None:
         """Process a single task and mark it done."""
         if self._queue is None:
+            self._discard_log_task(task)
             return
 
         try:
             await asyncio.wait_for(
-                task["context"].run(asyncio.create_task, task["coroutine"]),
+                self._start_log_task(task),
                 timeout=self.timeout,
             )
         except Exception:
             # Suppress errors during processing to ensure we keep going
             pass
         finally:
-            self._queue.task_done()
+            if task.get("counted_in_queue", True):
+                self._queue.task_done()
 
     async def _process_extracted_tasks(self, tasks: list[LoggingTask]) -> None:
         """
@@ -323,6 +363,8 @@ class LoggingWorker:
         Processes them concurrently without semaphore limits for maximum speed.
         """
         if not tasks or self._queue is None:
+            for task in tasks:
+                self._discard_log_task(task)
             return
 
         # Process all tasks concurrently for maximum speed
@@ -390,7 +432,7 @@ class LoggingWorker:
                 # Await the coroutine to properly execute and avoid "never awaited" warnings
                 try:
                     await asyncio.wait_for(
-                        task["context"].run(asyncio.create_task, task["coroutine"]),
+                        self._start_log_task(task),
                         timeout=self.timeout,
                     )
                 except Exception:

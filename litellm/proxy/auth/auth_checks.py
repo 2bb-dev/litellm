@@ -667,15 +667,22 @@ async def common_checks(
             and user_object is not None
             and user_object.max_budget is not None
         ):
-            user_budget = user_object.max_budget
+            from litellm.proxy.spend_tracking import postgres_accounting
             from litellm.proxy.proxy_server import get_current_spend
 
-            user_spend = await get_current_spend(
-                counter_key=f"spend:user:{user_object.user_id}",
-                fallback_spend=user_object.spend or 0.0,
-                max_budget=user_budget,
-            )
-            if math.isfinite(user_budget) and user_spend >= user_budget:
+            if postgres_accounting.runtime is not None:
+                current = await postgres_accounting.runtime.refresh_user(user_object.user_id, include_holds=True)
+                current_user = LiteLLM_UserTable(**current) if current is not None else None
+                user_budget = current_user.max_budget if current_user is not None else None
+                user_spend = (current_user.spend or 0.0) if current_user is not None else 0.0
+            else:
+                user_budget = user_object.max_budget
+                user_spend = await get_current_spend(
+                    counter_key=f"spend:user:{user_object.user_id}",
+                    fallback_spend=user_object.spend or 0.0,
+                    max_budget=user_budget,
+                )
+            if user_budget is not None and math.isfinite(user_budget) and user_spend >= user_budget:
                 raise litellm.BudgetExceededError(
                     current_cost=user_spend,
                     max_budget=user_budget,
@@ -1597,6 +1604,12 @@ async def get_user_object(
     if user_id is None:
         return None
 
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is not None:
+        current = await postgres_accounting.runtime.refresh_user(user_id)
+        return LiteLLM_UserTable(**current) if current is not None else None
+
     # check if in cache
     if not check_db_only:
         cached_user_obj = await user_api_key_cache.async_get_cache(
@@ -1905,6 +1918,11 @@ async def get_team_object(
     """
     if prisma_client is None:
         raise Exception("No DB Connected. See - https://docs.litellm.ai/docs/proxy/virtual_keys")
+
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is not None:
+        return LiteLLM_TeamTableCachedObj(**await postgres_accounting.runtime.refresh_team(team_id))
 
     # check if in cache
     key = "team_id:{}".format(team_id)
@@ -3039,6 +3057,10 @@ async def can_key_call_resolved_model(
             )
             team_object_from_lookup = True
         except Exception:
+            from litellm.proxy.spend_tracking import postgres_accounting
+
+            if postgres_accounting.runtime is not None:
+                raise
             team_object = LiteLLM_TeamTableCachedObj(
                 team_id=valid_token.team_id,
                 models=valid_token.team_models,
@@ -3823,6 +3845,10 @@ async def _check_team_member_model_access(
         )
 
 
+def team_budget_exceeded(spend: float, max_budget: Optional[float]) -> bool:
+    return max_budget is not None and math.isfinite(max_budget) and spend > max_budget
+
+
 async def _team_max_budget_check(
     team_object: Optional[LiteLLM_TeamTable],
     valid_token: Optional[UserAPIKeyAuth],
@@ -3838,14 +3864,20 @@ async def _team_max_budget_check(
     if team_object is not None and team_object.max_budget is not None:
         from litellm.proxy.proxy_server import get_current_spend
 
-        # Read spend from cross-pod counter (Redis-first) or cached object (fallback)
-        spend = await get_current_spend(
-            counter_key=f"spend:team:{team_object.team_id}",
-            fallback_spend=team_object.spend or 0.0,
-            max_budget=team_object.max_budget,
-        )
+        from litellm.proxy.spend_tracking import postgres_accounting
 
-        if math.isfinite(team_object.max_budget) and spend > team_object.max_budget:
+        if postgres_accounting.runtime is not None:
+            current = await postgres_accounting.runtime.refresh_team(team_object.team_id, include_holds=True)
+            team_object = LiteLLM_TeamTable(**current)
+            spend = team_object.spend or 0.0
+        else:
+            spend = await get_current_spend(
+                counter_key=f"spend:team:{team_object.team_id}",
+                fallback_spend=team_object.spend or 0.0,
+                max_budget=team_object.max_budget,
+            )
+
+        if team_budget_exceeded(spend, team_object.max_budget):
             if valid_token:
                 call_info = CallInfo(
                     token=valid_token.token,

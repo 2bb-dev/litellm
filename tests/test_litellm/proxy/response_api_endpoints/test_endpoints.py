@@ -11,6 +11,91 @@ from fastapi.testclient import TestClient
 from litellm.proxy.proxy_server import app
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"model": "gpt-4o", "input": 123},
+        {"model": "gpt-4o", "input": "private-prompt", "max_output_tokens": "invalid"},
+        {"model": "gpt-4o", "input": [123]},
+        {"model": "gpt-4o", "input": {"private-prompt": "not an input array"}},
+        {"model": "gpt-4o", "input": "private-prompt", "max_output_tokens": {}},
+    ],
+)
+def test_responses_native_body_schema_rejects_before_execution(body):
+    from fastapi import FastAPI
+    from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
+    from litellm.proxy.response_api_endpoints.endpoints import router
+
+    isolated = FastAPI()
+    isolated.include_router(router)
+    isolated.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(api_key="local-test-key")
+    with (
+        patch(
+            "litellm.proxy.response_api_endpoints.endpoints.ProxyBaseLLMRequestProcessing.base_process_llm_request",
+            new_callable=AsyncMock,
+        ) as execution,
+        TestClient(isolated) as client,
+    ):
+        response = client.post("/v1/responses", json=body)
+    execution.assert_not_awaited()
+    assert response.status_code == 422
+    assert "private-prompt" not in response.text
+    assert all("input" not in error for error in response.json()["detail"])
+
+
+@pytest.mark.parametrize("strict", [None, False, True])
+@pytest.mark.parametrize("detail", [None, "auto", "low"])
+def test_responses_native_optional_fields_reach_transformation_unchanged(strict, detail):
+    from copy import deepcopy
+    from fastapi import FastAPI
+    from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+    from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
+    from litellm.proxy.response_api_endpoints.endpoints import ProxyBaseLLMRequestProcessing, router
+    from litellm.types.router import GenericLiteLLMParams
+
+    isolated = FastAPI()
+    isolated.include_router(router)
+    isolated.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(api_key="local-test-key")
+    body = {
+        "model": "gpt-4o",
+        "input": [{"role": "user", "content": [{"type": "input_image", "image_url": "https://example.invalid/image"}]}],
+        "tools": [
+            {
+                "type": "function",
+                "name": "read",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False, "required": []},
+            }
+        ],
+        "max_output_tokens": 10,
+        "parallel_tool_calls": False,
+        "metadata": {"native-pass-through": "retained"},
+    }
+    if strict is not None:
+        body["tools"][0]["strict"] = strict
+    if detail is not None:
+        body["input"][0]["content"][0]["detail"] = detail
+    original = deepcopy(body)
+
+    async def execution(self, **kwargs):
+        return OpenAIResponsesAPIConfig().transform_responses_api_request(
+            model=self.data["model"],
+            input=self.data["input"],
+            response_api_optional_request_params={
+                key: value for key, value in self.data.items() if key not in {"model", "input"}
+            },
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+    with (
+        patch.object(ProxyBaseLLMRequestProcessing, "base_process_llm_request", execution),
+        TestClient(isolated) as client,
+    ):
+        response = client.post("/v1/responses", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json() == original
+
+
 class TestResponsesAPIEndpoints(unittest.TestCase):
     @pytest.mark.asyncio
     @patch("litellm.proxy.proxy_server.llm_router")

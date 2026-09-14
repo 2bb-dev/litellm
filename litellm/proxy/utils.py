@@ -180,6 +180,7 @@ from litellm.types.proxy.policy_engine.pipeline_types import PipelineExecutionRe
 from litellm.types.utils import LLMResponseTypes, LoggedLiteLLMParams
 
 if TYPE_CHECKING:
+    from prisma import Prisma
     from opentelemetry.trace import Span as _Span
 
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -2592,7 +2593,9 @@ class ProxyLogging:
         if _deferred_cb is not None and _args is not None:
             logging_obj._on_deferred_stream_complete = None
             logging_obj._deferred_stream_complete_args = None
-            asyncio.create_task(_deferred_cb(*_args))
+            from litellm.litellm_core_utils.accounting_context import spawn_accounting
+
+            spawn_accounting(_deferred_cb(*_args))
 
     def _release_max_parallel_requests_on_disconnect(self, user_api_key_dict: UserAPIKeyAuth) -> None:
         """
@@ -3588,6 +3591,22 @@ class PrismaClient:
             db_data["budget_limits"] = json.dumps(db_data["budget_limits"])
         return db_data
 
+    def prepare_key_insert(self, data: dict) -> dict:
+        hashed_token = self.hash_token(token=data["token"])
+        db_data = self.jsonify_object(data=data)
+        db_data["token"] = hashed_token
+        # Nullable JSON must be omitted, not passed as Python None to Prisma.
+        if db_data.get("budget_limits") is None:
+            db_data.pop("budget_limits", None)
+        return db_data
+
+    async def insert_key(self, db_data: dict, *, db: "Prisma"):
+        return await db.litellm_verificationtoken.upsert(
+            where={"token": db_data["token"]},
+            data={"create": {**db_data}, "update": {}},
+            include={"litellm_budget_table": True},
+        )
+
     # Define a retrying strategy with exponential backoff
     @backoff.on_exception(
         backoff.expo,
@@ -3608,29 +3627,17 @@ class PrismaClient:
         try:
             verbose_proxy_logger.debug("PrismaClient: insert_data: %s", data)
             if table_name == "key":
-                token = data["token"]
-                hashed_token = self.hash_token(token=token)
-                db_data = self.jsonify_object(data=data)
-                db_data["token"] = hashed_token
-                # Prisma rejects nullable JSON fields set to None (no default).
-                # Strip them so the DB stores NULL via the column's nullable constraint.
-                if db_data.get("budget_limits") is None:
-                    db_data.pop("budget_limits", None)
+                db_data = self.prepare_key_insert(data)
                 print_verbose("PrismaClient: Before upsert into litellm_verificationtoken")
-                new_verification_token = await VerificationTokenRepository(self).table.upsert(  # type: ignore
-                    where={
-                        "token": hashed_token,
-                    },
-                    data={
-                        "create": {**db_data},  # type: ignore
-                        "update": {},  # don't do anything if it already exists
-                    },
-                    include={"litellm_budget_table": True},
-                )
+                new_verification_token = await self.insert_key(db_data, db=self.db)
                 verbose_proxy_logger.info("Data Inserted into Keys Table")
                 return new_verification_token
             elif table_name == "user":
                 db_data = self.jsonify_object(data=data)
+                from litellm.proxy.spend_tracking import postgres_accounting
+
+                if postgres_accounting.runtime is not None:
+                    return await postgres_accounting.runtime.write_user(data["user_id"], data, {})
                 try:
                     new_user_row = await UserRepository(self).table.upsert(
                         where={"user_id": data["user_id"]},
@@ -3789,15 +3796,20 @@ class PrismaClient:
                         update_key_values = update_key_values_custom_query
                     else:
                         update_key_values = db_data
-                update_user_row = await UserRepository(self).table.upsert(
-                    where={"user_id": user_id},  # type: ignore
-                    data={
-                        "create": {**db_data},  # type: ignore
-                        "update": {
-                            **update_key_values  # type: ignore
-                        },  # just update user-specified values, if it already exists
-                    },
-                )
+                from litellm.proxy.spend_tracking import postgres_accounting
+
+                if postgres_accounting.runtime is not None:
+                    update_user_row = await postgres_accounting.runtime.write_user(user_id, db_data, update_key_values)
+                else:
+                    update_user_row = await UserRepository(self).table.upsert(
+                        where={"user_id": user_id},  # type: ignore
+                        data={
+                            "create": {**db_data},  # type: ignore
+                            "update": {
+                                **update_key_values  # type: ignore
+                            },  # just update user-specified values, if it already exists
+                        },
+                    )
                 verbose_proxy_logger.info(
                     "\033[91m" + f"DB User Table - update succeeded {update_user_row}" + "\033[0m"
                 )
@@ -5487,13 +5499,27 @@ async def update_spend_logs_job(
             # requeue the batch and let the scheduler retry it later. Spend-log
             # request IDs are unique and create_many skips duplicates, so replay
             # is safe when the original write eventually committed.
-            await ProxyUpdateSpend.update_spend_logs(
-                n_retry_times=0,
-                prisma_client=prisma_client,
-                proxy_logging_obj=proxy_logging_obj,
-                db_writer_client=db_writer_client,
-                logs_to_process=logs_to_process,
-            )
+            from litellm.proxy.spend_tracking import postgres_accounting
+
+            if postgres_accounting.runtime is not None:
+                for index, entry in enumerate(logs_to_process):
+                    envelope = postgres_accounting.OUTBOX_EVENT.validate_python(entry.get("postgres_accounting"))
+                    try:
+                        await postgres_accounting.runtime.apply(envelope)
+                    except postgres_accounting.AccountingReceiptsPending:
+                        spool = prisma_client._spend_log_spool
+                        if spool is None or queue_batch.durable_row_ids is None:
+                            raise
+                        # Keep the immutable seal pending without blocking unrelated receipts.
+                        await spool.defer(queue_batch.durable_row_ids[index])
+            else:
+                await ProxyUpdateSpend.update_spend_logs(
+                    n_retry_times=0,
+                    prisma_client=prisma_client,
+                    proxy_logging_obj=proxy_logging_obj,
+                    db_writer_client=db_writer_client,
+                    logs_to_process=logs_to_process,
+                )
         except asyncio.CancelledError:
             await release_spend_log_batch(prisma_client, queue_batch)
             raise

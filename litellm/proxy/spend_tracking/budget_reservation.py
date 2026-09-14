@@ -74,6 +74,23 @@ async def reserve_budget_for_request(
     if get_model_from_request(request_body, route, llm_router=llm_router) is None:
         return None
 
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is not None:
+        if (
+            route not in {"/chat/completions", "/v1/chat/completions", "/responses", "/v1/responses"}
+            or end_user_id
+            or request_body.get("user")
+        ):
+            raise ValueError("PostgreSQL accounting first vertical: scope/window integration pending")
+        await postgres_accounting.runtime.admit(
+            valid_token.token,
+            estimate_request_max_cost(request_body, route, llm_router),
+            estimate_request_input_cost(request_body, route, llm_router),
+            model=request_body.get("model"),
+            auth=valid_token,
+        )
+        return None
     counters = await _get_budget_counters(
         request_body=request_body,
         valid_token=valid_token,
@@ -173,6 +190,10 @@ async def reconcile_budget_reservation(
     actual_cost: Optional[float],
     finalize: bool = True,
 ) -> None:
+    from litellm.litellm_core_utils.accounting_context import accounting_request
+
+    if accounting_request.get() is not None:
+        return
     if not budget_reservation or budget_reservation.get("finalized") is True:
         return
 
@@ -216,6 +237,12 @@ async def release_budget_reservation_on_cancel(
     when success/failure handling already reconciled, so calling it on every
     cancellation path is safe.
     """
+    from litellm.proxy.spend_tracking import postgres_accounting
+    from litellm.litellm_core_utils.accounting_context import accounting_request
+
+    if postgres_accounting.runtime is not None and accounting_request.get() is not None:
+        await asyncio.shield(postgres_accounting.runtime.cancel())
+        return
     if not budget_reservation or budget_reservation.get("finalized") is True:
         return
     incurred_cost = float(budget_reservation.get("input_cost") or 0.0)

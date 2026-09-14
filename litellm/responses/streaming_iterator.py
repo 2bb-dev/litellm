@@ -66,6 +66,9 @@ class BaseResponsesAPIStreamingIterator:
         call_type: Optional[str] = None,
         manage_stream_lifecycle: bool = True,
     ):
+        from litellm.litellm_core_utils.accounting_context import accounting_call
+
+        self._accounting_call = accounting_call.get()
         self.response = response
         self.model = model
         self.logging_obj = logging_obj
@@ -514,7 +517,9 @@ class BaseResponsesAPIStreamingIterator:
 
         end_time = datetime.now()
         if is_async:
-            asyncio.create_task(
+            from litellm.litellm_core_utils.accounting_context import spawn_accounting
+
+            spawn_accounting(
                 self.logging_obj.async_success_handler(
                     result=logging_response,
                     start_time=self.start_time,
@@ -620,7 +625,9 @@ class BaseResponsesAPIStreamingIterator:
 
         cached_response = response_obj.model_dump_json()
         if is_async:
-            cache_write_task = asyncio.create_task(
+            from litellm.litellm_core_utils.accounting_context import spawn_accounting
+
+            cache_write_task = spawn_accounting(
                 litellm.cache.async_add_cache(
                     cached_response,
                     dynamic_cache_object=getattr(caching_handler, "dual_cache", None),
@@ -825,6 +832,15 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         return self
 
     async def __anext__(self) -> Any:
+        from litellm.litellm_core_utils.accounting_context import accounting_call
+
+        token = accounting_call.set(self._accounting_call)
+        try:
+            return await self._accounting_anext()
+        finally:
+            accounting_call.reset(token)
+
+    async def _accounting_anext(self) -> Any:
         try:
             self._check_max_streaming_duration()
             while True:
@@ -868,6 +884,24 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
     def _handle_logging_completed_response(self):
         """Handle logging for completed responses in async context"""
         self._log_completed_response(is_async=True)
+
+    def _handle_failure(self, exception: Exception):
+        from litellm.litellm_core_utils.accounting_context import accounting_request, spawn_accounting
+
+        if accounting_request.get() is None:
+            return super()._handle_failure(exception)
+        if self._failure_handled:
+            return
+        self._failure_handled = True
+        spawn_accounting(
+            self.logging_obj.async_failure_handler(
+                exception=exception,
+                traceback_exception=traceback.format_exc(),
+                start_time=self.start_time,
+                end_time=datetime.now(),
+            )
+        )
+        self.logging_obj.failure_handler(exception, traceback.format_exc(), self.start_time, datetime.now())
 
 
 class SyncResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):

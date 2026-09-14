@@ -1012,6 +1012,19 @@ class Router:
                     healthy_deployments=healthy_deployments,
                 )
             case "usage-based-routing":
+                from litellm.litellm_core_utils.accounting_context import accounting_request
+
+                if accounting_request.get() is not None:
+                    from litellm.proxy.spend_tracking import postgres_accounting
+
+                    if postgres_accounting.runtime is not None:
+                        return selector.get_available_deployments(
+                            model_group=model,
+                            healthy_deployments=healthy_deployments,
+                            messages=messages,
+                            input=input,
+                            usage_snapshot=await postgres_accounting.runtime.routing_usage(model),
+                        )
                 # `LowestTPMLoggingHandler` (v1) only exposes the sync
                 # `get_available_deployments`. Mirror the pre-routing-groups
                 # top-level fallback by calling it inline so groups using v1
@@ -10278,6 +10291,7 @@ class Router:
         """
         if (
             self.routing_strategy != "usage-based-routing-v2"
+            and self.routing_strategy != "usage-based-routing"
             and self.routing_strategy != "simple-shuffle"
             and self.routing_strategy != "cost-based-routing"
             and self.routing_strategy != "latency-based-routing"

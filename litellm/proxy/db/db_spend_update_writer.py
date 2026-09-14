@@ -64,6 +64,7 @@ from litellm.proxy.route_llm_request import ROUTE_ENDPOINT_MAPPING
 from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
 
 if TYPE_CHECKING:
+    from prisma.client import Batch
     from litellm.proxy.utils import PrismaClient, ProxyLogging
 else:
     PrismaClient = Any
@@ -176,6 +177,14 @@ class DBSpendUpdateWriter:
             if team_id is not None and team_id != "":
                 payload["team_id"] = team_id
 
+            from litellm.proxy.spend_tracking import postgres_accounting
+
+            if postgres_accounting.runtime is not None:
+                daily = await self._common_add_spend_log_transaction_to_daily_transaction(payload, prisma_client)
+                await postgres_accounting.runtime.bind_failure_key(hashed_token, response_cost)
+                await postgres_accounting.runtime.enqueue(payload, daily or {}, response_cost)
+                return
+
             # One deepcopy shared by all 6 daily spend helpers (was 5, fixes agent bug)
             payload_copy = copy.deepcopy(payload)
 
@@ -219,6 +228,12 @@ class DBSpendUpdateWriter:
 
             verbose_proxy_logger.debug("Runs spend update on all tables")
         except Exception:
+            from litellm.litellm_core_utils.accounting_context import accounting_request
+
+            accounting = accounting_request.get()
+            if accounting is not None:
+                accounting.failed = True
+                raise
             spend_log_error(
                 "Spend tracking - update_database failed. Spend log insertion or daily transaction enqueue "
                 "may not have completed for this request. "
@@ -1098,10 +1113,7 @@ class DBSpendUpdateWriter:
                             # batch_() issues statements sequentially within the tx, so iteration
                             # order = lock acquisition order.
                             for user_id, response_cost in sorted(user_list_transactions.items()):
-                                batcher.litellm_usertable.update_many(
-                                    where={"user_id": user_id},
-                                    data={"spend": {"increment": response_cost}},
-                                )
+                                DBSpendUpdateWriter.write_user_spend(batcher, user_id, response_cost)
                     break
                 except DB_CONNECTION_ERROR_TYPES as e:
                     if i >= n_retry_times:  # If we've reached the maximum number of retries
@@ -1138,13 +1150,7 @@ class DBSpendUpdateWriter:
                         async with transaction.batch_() as batcher:
                             # Sort by token for consistent lock ordering across pods to prevent deadlocks.
                             for token, response_cost in sorted(key_list_transactions.items()):
-                                batcher.litellm_verificationtoken.update_many(  # 'update_many' prevents error from being raised if no row exists
-                                    where={"token": token},
-                                    data={
-                                        "spend": {"increment": response_cost},
-                                        "last_active": datetime.now(timezone.utc),
-                                    },
-                                )
+                                DBSpendUpdateWriter.write_key_spend(batcher, token, response_cost)
                     break
                 except DB_CONNECTION_ERROR_TYPES as e:
                     if i >= n_retry_times:  # If we've reached the maximum number of retries
@@ -1174,10 +1180,7 @@ class DBSpendUpdateWriter:
                                 verbose_proxy_logger.debug(
                                     "Updating spend for team id={} by {}".format(team_id, response_cost)
                                 )
-                                batcher.litellm_teamtable.update_many(  # 'update_many' prevents error from being raised if no row exists
-                                    where={"team_id": team_id},
-                                    data={"spend": {"increment": response_cost}},
-                                )
+                                DBSpendUpdateWriter.write_team_spend(batcher, team_id, response_cost)
                     break
                 except DB_CONNECTION_ERROR_TYPES as e:
                     if i >= n_retry_times:  # If we've reached the maximum number of retries
@@ -1217,13 +1220,7 @@ class DBSpendUpdateWriter:
                                 team_id = key.split("::")[1]
                                 user_id = key.split("::")[3]
 
-                                batcher.litellm_teammembership.update_many(  # 'update_many' prevents error from being raised if no row exists
-                                    where={"team_id": team_id, "user_id": user_id},
-                                    data={
-                                        "spend": {"increment": response_cost},
-                                        "total_spend": {"increment": response_cost},
-                                    },
-                                )
+                                DBSpendUpdateWriter.write_team_member_spend(batcher, team_id, user_id, response_cost)
                     # Transaction succeeded, break out of retry loop
                     break
                 except DB_CONNECTION_ERROR_TYPES as e:
@@ -1366,6 +1363,127 @@ class DBSpendUpdateWriter:
                     _raise_failed_update_spend_exception(
                         e=e, start_time=start_time, proxy_logging_obj=proxy_logging_obj
                     )
+
+    @staticmethod
+    def write_team_spend(batcher: "Batch", team_id: str, response_cost: float) -> None:
+        batcher.litellm_teamtable.update_many(
+            where={"team_id": team_id},
+            data={"spend": {"increment": response_cost}},
+        )
+
+    @staticmethod
+    def write_team_member_spend(batcher: "Batch", team_id: str, user_id: str, response_cost: float) -> None:
+        batcher.litellm_teammembership.update_many(
+            where={"team_id": team_id, "user_id": user_id},
+            data={"spend": {"increment": response_cost}, "total_spend": {"increment": response_cost}},
+        )
+
+    @staticmethod
+    def write_user_spend(batcher: "Batch", user_id: str, response_cost: float) -> None:
+        batcher.litellm_usertable.update_many(
+            where={"user_id": user_id},
+            data={"spend": {"increment": response_cost}},
+        )
+
+    @staticmethod
+    def write_key_spend(batcher: "Batch", token: str, response_cost: float) -> None:
+        batcher.litellm_verificationtoken.update_many(
+            where={"token": token},
+            data={"spend": {"increment": response_cost}, "last_active": datetime.now(timezone.utc)},
+        )
+
+    @staticmethod
+    def write_daily_spend(
+        batcher: "Batch",
+        transaction: Union[
+            DailyUserSpendTransaction,
+            DailyTeamSpendTransaction,
+            DailyTagSpendTransaction,
+            DailyOrganizationSpendTransaction,
+            DailyEndUserSpendTransaction,
+            DailyAgentSpendTransaction,
+        ],
+        entity_type: Literal["user", "team", "org", "tag", "end_user", "agent"],
+        entity_id_field: str,
+        table_name: str,
+        unique_constraint_name: str,
+    ) -> None:
+        entity_id = transaction.get(entity_id_field)
+
+        # Construct the where clause dynamically
+        where_clause = {
+            unique_constraint_name: {
+                entity_id_field: entity_id,
+                "date": transaction["date"],
+                "api_key": transaction["api_key"],
+                "model": transaction["model"],
+                "custom_llm_provider": transaction.get("custom_llm_provider") or "",
+                "mcp_namespaced_tool_name": transaction.get("mcp_namespaced_tool_name") or "",
+                "endpoint": transaction.get("endpoint") or "",
+            }
+        }
+
+        # Get the table dynamically
+        table = getattr(batcher, table_name)
+
+        # Common data structure for both create and update
+        common_data = {
+            entity_id_field: entity_id,
+            "date": transaction["date"],
+            "api_key": transaction["api_key"],
+            "model": transaction.get("model"),
+            "model_group": transaction.get("model_group"),
+            "mcp_namespaced_tool_name": transaction.get("mcp_namespaced_tool_name") or "",
+            "custom_llm_provider": transaction.get("custom_llm_provider"),
+            "endpoint": transaction.get("endpoint") or "",
+            "prompt_tokens": transaction["prompt_tokens"],
+            "completion_tokens": transaction["completion_tokens"],
+            "spend": transaction["spend"],
+            "api_requests": transaction["api_requests"],
+            "successful_requests": transaction["successful_requests"],
+            "failed_requests": transaction["failed_requests"],
+        }
+
+        # Add cache-related fields if they exist
+        if "cache_read_input_tokens" in transaction:
+            common_data["cache_read_input_tokens"] = transaction.get("cache_read_input_tokens", 0)
+        if "cache_creation_input_tokens" in transaction:
+            common_data["cache_creation_input_tokens"] = transaction.get("cache_creation_input_tokens", 0)
+
+        if entity_type == "tag" and "request_id" in transaction:
+            common_data["request_id"] = transaction.get("request_id")
+
+        # Create update data structure
+        update_data = {
+            "prompt_tokens": {"increment": transaction["prompt_tokens"]},
+            "completion_tokens": {"increment": transaction["completion_tokens"]},
+            "spend": {"increment": transaction["spend"]},
+            "api_requests": {"increment": transaction["api_requests"]},
+            "successful_requests": {"increment": transaction["successful_requests"]},
+            "failed_requests": {"increment": transaction["failed_requests"]},
+        }
+
+        # Add cache-related fields to update if they exist
+        if "cache_read_input_tokens" in transaction:
+            update_data["cache_read_input_tokens"] = {"increment": transaction.get("cache_read_input_tokens", 0)}
+        if "cache_creation_input_tokens" in transaction:
+            update_data["cache_creation_input_tokens"] = {
+                "increment": transaction.get("cache_creation_input_tokens", 0)
+            }
+
+        if entity_type == "tag" and "request_id" in transaction:
+            update_data["request_id"] = transaction.get("request_id")
+
+        # Add endpoint to update_data so existing rows get their endpoint field updated
+        update_data["endpoint"] = transaction.get("endpoint") or ""
+
+        table.upsert(
+            where=where_clause,
+            data={
+                "create": common_data,
+                "update": update_data,
+            },
+        )
 
     # fmt: off
 
@@ -1519,88 +1637,13 @@ class DBSpendUpdateWriter:
                         try:
                             async with prisma_client.db.batch_() as batcher:
                                 for _, transaction in transactions_to_process.items():
-                                    entity_id = transaction.get(entity_id_field)
-
-                                    # Construct the where clause dynamically
-                                    where_clause = {
-                                        unique_constraint_name: {
-                                            entity_id_field: entity_id,
-                                            "date": transaction["date"],
-                                            "api_key": transaction["api_key"],
-                                            "model": transaction["model"],
-                                            "custom_llm_provider": transaction.get("custom_llm_provider") or "",
-                                            "mcp_namespaced_tool_name": transaction.get("mcp_namespaced_tool_name")
-                                            or "",
-                                            "endpoint": transaction.get("endpoint") or "",
-                                        }
-                                    }
-
-                                    # Get the table dynamically
-                                    table = getattr(batcher, table_name)
-
-                                    # Common data structure for both create and update
-                                    common_data = {
-                                        entity_id_field: entity_id,
-                                        "date": transaction["date"],
-                                        "api_key": transaction["api_key"],
-                                        "model": transaction.get("model"),
-                                        "model_group": transaction.get("model_group"),
-                                        "mcp_namespaced_tool_name": transaction.get("mcp_namespaced_tool_name") or "",
-                                        "custom_llm_provider": transaction.get("custom_llm_provider"),
-                                        "endpoint": transaction.get("endpoint") or "",
-                                        "prompt_tokens": transaction["prompt_tokens"],
-                                        "completion_tokens": transaction["completion_tokens"],
-                                        "spend": transaction["spend"],
-                                        "api_requests": transaction["api_requests"],
-                                        "successful_requests": transaction["successful_requests"],
-                                        "failed_requests": transaction["failed_requests"],
-                                    }
-
-                                    # Add cache-related fields if they exist
-                                    if "cache_read_input_tokens" in transaction:
-                                        common_data["cache_read_input_tokens"] = transaction.get(
-                                            "cache_read_input_tokens", 0
-                                        )
-                                    if "cache_creation_input_tokens" in transaction:
-                                        common_data["cache_creation_input_tokens"] = transaction.get(
-                                            "cache_creation_input_tokens", 0
-                                        )
-
-                                    if entity_type == "tag" and "request_id" in transaction:
-                                        common_data["request_id"] = transaction.get("request_id")
-
-                                    # Create update data structure
-                                    update_data = {
-                                        "prompt_tokens": {"increment": transaction["prompt_tokens"]},
-                                        "completion_tokens": {"increment": transaction["completion_tokens"]},
-                                        "spend": {"increment": transaction["spend"]},
-                                        "api_requests": {"increment": transaction["api_requests"]},
-                                        "successful_requests": {"increment": transaction["successful_requests"]},
-                                        "failed_requests": {"increment": transaction["failed_requests"]},
-                                    }
-
-                                    # Add cache-related fields to update if they exist
-                                    if "cache_read_input_tokens" in transaction:
-                                        update_data["cache_read_input_tokens"] = {
-                                            "increment": transaction.get("cache_read_input_tokens", 0)
-                                        }
-                                    if "cache_creation_input_tokens" in transaction:
-                                        update_data["cache_creation_input_tokens"] = {
-                                            "increment": transaction.get("cache_creation_input_tokens", 0)
-                                        }
-
-                                    if entity_type == "tag" and "request_id" in transaction:
-                                        update_data["request_id"] = transaction.get("request_id")
-
-                                    # Add endpoint to update_data so existing rows get their endpoint field updated
-                                    update_data["endpoint"] = transaction.get("endpoint") or ""
-
-                                    table.upsert(
-                                        where=where_clause,
-                                        data={
-                                            "create": common_data,
-                                            "update": update_data,
-                                        },
+                                    DBSpendUpdateWriter.write_daily_spend(
+                                        batcher,
+                                        transaction,
+                                        entity_type,
+                                        entity_id_field,
+                                        table_name,
+                                        unique_constraint_name,
                                     )
                         except Exception as batch_error:
                             # Log detailed error information for debugging batch upsert failures

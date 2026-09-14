@@ -1559,6 +1559,10 @@ async def health_readiness(response: Response):
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "shutting_down"}
 
+    accounting_status = await _accounting_readiness(response)
+    if accounting_status is not None:
+        return accounting_status
+
     if _allow_public_health_readiness_details():
         return await _get_health_readiness_details(response=response)
 
@@ -1575,6 +1579,12 @@ async def health_readiness_details(response: Response):
     """
     Authenticated readiness diagnostics with DB/cache/callback metadata.
     """
+    if GracefulShutdownManager.is_shutting_down():
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "shutting_down"}
+    accounting_status = await _accounting_readiness(response)
+    if accounting_status is not None:
+        return accounting_status
     return await _get_health_readiness_details(response=response)
 
 
@@ -1595,6 +1605,53 @@ async def health_backlog():
     return {"in_flight_requests": get_in_flight_requests()}
 
 
+async def _accounting_readiness(response: Response) -> Optional[dict[str, str]]:
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is None:
+        return None
+    try:
+        state = await postgres_accounting.runtime.status()
+    except Exception:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "accounting_unknown"}
+    if not state.accepting:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "accounting_draining"}
+    return None
+
+
+async def _accounting_control(request: Request, accepting: Optional[bool] = None):
+    from starlette.responses import JSONResponse
+
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if not _drain_endpoint_enabled():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    _authorize_drain_request(request)
+    runtime = postgres_accounting.runtime
+    if runtime is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    if accepting is True and GracefulShutdownManager.is_shutting_down():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Process is shutting down")
+    try:
+        state = await runtime.status() if accepting is None else await runtime.set_accepting(accepting)
+    except Exception:
+        return JSONResponse(runtime.unknown_status().model_dump(), status_code=503)
+    code = 202 if accepting is False and state.pending_requests else 200
+    return JSONResponse(state.model_dump(), status_code=code)
+
+
+@router.get("/health/accounting", tags=["health"])
+async def health_accounting(request: Request):
+    return await _accounting_control(request)
+
+
+@router.post("/health/resume", tags=["health"])
+async def health_resume(request: Request):
+    return await _accounting_control(request, accepting=True)
+
+
 @router.get(
     "/health/drain",
     tags=["health"],
@@ -1602,6 +1659,11 @@ async def health_backlog():
 async def health_drain(request: Request):
     """
     Graceful-drain probe for Kubernetes ``preStop`` hooks.
+
+    With PostgreSQL accounting, close durable generation admission only. The
+    identity envelope reports accounting/producer obligations, not transport
+    retirement; liveness and process shutdown remain unchanged. Explicit resume
+    reopens admission for rollback. The remaining behavior describes legacy mode.
 
     Disabled by default and returns 404 unless ``general_settings`` sets
     ``enable_drain_endpoint: true``. Calling it flips a process-wide
@@ -1638,6 +1700,10 @@ async def health_drain(request: Request):
     if not _drain_endpoint_enabled():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
     _authorize_drain_request(request)
+    from litellm.proxy.spend_tracking import postgres_accounting
+
+    if postgres_accounting.runtime is not None:
+        return await _accounting_control(request, accepting=False)
     GracefulShutdownManager.start_shutdown()
     drained = await GracefulShutdownManager.wait_for_drain(exclude_self=True)
     return {"status": "drained", "drained_requests": drained}

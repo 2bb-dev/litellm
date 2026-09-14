@@ -122,6 +122,9 @@ class CustomStreamWrapper:
         make_call: Optional[Callable] = None,
         _response_headers: Optional[dict] = None,
     ):
+        from litellm.litellm_core_utils.accounting_context import accounting_call
+
+        self._accounting_call = accounting_call.get()
         self.model = model
         self.make_call = make_call
         self.custom_llm_provider = custom_llm_provider
@@ -1875,6 +1878,15 @@ class CustomStreamWrapper:
         return self.completion_stream
 
     async def __anext__(self) -> "ModelResponseStream":
+        from litellm.litellm_core_utils.accounting_context import accounting_call
+
+        token = accounting_call.set(self._accounting_call)
+        try:
+            return await self._anext()
+        finally:
+            accounting_call.reset(token)
+
+    async def _anext(self) -> "ModelResponseStream":
         cache_hit = False
         if self.custom_llm_provider is not None and self.custom_llm_provider == "cached_response":
             cache_hit = True
@@ -2050,7 +2062,9 @@ class CustomStreamWrapper:
                     # prefer_async_handlers routes CustomLogger to async_success_handler
                     # when consumers use ``async for`` on sync-SDK streams. Legacy string
                     # callbacks still run via executor.submit inside dispatch_success_handlers.
-                    asyncio.create_task(
+                    from litellm.litellm_core_utils.accounting_context import spawn_accounting
+
+                    spawn_accounting(
                         self.logging_obj.dispatch_success_handlers(
                             complete_streaming_response,
                             cache_hit=cache_hit,
@@ -2077,7 +2091,9 @@ class CustomStreamWrapper:
                     args=(e, traceback_exception),
                 ).start()  # log response
                 # Handle any exceptions that might occur during streaming
-                asyncio.create_task(self.logging_obj.async_failure_handler(e, traceback_exception))
+                from litellm.litellm_core_utils.accounting_context import spawn_accounting
+
+                spawn_accounting(self.logging_obj.async_failure_handler(e, traceback_exception))
             self._handle_stream_fallback_error(e)
         except Exception as e:
             traceback_exception = traceback.format_exc()
@@ -2089,7 +2105,9 @@ class CustomStreamWrapper:
                     args=(e, traceback_exception),
                 ).start()  # log response
                 # Handle any exceptions that might occur during streaming
-                asyncio.create_task(
+                from litellm.litellm_core_utils.accounting_context import spawn_accounting
+
+                spawn_accounting(
                     self.logging_obj.async_failure_handler(e, traceback_exception)  # type: ignore
                 )
             self._handle_stream_fallback_error(e)

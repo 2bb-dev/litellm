@@ -152,6 +152,7 @@ class LowestTPMLoggingHandler(CustomLogger):
         healthy_deployments: list,
         messages: Optional[List[Dict[str, str]]] = None,
         input: Optional[Union[str, List]] = None,
+        usage_snapshot: Optional[tuple[Dict[str, int], Dict[str, int]]] = None,
     ):
         """
         Returns a deployment with the lowest TPM/RPM usage.
@@ -164,8 +165,8 @@ class LowestTPMLoggingHandler(CustomLogger):
         tpm_key = f"{model_group}:tpm:{current_minute}"
         rpm_key = f"{model_group}:rpm:{current_minute}"
 
-        tpm_dict = self.router_cache.get_cache(key=tpm_key)
-        rpm_dict = self.router_cache.get_cache(key=rpm_key)
+        tpm_dict = usage_snapshot[0] if usage_snapshot is not None else self.router_cache.get_cache(key=tpm_key)
+        rpm_dict = usage_snapshot[1] if usage_snapshot is not None else self.router_cache.get_cache(key=rpm_key)
 
         verbose_router_logger.debug(f"tpm_key={tpm_key}, tpm_dict: {tpm_dict}, rpm_dict: {rpm_dict}")
         try:
