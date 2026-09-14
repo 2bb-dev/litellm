@@ -6,6 +6,7 @@ but litellm_params["litellm_metadata"] is None.
 """
 
 from types import SimpleNamespace
+import ssl
 
 import pytest
 
@@ -16,6 +17,29 @@ from litellm.litellm_core_utils.redact_messages import (
     should_redact_message_logging,
 )
 from litellm.responses.main import mock_responses_api_response
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_redacted_responses_preserve_usage_with_transport_state(stream):
+    response = mock_responses_api_response("sensitive output")
+    response.reasoning = {"summary": "private reasoning"}
+    response._hidden_params["transport"] = ssl.create_default_context()
+    response._hidden_params["response_cost"] = 0.125
+    original_usage = response.usage.model_dump()
+    details = {"stream": stream, "messages": [{"role": "user", "content": "private prompt"}]}
+
+    redacted = perform_redaction(details, response)
+
+    assert isinstance(redacted, litellm.ResponsesAPIResponse)
+    assert redacted.id == response.id
+    assert redacted.model == response.model
+    assert redacted.usage.model_dump() == original_usage
+    assert redacted._hidden_params["response_cost"] == 0.125
+    assert redacted.output[0].content[0].text == "redacted-by-litellm"
+    assert redacted.reasoning is None
+    assert response.output[0].content[0].text == "sensitive output"
+    assert response.reasoning == {"summary": "private reasoning"}
+    assert details["messages"] == [{"role": "user", "content": "redacted-by-litellm"}]
 
 
 @pytest.fixture(autouse=True)
