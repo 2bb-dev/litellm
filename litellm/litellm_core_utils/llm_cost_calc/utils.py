@@ -208,7 +208,7 @@ def _parse_above_token_threshold(key: str) -> float:
 
 def _get_token_base_cost(
     model_info: ModelInfo, usage: Usage, service_tier: Optional[str] = None
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[float, float, Optional[float], float, float]:
     """
     Return prompt cost, completion cost, and cache costs for a given model and usage.
 
@@ -216,7 +216,7 @@ def _get_token_base_cost(
     then we use the corresponding threshold cost for all token types.
 
     Returns:
-        Tuple[float, float, float, float] - (prompt_cost, completion_cost, cache_creation_cost, cache_read_cost)
+        Tuple of input, output, optional cache-write, one-hour write, and cache-read rates.
     """
     # Get service tier aware cost keys
     input_cost_key = _get_service_tier_cost_key("input_cost_per_token", service_tier)
@@ -233,7 +233,7 @@ def _get_token_base_cost(
         output_image_cost = _get_cost_per_unit(model_info, "output_cost_per_image_token", None)
         if output_image_cost is not None:
             completion_base_cost = cast(float, output_image_cost)
-    cache_creation_cost = cast(float, _get_cost_per_unit(model_info, cache_creation_cost_key))
+    cache_creation_cost = _get_cost_per_unit(model_info, cache_creation_cost_key, None)
     cache_creation_cost_above_1hr = cast(
         float,
         _get_cost_per_unit(model_info, "cache_creation_input_token_cost_above_1hr"),
@@ -329,13 +329,10 @@ def _get_token_base_cost(
                         else f"cache_read_input_token_cost_above_{threshold_str}_tokens"
                     )
 
-                    cache_creation_cost = cast(
-                        float,
-                        _get_cost_per_unit(
-                            model_info,
-                            cache_creation_tiered_key,
-                            cache_creation_cost,
-                        ),
+                    cache_creation_cost = _get_cost_per_unit(
+                        model_info,
+                        cache_creation_tiered_key,
+                        cache_creation_cost,
                     )
 
                     cache_creation_cost_above_1hr = cast(
@@ -466,7 +463,8 @@ def _parse_prompt_tokens_details(usage: Usage) -> PromptTokensDetailsResult:
     cache_creation_tokens = (
         cast(
             Optional[int],
-            getattr(usage.prompt_tokens_details, "cache_creation_tokens", 0),
+            getattr(usage.prompt_tokens_details, "cache_write_tokens", 0)
+            or getattr(usage.prompt_tokens_details, "cache_creation_tokens", 0),
         )
         or 0
     )
@@ -765,7 +763,17 @@ def resolve_token_pricing(
     }
     if "output_cost_per_reasoning_token" in period:
         effective_rates["output_cost_per_reasoning_token"] = period["output_cost_per_reasoning_token"]
-    return cast(ModelInfo, {**dated_info, **effective_rates})
+    write_rate = effective_rates["cache_creation_input_token_cost"]
+    return cast(
+        ModelInfo,
+        {
+            **dated_info,
+            **effective_rates,
+            "cache_creation_input_token_cost": write_rate
+            if write_rate is not None
+            else effective_rates["input_cost_per_token"],
+        },
+    )
 
 
 def calculate_cache_costs(
