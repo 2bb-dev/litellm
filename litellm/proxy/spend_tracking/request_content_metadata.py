@@ -7,8 +7,8 @@ from collections.abc import Mapping
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
-from litellm.proxy._types import SpendLogsPayload
 from litellm.litellm_core_utils.credential_ownership import FIELD, safe_ownership
+from litellm.proxy._types import SpendLogsPayload
 from litellm.proxy.spend_tracking.request_content_encryption import (
     CaptureFailure,
     ContentEnvelope,
