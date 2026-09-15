@@ -616,12 +616,13 @@ def load_credentials_from_list(kwargs: dict):
     credential_values, credential_info, ambiguous = (
         CredentialAccessor.get_credential_snapshot(credential_name) if credential_name else ({}, {}, False)
     )
-    from litellm.litellm_core_utils.credential_ownership import STAMP, resolve_ownership
+    from litellm.litellm_core_utils.credential_ownership import DISPATCH, STAMP, resolve_ownership
 
     stamp = resolve_ownership(kwargs, credential_values, credential_info, credential_ambiguous=ambiguous)
     logging_obj = kwargs.get("litellm_logging_obj")
     if logging_obj is not None:
         logging_obj.model_call_details[STAMP] = stamp
+        logging_obj.model_call_details[DISPATCH] = stamp
     if credential_name:
         for key, value in credential_values.items():
             if key not in kwargs:
@@ -1333,6 +1334,14 @@ def client(original_function):
             ## LOAD CREDENTIALS
             kwargs["litellm_logging_obj"] = logging_obj
             load_credentials_from_list(kwargs)
+            from litellm.litellm_core_utils.terminal_receipt_hooks import CALL_CONTEXT
+            from litellm.litellm_core_utils.terminal_receipt_hooks import (
+                prepare as prepare_terminal_receipt,
+            )
+
+            prepare_terminal_receipt(
+                CALL_CONTEXT.validate_python(kwargs), CALL_CONTEXT.validate_python(logging_obj.model_call_details)
+            )
             kwargs["litellm_logging_obj"] = logging_obj
             LLMCachingHandler = _get_cached_llm_caching_handler()
             _llm_caching_handler: "LLMCachingHandler" = LLMCachingHandler(
@@ -1624,6 +1633,12 @@ def client(original_function):
             kwargs["litellm_logging_obj"] = logging_obj
             ## LOAD CREDENTIALS
             load_credentials_from_list(kwargs)
+            from litellm.litellm_core_utils import terminal_receipt_hooks
+
+            await terminal_receipt_hooks.prepare_async(
+                terminal_receipt_hooks.CALL_CONTEXT.validate_python(kwargs),
+                terminal_receipt_hooks.CALL_CONTEXT.validate_python(logging_obj.model_call_details),
+            )
             logging_obj._llm_caching_handler = _llm_caching_handler
             # [OPTIONAL] CHECK BUDGET
             if litellm.max_budget:

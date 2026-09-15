@@ -305,6 +305,7 @@ def make_call(failed=False):
         "user_api_key_user_id": "user-1",
         "user_api_key_team_id": "team-1",
         "user_api_key_org_id": "org-1",
+        "user_api_key_end_user_id": "end-user-1",
         "status": "failure" if failed else "success",
         "tags": [CANARY],
         "user_api_key_alias": CANARY,
@@ -462,7 +463,9 @@ def test_oversized_complete_request_is_capture_failure_not_silently_truncated(pr
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider_failed", [False, True])
 @pytest.mark.parametrize("failure_mode", ["none", "crypto", "transform"])
-@pytest.mark.parametrize("ownership_source", ["platform", "byok", "unknown"])
+@pytest.mark.parametrize(
+    "ownership_source", ["platform", "byok", "unknown", "admission_timeout", "bad_ingress", "retrieval_unavailable"]
+)
 async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_billing(
     protected_config, tmp_path, provider_failed, failure_mode, ownership_source
 ):
@@ -478,9 +481,14 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
         select_credential,
     )
 
+    local_source = (
+        "unknown"
+        if ownership_source in {"admission_timeout", "bad_ingress", "retrieval_unavailable"}
+        else ownership_source
+    )
     registration = {
         "v": 1,
-        "source": ownership_source,
+        "source": local_source,
         "registration_id": "3e15c0c2-feca-4104-a648-8d579315ef51",
         "registration_revision": "e7ca1c3e-b6ea-4ce0-8538-b8f149448038",
     }
@@ -502,6 +510,70 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
     )
     kwargs["litellm_params"]["metadata"]["model_info"] = {"id": "completed-deployment"}
     kwargs["litellm_params"]["metadata"][FIELD] = {**registration, "source": "forged"}
+    from tests.test_litellm.litellm_core_utils.test_terminal_receipt_evidence import signed_session
+    from litellm.litellm_core_utils.terminal_receipt_evidence import FIELD as TERMINAL_FIELD, STAMP as TERMINAL_STAMP
+
+    from tests.test_litellm.litellm_core_utils.test_terminal_usage_evidence import signed_usage
+    from litellm.litellm_core_utils.terminal_usage_evidence import FIELD as USAGE_EVIDENCE_FIELD, usage_shell
+
+    terminal_session, measurement, _, _, _ = signed_usage(local_source)
+    terminal_session.usage_envelope = measurement
+    if ownership_source in {"admission_timeout", "bad_ingress"}:
+        from litellm.litellm_core_utils.terminal_receipt_client import ReceiptUnavailable
+        from litellm.litellm_core_utils.terminal_receipt_evidence import CONTEXT as TERMINAL_CONTEXT, Terminal
+        from litellm.litellm_core_utils.terminal_receipt_hooks import prepare
+
+        terminal_session.envelope = None
+        terminal_session.begun = False
+        terminal_session.finished = False
+        terminal_session.terminal = Terminal(
+            deployment_id="completed-deployment", model="proxy-model", provider="litellm_proxy"
+        )
+        with patch.object(
+            terminal_session.root.authority,
+            "request",
+            **(
+                {"side_effect": ReceiptUnavailable()}
+                if ownership_source == "admission_timeout"
+                else {"return_value": {"ingress_jws": CANARY}}
+            ),
+        ):
+            with pytest.raises(ReceiptUnavailable):
+                prepare({"metadata": {TERMINAL_CONTEXT: terminal_session}}, kwargs)
+        assert terminal_session.envelope is not None
+        assert terminal_session.envelope.correlation_id is None
+        assert terminal_session.envelope.state == "unavailable"
+        terminal_session.usage_envelope = usage_shell(terminal_session.envelope)
+    if ownership_source == "retrieval_unavailable":
+        from litellm.litellm_core_utils.terminal_receipt_client import ReceiptUnavailable
+
+        terminal_session.envelope = terminal_session.envelope.model_copy(
+            update={
+                "receipts": terminal_session.envelope.receipts[:2],
+                "state": "pending",
+            }
+        )
+        expected_receipts = terminal_session.envelope.receipts
+        with patch.object(terminal_session.root.authority, "request", side_effect=ReceiptUnavailable()):
+            terminal_session.envelope = terminal_session.root.authority.retrieve(terminal_session.envelope)
+        assert terminal_session.envelope.receipts == expected_receipts
+        assert terminal_session.envelope.state == "unavailable"
+    from litellm.litellm_core_utils.terminal_usage_observation import UsageSnapshot, FIELD as USAGE_FIELD
+
+    terminal_session.usage_snapshot = UsageSnapshot(
+        prompt_tokens=9,
+        completion_tokens=3,
+        total_tokens=12,
+        cache_read_tokens=5,
+        cache_write_tokens=2,
+        cache_write_5m_tokens=1,
+        cache_write_1h_tokens=1,
+    )
+    terminal_session.usage_final = not provider_failed
+    kwargs[TERMINAL_STAMP] = terminal_session
+    kwargs["litellm_params"]["metadata"][TERMINAL_FIELD] = {"state": "forged"}
+    kwargs["litellm_params"]["metadata"][USAGE_FIELD] = {"state": "forged", "prompt_tokens": CANARY}
+    kwargs["litellm_params"]["metadata"][USAGE_EVIDENCE_FIELD] = {"state": "forged", "measurements": [CANARY]}
     original = copy.deepcopy(kwargs)
     spool = SQLiteSpendLogSpool(str(tmp_path / "spend.sqlite"))
     client = SimpleNamespace(
@@ -525,6 +597,7 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
     assert isinstance(encryptor, RequestContentEncryptor)
     with (
         patch.object(proxy_server, "prisma_client", client),
+        patch.object(proxy_server.proxy_logging_obj, "db_spend_update_writer", writer),
         patch.object(proxy_server, "disable_spend_logs", False),
         patch.object(proxy_server, "general_settings", {"store_prompts_in_spend_logs": True}),
         patch.object(proxy_server, "user_api_key_cache", SimpleNamespace(async_get_cache=AsyncMock(return_value=None))),
@@ -540,18 +613,31 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
         if failure_mode == "transform"
         else patch("litellm.proxy.spend_tracking.request_content_metadata.safe_metadata", wraps=safe_metadata),
     ):
-        await writer.update_database(
-            token="a" * 64,
-            user_id="user-1",
-            end_user_id="end-user-1",
-            team_id="team-1",
-            org_id="org-1",
-            kwargs=kwargs,
-            completion_response=ValueError(CANARY) if provider_failed else response,
-            start_time=datetime(2026, 9, 7, tzinfo=timezone.utc),
-            end_time=datetime(2026, 9, 7, 0, 0, 1, tzinfo=timezone.utc),
-            response_cost=0.25,
-        )
+        if provider_failed:
+            from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
+
+            collector = _ProxyDBLogger()
+            await collector.async_log_failure_event(
+                kwargs,
+                response,
+                datetime(2026, 9, 7, tzinfo=timezone.utc),
+                datetime(2026, 9, 7, 0, 0, 1, tzinfo=timezone.utc),
+            )
+            assert terminal_session.failure_persisted
+            await collector.async_log_failure_event(kwargs, response, datetime.now(), datetime.now())
+        else:
+            await writer.update_database(
+                token="a" * 64,
+                user_id="user-1",
+                end_user_id="end-user-1",
+                team_id="team-1",
+                org_id="org-1",
+                kwargs=kwargs,
+                completion_response=ValueError(CANARY) if provider_failed else response,
+                start_time=datetime(2026, 9, 7, tzinfo=timezone.utc),
+                end_time=datetime(2026, 9, 7, 0, 0, 1, tzinfo=timezone.utc),
+                response_cost=0.25,
+            )
         await asyncio.wait_for(captured.wait(), 2)
         rows = (await spool.peek_batch(10, 100000)).logs
         assert len(rows) == 1
@@ -575,10 +661,21 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
         marker = json.loads(row["metadata"])["openorange_request_log"]
         for persisted in (row, batch["payload_copy"]):
             persisted_metadata = json.loads(persisted["metadata"])
-            assert persisted_metadata[FIELD]["source"] == ownership_source
+            assert persisted["request_id"] == terminal_session.attempt_id
+            assert persisted_metadata[TERMINAL_FIELD] == terminal_session.envelope.model_dump(mode="json")
+            assert persisted_metadata[USAGE_EVIDENCE_FIELD] == terminal_session.usage_envelope.model_dump(mode="json")
+            observation = persisted_metadata[USAGE_FIELD]
+            assert observation["state"] == ("partial" if provider_failed else "observed")
+            assert observation["local_attempt_id"] == terminal_session.attempt_id
+            assert observation["prompt_tokens"] == 9
+            assert observation["cache_read_tokens"] == 5
+            assert observation["cache_write_tokens"] == 2
+            assert observation["cache_write_5m_tokens"] == 1
+            assert observation["cache_write_1h_tokens"] == 1
+            assert persisted_metadata[FIELD]["source"] == local_source
             assert persisted_metadata[FIELD]["deployment_id"] == "completed-deployment"
             assert persisted_metadata[FIELD]["registration_id"] == (
-                registration["registration_id"] if ownership_source != "unknown" else None
+                registration["registration_id"] if local_source != "unknown" else None
             )
             facts = persisted_metadata["additional_usage_values"]
             assert facts["prompt_tokens_details"]["cache_creation_token_details"] == {
@@ -697,3 +794,88 @@ async def test_mock_provider_output_and_full_retention_survive_no_log(protected_
     assert header["recordId"] == rows[0]["request_id"]
     assert content["messages"] == messages
     assert content["response"]["choices"][0]["message"]["content"] == CANARY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_failure", ["missing_database", "missing_spool", "enqueue_error"])
+async def test_receipt_failure_recovery_uses_private_context_and_durable_ack(
+    protected_config, monkeypatch, tmp_path, initial_failure
+):
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
+    from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP, FIELD
+    from tests.test_litellm.litellm_core_utils.test_terminal_receipt_evidence import signed_session
+
+    session, _, _, _ = signed_session("unknown")
+    response, kwargs = make_call(True)
+    kwargs[STAMP] = session
+    kwargs["litellm_params"]["metadata"]["model_info"] = {"id": session.terminal.deployment_id}
+    kwargs["start_time"] = datetime(2026, 9, 7, tzinfo=timezone.utc)
+    kwargs["end_time"] = datetime(2026, 9, 7, 0, 0, 1, tzinfo=timezone.utc)
+    spool = SQLiteSpendLogSpool(str(tmp_path / "recovery.sqlite"))
+    client = SimpleNamespace(
+        _spend_log_spool=spool,
+        _spend_log_transactions_lock=asyncio.Lock(),
+        spend_log_transactions=[],
+        get_request_status=lambda row: row["status"],
+    )
+    writer = DBSpendUpdateWriter()
+    batches = AsyncMock()
+    writer._batch_database_updates = batches
+    writer._enqueue_tool_registry_upsert = AsyncMock()
+    proxy_logging = proxy_server.proxy_logging_obj
+    monkeypatch.setattr(proxy_logging, "db_spend_update_writer", writer)
+    monkeypatch.setattr(proxy_logging, "update_request_status", AsyncMock())
+    monkeypatch.setattr(proxy_logging, "alert_types", [])
+    monkeypatch.setattr(proxy_server, "prisma_client", None if initial_failure == "missing_database" else client)
+    monkeypatch.setattr(proxy_server, "disable_spend_logs", False)
+    monkeypatch.setattr(proxy_server, "general_settings", {"store_prompts_in_spend_logs": True})
+    collector = _ProxyDBLogger()
+    monkeypatch.setattr(litellm, "callbacks", [collector])
+    if initial_failure == "missing_spool":
+        client._spend_log_spool = None
+    with (
+        patch.object(spool, "enqueue", side_effect=OSError("synthetic storage failure"))
+        if initial_failure == "enqueue_error"
+        else patch.object(spool, "enqueue", wraps=spool.enqueue)
+    ):
+        await collector.async_log_failure_event(kwargs, response, kwargs["start_time"], kwargs["end_time"])
+    await asyncio.sleep(0)
+    assert not session.failure_persisted
+    assert (await spool.stats()).count == 0
+    initial_batches = batches.await_count
+    monkeypatch.setattr(proxy_server, "prisma_client", client)
+    client._spend_log_spool = spool
+    data = {"litellm_call_id": "root-request", "litellm_logging_obj": SimpleNamespace(model_call_details=kwargs)}
+    with (
+        patch(
+            "litellm.proxy.hooks.proxy_track_cost_callback._release_budget_reservation", new_callable=AsyncMock
+        ) as release,
+        patch("litellm.proxy.spend_tracking.request_content_policy.request_policy_failure", return_value=None),
+        patch("litellm.proxy.spend_tracking.request_content_policy.protected_profile_failure", return_value=None),
+    ):
+        await proxy_logging.post_call_failure_hook(
+            request_data=data,
+            original_exception=ValueError("native failure is not non-execution"),
+            user_api_key_dict=UserAPIKeyAuth(request_route="/chat/completions"),
+        )
+        release.assert_not_awaited()
+    await asyncio.sleep(0)
+    assert "litellm_logging_obj" not in data
+    assert STAMP not in data
+    assert session.failure_persisted
+    rows = (await spool.peek_batch(10, 100000)).logs
+    assert len(rows) == 1
+    assert rows[0]["request_id"] == session.attempt_id
+    assert json.loads(rows[0]["metadata"])[FIELD]["local_request_id"] == session.root.local_request_id
+    assert rows[0]["status"] == "failure"
+    assert rows[0]["prompt_tokens"] == 9
+    assert batches.await_count == max(initial_batches, 1)
+    await asyncio.gather(
+        *(
+            collector.async_log_failure_event(kwargs, response, kwargs["start_time"], kwargs["end_time"])
+            for _ in range(2)
+        )
+    )
+    assert (await spool.stats()).count == 1

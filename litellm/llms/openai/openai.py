@@ -432,6 +432,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             else:
                 headers = {}
             response = raw_response.parse()
+            from litellm.litellm_core_utils.terminal_usage_observation import observe_sdk_usage
+
+            observe_sdk_usage(logging_obj.model_call_details, response)
             if not data.get("stream") and not hasattr(response, "model_dump"):
                 raise OpenAIError(
                     status_code=500,
@@ -468,6 +471,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             else:
                 headers = {}
             response = raw_response.parse()
+            from litellm.litellm_core_utils.terminal_usage_observation import observe_sdk_usage
+
+            observe_sdk_usage(logging_obj.model_call_details, response)
             if not data.get("stream") and not hasattr(response, "model_dump"):
                 raise OpenAIError(
                     status_code=500,

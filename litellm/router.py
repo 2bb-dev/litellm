@@ -43,6 +43,17 @@ from openai import AsyncOpenAI
 from typing_extensions import overload
 
 import litellm
+from litellm.litellm_core_utils.terminal_receipt_client import (
+    Authority as TerminalReceiptAuthority,
+    configured_authority as configured_terminal_receipt_authority,
+)
+from litellm.litellm_core_utils.terminal_receipt_hooks import (
+    CALL_CONTEXT,
+    OPAQUE_VALUE,
+    enter_router,
+    select_attempt,
+    wrap_result,
+)
 import litellm.litellm_core_utils
 import litellm.litellm_core_utils.exception_mapping_utils
 from litellm import get_secret_str
@@ -314,6 +325,7 @@ class Router:
         health_check_staleness_threshold: Optional[int] = None,
         health_check_ignore_transient_errors: bool = False,
         enable_weighted_failover: bool = False,
+        terminal_receipt_authority: Optional["TerminalReceiptAuthority"] = None,
     ) -> None:
         """
         Initialize the Router class with the given parameters for caching, reliability, and routing strategy.
@@ -404,6 +416,7 @@ class Router:
                 verbose_router_logger.setLevel(logging.DEBUG)
         self.router_general_settings: RouterGeneralSettings = router_general_settings or RouterGeneralSettings()
 
+        self._terminal_receipt_authority = terminal_receipt_authority or configured_terminal_receipt_authority()
         self.assistants_config = assistants_config
         self.search_tools = search_tools or []
         self.guardrail_list = guardrail_list or []
@@ -1589,6 +1602,7 @@ class Router:
         Example usage:
         response = router.completion(model="gpt-3.5-turbo", messages=[{"role": "user", "content": "Hey, how's it going?"}]
         """
+        terminal_root = enter_router(CALL_CONTEXT.validate_python(kwargs), self._terminal_receipt_authority)
         try:
             verbose_router_logger.debug(f"router.completion(model={model},..)")
             kwargs["model"] = model
@@ -1597,8 +1611,10 @@ class Router:
             self._update_kwargs_before_fallbacks(model=model, kwargs=kwargs)
 
             response = self.function_with_fallbacks(**kwargs)
-            return response
-        except Exception as e:
+            return wrap_result(response, terminal_root)
+        except BaseException as e:
+            if terminal_root is not None:
+                terminal_root.leave()
             raise e
 
     def _completion(
@@ -1815,6 +1831,7 @@ class Router:
         stream: bool = False,
         **kwargs,
     ):
+        terminal_root = enter_router(CALL_CONTEXT.validate_python(kwargs), self._terminal_receipt_authority)
         try:
             kwargs["model"] = model
             kwargs["messages"] = messages
@@ -1849,8 +1866,12 @@ class Router:
                 )
             )
 
-            return response
-        except Exception as e:
+            return (
+                await asyncio.to_thread(wrap_result, response, terminal_root) if terminal_root is not None else response
+            )
+        except BaseException as e:
+            if terminal_root is not None:
+                await asyncio.to_thread(terminal_root.leave)
             asyncio.create_task(
                 send_llm_exception_alert(
                     litellm_router_instance=self,
@@ -2977,6 +2998,12 @@ class Router:
 
         kwargs[metadata_variable_name].pop(FIELD, None)
         kwargs[metadata_variable_name][CONTEXT] = select_credential(deployment, kwargs, model_info.get("id"))
+        kwargs[metadata_variable_name] = select_attempt(
+            CALL_CONTEXT.validate_python(kwargs[metadata_variable_name]),
+            OPAQUE_VALUE.validate_python(deployment_litellm_model_name),
+            OPAQUE_VALUE.validate_python(model_info.get("id")),
+            OPAQUE_VALUE.validate_python(deployment_api_base),
+        )
 
     def _get_async_openai_model_client(self, deployment: dict, kwargs: dict):
         """

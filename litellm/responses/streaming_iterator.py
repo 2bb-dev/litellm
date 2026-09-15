@@ -355,6 +355,10 @@ class BaseResponsesAPIStreamingIterator:
         try:
             # Parse the JSON chunk
             parsed_chunk = json.loads(chunk)
+            from litellm.litellm_core_utils.terminal_receipt_hooks import CALL_CONTEXT, OPAQUE_VALUE
+            from litellm.litellm_core_utils.terminal_usage_observation import observe_native_usage
+
+            observe_native_usage(CALL_CONTEXT.validate_python(self.logging_obj.model_call_details), OPAQUE_VALUE.validate_python(parsed_chunk), streamed=True)
 
             # Format as ResponsesAPIStreamingResponse
             if isinstance(parsed_chunk, dict):
