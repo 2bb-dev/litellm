@@ -69,6 +69,44 @@ async def test_responses_usage_callback_survives_redacted_transport_state(async_
     assert logged.output[0].content[0].text == "redacted-by-litellm"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_call", [False, True])
+async def test_responses_redacted_logging_hook_cannot_mutate_caller_metadata(async_call):
+    from litellm.responses.main import mock_responses_api_response
+
+    class MetadataRedactor(CustomLogger):
+        def logging_hook(self, kwargs, result, call_type):
+            result.metadata.clear()
+            return kwargs, result
+
+        async def async_logging_hook(self, kwargs, result, call_type):
+            result.metadata.clear()
+            return kwargs, result
+
+    receiver = MetadataRedactor()
+    result = mock_responses_api_response("private response")
+    result.metadata = {"task": "original"}
+    result._hidden_params["transport"] = ssl.create_default_context()
+    logger = LitellmLogging(
+        model=result.model,
+        messages=[{"role": "user", "content": "private prompt"}],
+        stream=False,
+        call_type="aresponses" if async_call else "responses",
+        start_time=time.time(),
+        litellm_call_id="redaction-metadata-test",
+        function_id="redaction-metadata-test",
+        dynamic_success_callbacks=[receiver],
+        dynamic_async_success_callbacks=[receiver],
+    )
+    logger.model_call_details["standard_callback_dynamic_params"] = {"turn_off_message_logging": True}
+    if async_call:
+        await logger.async_success_handler(result=result)
+    else:
+        logger.success_handler(result=result)
+
+    assert result.metadata == {"task": "original"}
+
+
 @pytest.fixture
 def logging_obj():
     return LitellmLogging(

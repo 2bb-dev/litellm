@@ -195,12 +195,7 @@ def perform_redaction(model_call_details: dict, result):
             return result.model_copy(update={"response": perform_redaction({}, result.response)})
         if isinstance(result, litellm.ResponsesAPIResponse):
             # Private transport state can contain clients/SSLContext that cannot be deep-copied.
-            _result = result.model_copy(
-                update={
-                    "output": copy.deepcopy(result.output),
-                    "usage": copy.deepcopy(result.usage),
-                }
-            )
+            _result = result.model_copy(update=copy.deepcopy(dict(result)))
             _result._hidden_params = dict(result._hidden_params)
         else:
             _result = copy.deepcopy(result)

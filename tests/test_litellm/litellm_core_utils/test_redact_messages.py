@@ -42,6 +42,24 @@ def test_redacted_responses_preserve_usage_with_transport_state(stream):
     assert details["messages"] == [{"role": "user", "content": "redacted-by-litellm"}]
 
 
+def test_redacted_responses_isolate_all_public_mutable_fields():
+    response = mock_responses_api_response("private output")
+    response.metadata = {"task": "original"}
+    response.tools = [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+    response.text = {"format": {"type": "text"}}
+    response._hidden_params["transport"] = ssl.create_default_context()
+
+    redacted = perform_redaction({}, response)
+    redacted.metadata.clear()
+    redacted.tools[0]["parameters"].clear()
+    redacted.text["format"].clear()
+
+    assert response.metadata == {"task": "original"}
+    assert response.tools[0]["parameters"] == {"type": "object"}
+    assert response.text == {"format": {"type": "text"}}
+    assert redacted._hidden_params["transport"] is response._hidden_params["transport"]
+
+
 @pytest.fixture(autouse=True)
 def _reset_global_redaction():
     """Ensure the global setting is off for every test."""
