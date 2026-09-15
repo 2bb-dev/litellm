@@ -41,6 +41,7 @@ from litellm.constants import (
     DEFAULT_SSL_CIPHERS,
     HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS,
 )
+from litellm.litellm_core_utils.credential_ownership import DISPATCH, STAMP, ownership_after_http_response
 from litellm.litellm_core_utils.logging_utils import track_llm_api_timing
 from litellm.litellm_core_utils.request_timeout_resolver import (
     get_configured_request_timeout,
@@ -62,6 +63,26 @@ try:
     from litellm._version import version
 except Exception:
     version = "0.0.0"
+
+
+def _prepare_ownership_dispatch(logging_obj: Optional[LiteLLMLoggingObject]) -> None:
+    if logging_obj is not None and DISPATCH in logging_obj.model_call_details:
+        logging_obj.model_call_details[STAMP] = logging_obj.model_call_details[DISPATCH]
+
+
+def _record_ownership_response(
+    logging_obj: Optional[LiteLLMLoggingObject],
+    request: httpx.Request,
+    client: httpx.Client | httpx.AsyncClient,
+    response: httpx.Response,
+) -> None:
+    if logging_obj is not None and DISPATCH in logging_obj.model_call_details:
+        logging_obj.model_call_details[STAMP] = ownership_after_http_response(
+            logging_obj.model_call_details[DISPATCH],
+            request,
+            client,
+            response,
+        )
 
 
 # aiohttp 3.10+ exposes a `socket_factory` kwarg on TCPConnector. Older
@@ -630,7 +651,9 @@ class AsyncHTTPHandler:
                 files=files,
                 content=request_content,
             )
+            _prepare_ownership_dispatch(logging_obj)
             response = await self.client.send(req, stream=stream)
+            _record_ownership_response(logging_obj, req, self.client, response)
             response.raise_for_status()
             return response
         except (httpx.RemoteProtocolError, httpx.ConnectError):
@@ -645,6 +668,7 @@ class AsyncHTTPHandler:
                     params=params,
                     headers=headers,
                     stream=stream,
+                    logging_obj=logging_obj,
                 )
             finally:
                 await new_client.aclose()
@@ -857,6 +881,7 @@ class AsyncHTTPHandler:
         headers: Optional[dict] = None,
         stream: bool = False,
         content: Any = None,
+        logging_obj: Optional[LiteLLMLoggingObject] = None,
     ):
         """
         Making POST request for a single connection client.
@@ -875,7 +900,9 @@ class AsyncHTTPHandler:
             headers=headers,
             content=request_content,  # type: ignore
         )
+        _prepare_ownership_dispatch(logging_obj)
         response = await client.send(req, stream=stream)
+        _record_ownership_response(logging_obj, req, client, response)
         response.raise_for_status()
         return response
 
@@ -1182,7 +1209,9 @@ class HTTPHandler:
                     files=files,
                     content=request_content,  # type: ignore
                 )
+            _prepare_ownership_dispatch(logging_obj)
             response = self.client.send(req, stream=stream)
+            _record_ownership_response(logging_obj, req, self.client, response)
             response.raise_for_status()
             return response
         except httpx.TimeoutException:

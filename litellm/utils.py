@@ -616,12 +616,13 @@ def load_credentials_from_list(kwargs: dict):
     credential_values, credential_info, ambiguous = (
         CredentialAccessor.get_credential_snapshot(credential_name) if credential_name else ({}, {}, False)
     )
-    from litellm.litellm_core_utils.credential_ownership import STAMP, resolve_ownership
+    from litellm.litellm_core_utils.credential_ownership import DISPATCH, STAMP, resolve_ownership
 
     stamp = resolve_ownership(kwargs, credential_values, credential_info, credential_ambiguous=ambiguous)
     logging_obj = kwargs.get("litellm_logging_obj")
     if logging_obj is not None:
         logging_obj.model_call_details[STAMP] = stamp
+        logging_obj.model_call_details[DISPATCH] = stamp
     if credential_name:
         for key, value in credential_values.items():
             if key not in kwargs:
