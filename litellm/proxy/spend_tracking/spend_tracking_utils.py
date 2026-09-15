@@ -26,6 +26,7 @@ from litellm.litellm_core_utils.core_helpers import (
     reconstruct_model_name,
 )
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps, strip_null_bytes
+from litellm.litellm_core_utils.credential_ownership import FIELD, STAMP, ownership_for_spend, strip_ownership
 from litellm.proxy._types import SpendLogsMetadata, SpendLogsPayload
 from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
 from litellm.proxy.utils import PrismaClient, hash_token
@@ -407,7 +408,12 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
             user=metadata.get("user_api_key_user_id", "") or "",
             team_id=metadata.get("user_api_key_team_id", "") or "",
             organization_id=metadata.get("user_api_key_org_id") or "",
-            metadata=safe_dumps(clean_metadata),
+            metadata=safe_dumps(
+                {
+                    **cast(dict, strip_ownership(clean_metadata)),
+                    FIELD: ownership_for_spend(kwargs.get(STAMP), _model_id),
+                }
+            ),
             cache_key=cache_key,
             spend=kwargs.get("response_cost", 0),
             total_tokens=usage.get("total_tokens", standard_logging_total_tokens),

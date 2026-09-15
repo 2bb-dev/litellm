@@ -2973,6 +2973,11 @@ class Router:
 
         self._update_kwargs_with_default_litellm_params(kwargs=kwargs, metadata_variable_name=metadata_variable_name)
 
+        from litellm.litellm_core_utils.credential_ownership import CONTEXT, FIELD, select_credential
+
+        kwargs[metadata_variable_name].pop(FIELD, None)
+        kwargs[metadata_variable_name][CONTEXT] = select_credential(deployment, kwargs, model_info.get("id"))
+
     def _get_async_openai_model_client(self, deployment: dict, kwargs: dict):
         """
         Helper to get AsyncOpenAI or AsyncAzureOpenAI client that was created for the deployment
@@ -4261,8 +4266,7 @@ class Router:
             if "cache_control" in kwargs and kwargs["cache_control"] is None:
                 kwargs["_litellm_disable_cache_control"] = "forward"
             elif "cache_control" not in kwargs and any(
-                self._contains_cache_control(kwargs.get(field))
-                for field in ("tools", "system", "messages")
+                self._contains_cache_control(kwargs.get(field)) for field in ("tools", "system", "messages")
             ):
                 # Explicit Anthropic breakpoints are the caller's cache policy.
                 # Do not add the deployment's automatic breakpoint on top.

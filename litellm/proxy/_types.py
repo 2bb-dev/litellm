@@ -10,10 +10,11 @@ from pydantic import (
     ConfigDict,
     Field,
     Json,
+    JsonValue,
     field_validator,
     model_validator,
 )
-from typing_extensions import Required, TypedDict
+from typing_extensions import NotRequired, Required, TypedDict
 
 from litellm._uuid import uuid
 from litellm.constants import MCP_STDIO_ALLOWED_COMMANDS
@@ -3063,6 +3064,7 @@ class SpendLogsMetadata(TypedDict):
     """
 
     additional_usage_values: Optional[dict]  # covers provider-specific usage information - e.g. prompt caching
+    openorange_credential_ownership: NotRequired[dict[str, JsonValue]]
     user_api_key: Optional[str]
     user_api_key_alias: Optional[str]
     user_api_key_team_id: Optional[str]

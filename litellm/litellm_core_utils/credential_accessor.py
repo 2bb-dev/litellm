@@ -8,6 +8,16 @@ from litellm.types.utils import CredentialItem
 
 class CredentialAccessor:
     @staticmethod
+    def get_credential_snapshot(credential_name: str) -> tuple[dict[str, object], dict[str, object], bool]:
+        """Values and registration from one selected registry item, before dispatch."""
+        matches = tuple(
+            credential for credential in litellm.credential_list if credential.credential_name == credential_name
+        )
+        if not matches:
+            return {}, {}, False
+        return matches[0].credential_values.copy(), matches[0].credential_info.copy(), len(matches) != 1
+
+    @staticmethod
     def get_credential_values(credential_name: str) -> dict:
         """Safe accessor for credentials."""
 

@@ -59,6 +59,11 @@ def _admin_config_fields_to_clear_on_base_override() -> List[str]:
 _ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE = _admin_config_fields_to_clear_on_base_override()
 
 
+def credential_override_fields() -> frozenset[str]:
+    """Fields that can replace the server-selected authentication or destination."""
+    return frozenset(_ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE) | frozenset(clientside_credential_keys)
+
+
 def is_clientside_credential(request_kwargs: dict) -> bool:
     """
     Check if the credential is a clientside credential.
