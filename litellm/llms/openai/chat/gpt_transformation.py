@@ -631,6 +631,10 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
         ## RESPONSE OBJECT
         try:
             completion_response = raw_response.json()
+            from litellm.litellm_core_utils.terminal_receipt_hooks import CALL_CONTEXT, OPAQUE_VALUE
+            from litellm.litellm_core_utils.terminal_usage_observation import observe_native_usage
+
+            observe_native_usage(CALL_CONTEXT.validate_python(logging_obj.model_call_details), OPAQUE_VALUE.validate_python(completion_response))
         except Exception as e:
             response_headers = getattr(raw_response, "headers", None)
             raise OpenAIError(

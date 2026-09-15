@@ -2115,12 +2115,27 @@ class ProxyLogging:
                     _callback = callback  # type: ignore
                 if _callback is not None and isinstance(_callback, CustomLogger):
                     try:
-                        hook_result = await _callback.async_post_call_failure_hook(
-                            request_data=request_data,
-                            user_api_key_dict=user_api_key_dict,
-                            original_exception=original_exception,
-                            traceback_str=traceback_str,
-                        )
+                        from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
+
+                        if isinstance(_callback, _ProxyDBLogger):
+                            from litellm.litellm_core_utils.terminal_receipt_hooks import CALL_CONTEXT, OPAQUE_VALUE
+
+                            hook_result = await _callback.async_post_call_failure_hook(
+                                request_data=request_data,
+                                user_api_key_dict=user_api_key_dict,
+                                original_exception=original_exception,
+                                traceback_str=traceback_str,
+                                terminal_details=CALL_CONTEXT.validate_python(
+                                    getattr(OPAQUE_VALUE.validate_python(_logging_obj), "model_call_details", {})
+                                ),
+                            )
+                        else:
+                            hook_result = await _callback.async_post_call_failure_hook(
+                                request_data=request_data,
+                                user_api_key_dict=user_api_key_dict,
+                                original_exception=original_exception,
+                                traceback_str=traceback_str,
+                            )
                         # If callback returned an HTTPException, use it (first one wins)
                         if isinstance(hook_result, HTTPException) and transformed_exception is None:
                             transformed_exception = hook_result

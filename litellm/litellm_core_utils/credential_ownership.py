@@ -148,9 +148,10 @@ class _Stamp:
 @dataclass(frozen=True, slots=True)
 class _DispatchProof:
     stamp: _Stamp
-    provider: Literal["anthropic", "deepseek"]
+    provider: Literal["anthropic", "deepseek", "chatgpt"]
     key_digest: bytes = field(repr=False)
     endpoint: str = field(repr=False)
+    account_digest: bytes | None = field(default=None, repr=False)
 
 
 def _digest(value: object) -> bytes | None:
@@ -333,11 +334,58 @@ def strip_ownership(value: object, depth: int = 0) -> object:
         return {
             key: strip_ownership(item, depth + 1)
             for key, item in mapping.items()
-            if key not in {FIELD, CONTEXT, STAMP, DISPATCH}
+            if key
+            not in {
+                FIELD,
+                CONTEXT,
+                STAMP,
+                DISPATCH,
+                "openorange_terminal_evidence",
+                "openorange_usage_observation",
+                "openorange_terminal_usage_evidence",
+                "_openorange_terminal_context",
+                "_openorange_terminal_stamp",
+                "_openorange_terminal_root",
+                "_openorange_terminal_oauth",
+            }
+            and key.lower() not in {"x-openorange-terminal-ingress", "x-openorange-terminal-central-request"}
         }
     if isinstance(value, list):
         return [strip_ownership(item, depth + 1) for item in _LIST.validate_python(value)]
     return value
+
+
+def planned_ownership_for_terminal(value: object, deployment_id: object) -> dict[str, JsonValue]:
+    selected = value.stamp if type(value) is _DispatchProof else value
+    return ownership_for_spend(selected, deployment_id)
+
+
+def selected_oauth_proof(
+    value: object,
+    registration: Registration,
+    key_digest: bytes,
+    account_digest: bytes,
+    base: str,
+    *,
+    responses: bool = False,
+) -> object:
+    if type(value) is not _Selection:
+        return _stamp(None, None, "unregistered")
+    if (
+        value.rejection is not None
+        or value.deployment_id is None
+        or not (value.model or "").startswith("chatgpt/")
+        or value.credential_name is not None
+        or (value.registration is not None and value.registration != registration)
+    ):
+        return _stamp(value, None, "ambiguous")
+    return _DispatchProof(
+        _stamp(value, registration, "credential_registration"),
+        "chatgpt",
+        key_digest,
+        base.rstrip("/") + ("/responses" if responses else "/chat/completions"),
+        account_digest,
+    )
 
 
 def _native_endpoint(provider: Literal["anthropic", "deepseek"], base: object) -> str:
@@ -404,6 +452,10 @@ def ownership_after_http_response(value: object, request: object, client: object
         return pending
     auth = request.headers.get_list("authorization")
     keys = request.headers.get_list("x-api-key")
+    if value.provider == "chatgpt":
+        accounts = request.headers.get_list("chatgpt-account-id")
+        if len(accounts) != 1 or _digest(accounts[0]) != value.account_digest:
+            return pending
     if len(auth) == 1 and not keys and auth[0].startswith("Bearer "):
         return value.stamp if _digest(auth[0][7:]) == value.key_digest else pending
     if value.provider == "anthropic" and len(keys) == 1 and not auth:

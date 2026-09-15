@@ -53,7 +53,12 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 message=str(e),
             )
 
-        account_id = self.authenticator.get_account_id()
+        from litellm.litellm_core_utils.terminal_receipt_oauth import AccountSnapshot, record_account
+
+        snapshot = self.authenticator.get_account_snapshot(access_token)
+        account_id = snapshot.account_id if type(snapshot) is AccountSnapshot else self.authenticator.get_account_id()
+        if litellm_params is not None:
+            record_account(dict(litellm_params), snapshot)
         session_id = ensure_chatgpt_session_id(litellm_params)
         default_headers = get_chatgpt_default_headers(access_token, account_id, session_id)
         return {**default_headers, **headers}

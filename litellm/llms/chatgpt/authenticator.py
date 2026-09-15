@@ -1,8 +1,9 @@
 import base64
+import hashlib
 import json
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import httpx
 
@@ -26,6 +27,9 @@ TOKEN_EXPIRY_SKEW_SECONDS = 60
 DEVICE_CODE_TIMEOUT_SECONDS = 15 * 60
 DEVICE_CODE_COOLDOWN_SECONDS = 5 * 60
 DEVICE_CODE_POLL_SLEEP_SECONDS = 5
+
+if TYPE_CHECKING:
+    from litellm.litellm_core_utils.terminal_receipt_oauth import AccountSnapshot
 
 
 class Authenticator:
@@ -77,6 +81,24 @@ class Authenticator:
             auth_data["account_id"] = derived
             self._write_auth_file(auth_data)
         return derived
+
+    def get_account_snapshot(self, access_token: Optional[str]) -> "AccountSnapshot | None":
+        from litellm.litellm_core_utils.terminal_receipt_hooks import mapping
+        from litellm.litellm_core_utils.terminal_receipt_oauth import AccountSnapshot
+
+        data = mapping(self._read_auth_file())
+        if not access_token or data.get("access_token") != access_token:
+            return None
+        account = data.get("account_id")
+        token = data.get("id_token")
+        selected = (
+            account
+            if isinstance(account, str) and account
+            else self._extract_account_id(token if isinstance(token, str) else access_token)
+        )
+        if not selected:
+            return None
+        return AccountSnapshot(selected, hashlib.sha256(access_token.encode()).digest(), self.get_api_base())
 
     def _ensure_token_dir(self) -> None:
         if not os.path.exists(self.token_dir):

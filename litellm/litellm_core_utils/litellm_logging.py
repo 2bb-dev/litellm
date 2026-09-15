@@ -1969,6 +1969,17 @@ class Logging(LiteLLMLoggingBaseClass):
                     # Only emit for sync requests (async_success_handler handles async)
                     if is_sync_request:
                         emit_standard_logging_payload(standard_logging_payload)
+            if is_sync_request and (not self.stream or complete_streaming_response is not None):
+                from litellm.litellm_core_utils.terminal_receipt_hooks import OPAQUE_VALUE
+                from litellm.litellm_core_utils.terminal_receipt_hooks import (
+                    finish as finish_terminal_receipt,
+                )
+
+                finish_terminal_receipt(
+                    self.model_call_details,
+                    OPAQUE_VALUE.validate_python(complete_streaming_response or result),
+                    "success",
+                )
             callbacks = self.get_combined_callback_list(
                 dynamic_success_callbacks=self.dynamic_success_callbacks,
                 global_callbacks=litellm.success_callback,
@@ -2463,6 +2474,15 @@ class Logging(LiteLLMLoggingBaseClass):
                 # print standard logging payload
                 if (standard_logging_payload := self.model_call_details.get("standard_logging_object")) is not None:
                     emit_standard_logging_payload(standard_logging_payload)
+        if not self.stream or complete_streaming_response is not None:
+            from litellm.litellm_core_utils.terminal_receipt_hooks import OPAQUE_VALUE
+            from litellm.litellm_core_utils.terminal_receipt_hooks import (
+                finish_async as finish_terminal_receipt_async,
+            )
+
+            await finish_terminal_receipt_async(
+                self.model_call_details, OPAQUE_VALUE.validate_python(complete_streaming_response or result), "success"
+            )
         callbacks = self.get_combined_callback_list(
             dynamic_success_callbacks=self.dynamic_async_success_callbacks,
             global_callbacks=litellm._async_success_callback,
@@ -2736,6 +2756,10 @@ class Logging(LiteLLMLoggingBaseClass):
                 start_time=start_time,
                 end_time=end_time,
             )
+            if is_sync_request:
+                from litellm.litellm_core_utils.terminal_receipt_hooks import finish as finish_terminal_receipt
+
+                finish_terminal_receipt(self.model_call_details, None, "failure")
             callbacks = self.get_combined_callback_list(
                 dynamic_success_callbacks=self.dynamic_failure_callbacks,
                 global_callbacks=litellm.failure_callback,
@@ -2905,6 +2929,9 @@ class Logging(LiteLLMLoggingBaseClass):
             end_time=end_time,
         )
 
+        from litellm.litellm_core_utils.terminal_receipt_hooks import finish_async as finish_terminal_receipt_async
+
+        await finish_terminal_receipt_async(self.model_call_details, None, "failure")
         callbacks = self.get_combined_callback_list(
             dynamic_success_callbacks=self.dynamic_async_failure_callbacks,
             global_callbacks=litellm._async_failure_callback,

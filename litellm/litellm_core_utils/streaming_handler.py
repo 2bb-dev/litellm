@@ -1890,6 +1890,10 @@ class CustomStreamWrapper:
 
                     elif self.custom_llm_provider == "gemini" and hasattr(chunk, "parts") and len(chunk.parts) == 0:
                         continue
+                    from litellm.litellm_core_utils.terminal_receipt_hooks import OPAQUE_VALUE
+                    from litellm.litellm_core_utils.terminal_usage_observation import observe_sdk_usage
+
+                    observe_sdk_usage(self.logging_obj.model_call_details, OPAQUE_VALUE.validate_python(chunk))
                     processed_chunk: Optional[ModelResponseStream] = self.chunk_creator(chunk=chunk)
                     if processed_chunk is None:
                         continue

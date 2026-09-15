@@ -65,7 +65,12 @@ except Exception:
     version = "0.0.0"
 
 
-def _prepare_ownership_dispatch(logging_obj: Optional[LiteLLMLoggingObject]) -> None:
+def _prepare_ownership_dispatch(logging_obj: Optional[LiteLLMLoggingObject], request: httpx.Request) -> None:
+    from litellm.litellm_core_utils.terminal_receipt_hooks import is_bound_relay
+
+    if logging_obj is None or not is_bound_relay(logging_obj.model_call_details):
+        for name in ("x-openorange-terminal-ingress", "x-openorange-terminal-central-request"):
+            request.headers.pop(name, None)
     if logging_obj is not None and DISPATCH in logging_obj.model_call_details:
         logging_obj.model_call_details[STAMP] = logging_obj.model_call_details[DISPATCH]
 
@@ -651,7 +656,11 @@ class AsyncHTTPHandler:
                 files=files,
                 content=request_content,
             )
-            _prepare_ownership_dispatch(logging_obj)
+            _prepare_ownership_dispatch(logging_obj, req)
+            if logging_obj is not None:
+                from litellm.litellm_core_utils.terminal_receipt_hooks import prepare_selected_dispatch_async
+
+                await prepare_selected_dispatch_async(logging_obj.model_call_details)
             response = await self.client.send(req, stream=stream)
             _record_ownership_response(logging_obj, req, self.client, response)
             response.raise_for_status()
@@ -900,7 +909,11 @@ class AsyncHTTPHandler:
             headers=headers,
             content=request_content,  # type: ignore
         )
-        _prepare_ownership_dispatch(logging_obj)
+        _prepare_ownership_dispatch(logging_obj, req)
+        if logging_obj is not None:
+            from litellm.litellm_core_utils.terminal_receipt_hooks import prepare_selected_dispatch_async
+
+            await prepare_selected_dispatch_async(logging_obj.model_call_details)
         response = await client.send(req, stream=stream)
         _record_ownership_response(logging_obj, req, client, response)
         response.raise_for_status()
@@ -1209,7 +1222,11 @@ class HTTPHandler:
                     files=files,
                     content=request_content,  # type: ignore
                 )
-            _prepare_ownership_dispatch(logging_obj)
+            _prepare_ownership_dispatch(logging_obj, req)
+            if logging_obj is not None:
+                from litellm.litellm_core_utils.terminal_receipt_hooks import prepare_selected_dispatch
+
+                prepare_selected_dispatch(logging_obj.model_call_details)
             response = self.client.send(req, stream=stream)
             _record_ownership_response(logging_obj, req, self.client, response)
             response.raise_for_status()
