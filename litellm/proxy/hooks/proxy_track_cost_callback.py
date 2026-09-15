@@ -425,6 +425,10 @@ def _get_request_tags_for_cost_tracking(
     sl_object: Optional[StandardLoggingPayload],
     metadata: dict,
 ) -> Optional[List[str]]:
+    from litellm.litellm_core_utils.request_content_mode import encryption_enabled
+
+    if encryption_enabled():
+        return None
     if sl_object is not None:
         request_tags = sl_object.get("request_tags", None)
         if isinstance(request_tags, list):

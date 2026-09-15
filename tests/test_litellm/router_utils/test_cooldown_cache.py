@@ -26,6 +26,19 @@ class TestCooldownCacheExceptionMasking:
         mock_dual_cache = MagicMock(spec=DualCache)
         return CooldownCache(cache=mock_dual_cache, default_cooldown_time=60.0)
 
+    def test_protected_cooldown_keeps_routing_fields_without_exception_content(self, monkeypatch):
+        monkeypatch.setenv("OPENORANGE_REQUEST_LOG_ENCRYPTION_CONFIG", "/synthetic/public.json")
+        canary = "SYNTHETIC_PRIVATE_PROMPT"
+        cache = DualCache(in_memory_cache=InMemoryCache())
+        cooldown_cache = CooldownCache(cache=cache, default_cooldown_time=60.0)
+        cooldown_cache.add_deployment_to_cooldown("model-1", ValueError(canary), 429, 30.0)
+        written: CooldownCacheValue = cache.get_cache("deployment:model-1:cooldown")
+        assert canary not in str(written)
+        assert written["status_code"] == "429"
+        assert written["cooldown_time"] == 30.0
+        assert written["exception_received"] == "Protected request logging: exception detail suppressed"
+        assert cache.in_memory_cache.ttl_dict["deployment:model-1:cooldown"] - written["timestamp"] == pytest.approx(30, abs=1)
+
     def test_exception_masker_initialization(self, cooldown_cache):
         """Test that the exception masker is properly initialized"""
         assert isinstance(cooldown_cache.exception_masker, SensitiveDataMasker)

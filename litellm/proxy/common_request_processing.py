@@ -1046,6 +1046,10 @@ class ProxyBaseLLMRequestProcessing:
     ) -> Tuple[dict, LiteLLMLoggingObj]:
         start_time = datetime.now()  # start before calling guardrail hooks
 
+        from litellm.proxy.spend_tracking.request_content_policy import enforce_protected_profile
+
+        enforce_protected_profile(self.data)
+
         self.data = await add_litellm_data_to_request(
             data=self.data,
             request=request,
@@ -1137,6 +1141,7 @@ class ProxyBaseLLMRequestProcessing:
 
         ## LOGGING OBJECT ## - initialize logging object for logging success/failure events for call
         ## IMPORTANT Note: - initialize this before running pre-call checks. Ensures we log rejected requests to langfuse.
+        enforce_protected_profile(self.data)
         logging_obj, self.data = litellm.utils.function_setup(
             original_function=route_type,
             rules_obj=litellm.utils.Rules(),

@@ -4231,7 +4231,13 @@ async def _tag_max_budget_check(
         BudgetExceededError if any tag is over its max budget.
         Triggers a budget alert if any tag is over its max budget.
     """
+    from litellm.litellm_core_utils.request_content_mode import encryption_enabled
     from litellm.proxy.common_utils.http_parsing_utils import get_tags_from_request_body
+    from litellm.proxy.spend_tracking.request_content_policy import enforce_protected_tag_budget_profile
+
+    if encryption_enabled():
+        await enforce_protected_tag_budget_profile()
+        return
 
     if prisma_client is None:
         return
