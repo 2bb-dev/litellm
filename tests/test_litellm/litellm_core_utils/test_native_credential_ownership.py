@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
@@ -56,12 +57,24 @@ def native_server():
                 self.close_connection = True
                 return
             streamed = bool(body.get("stream")) and code == 200
+            partial_stream = response.pop("_test_stream_disconnect", False)
             data = native_stream(response).encode() if streamed else json.dumps(response).encode()
+            if partial_stream:
+                cut = (
+                    data.index(b"event: message_delta")
+                    if response.get("type") == "message"
+                    else data.index(b"\n\n") + 2
+                )
+                data = data[:cut]
             self.send_response(code)
             self.send_header("Content-Type", "text/event-stream" if streamed else "application/json")
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(len(data) + (100 if partial_stream else 0)))
             self.end_headers()
             self.wfile.write(data)
+            if partial_stream:
+                self.wfile.flush()
+                time.sleep(0.1)
+                self.close_connection = True
 
         def log_message(self, *_args):
             pass
@@ -185,7 +198,7 @@ def native_stream(response):
                     **response,
                     "content": [],
                     "stop_reason": None,
-                    "usage": {"input_tokens": 9, "output_tokens": 0},
+                    "usage": {**response.get("usage", {}), "output_tokens": 0},
                 },
             },
             {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},

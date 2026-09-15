@@ -88,26 +88,13 @@ class AiohttpResponseStream(httpx.AsyncByteStream):
         except (
             aiohttp.ClientPayloadError,
             aiohttp.client_exceptions.ClientPayloadError,
+            aiohttp.http_exceptions.TransferEncodingError,
         ) as e:
-            # Handle incomplete transfers more gracefully
-            # Log the error but don't re-raise if we've already yielded some data
-            verbose_logger.debug(f"Transfer incomplete, but continuing: {e}")
-            # If the error is due to incomplete transfer encoding, we can still
-            # return what we've received so far, similar to how httpx handles it
-            return
+            raise httpx.ReadError("Upstream response body was incomplete") from e
         except RuntimeError as e:
-            # Some providers (e.g., SSE streams) may close the connection
-            # causing aiohttp StreamReader to raise a generic RuntimeError
-            # with message "Connection closed.". Treat this as a graceful
-            # end-of-stream so downstream consumers don't error.
             if "Connection closed" in str(e):
-                verbose_logger.debug("Upstream closed streaming connection; ending iterator gracefully")
-                return
+                raise httpx.ReadError("Upstream response body was incomplete") from e
             raise
-        except aiohttp.http_exceptions.TransferEncodingError as e:
-            # Handle transfer encoding errors gracefully
-            verbose_logger.debug(f"Transfer encoding error, but continuing: {e}")
-            return
         except Exception:
             # For other exceptions, use the normal mapping
             with map_aiohttp_exceptions():

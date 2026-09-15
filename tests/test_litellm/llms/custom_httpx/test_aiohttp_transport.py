@@ -107,64 +107,42 @@ async def test_aiohttp_response_stream_normal_flow():
 
 
 @pytest.mark.asyncio
-async def test_transfer_encoding_error_no_httpx_read_error():
-    """Test that TransferEncodingError doesn't get converted to httpx.ReadError"""
-
-    # Create a TransferEncodingError wrapped in ClientPayloadError (like in real scenarios)
-    transfer_error = aiohttp.http_exceptions.TransferEncodingError(
-        message="400, message: Not enough data for satisfy transfer length header."
-    )
-
-    # Wrap it in ClientPayloadError as aiohttp does
-    client_payload_error = aiohttp.ClientPayloadError(
-        "Response payload is not completed"
-    )
-    client_payload_error.__cause__ = transfer_error
-
+@pytest.mark.parametrize(
+    "upstream_error",
+    [
+        aiohttp.ClientPayloadError("private upstream detail"),
+        aiohttp.http_exceptions.TransferEncodingError(message="private upstream detail"),
+        RuntimeError("Connection closed. private upstream detail"),
+    ],
+)
+async def test_truncated_body_raises_read_error_and_releases_connection(upstream_error):
     mock_response = MockAiohttpResponse(
-        content_chunks=[b"chunk1", b"chunk2", b"chunk3"],
-        exception_to_raise=client_payload_error,
-        exception_at_chunk=1,  # Error occurs at chunk 1
+        content_chunks=[b"data1", b"data2", b"data3"],
+        exception_to_raise=upstream_error,
+        exception_at_chunk=2,
     )
-
     stream = AiohttpResponseStream(mock_response)  # type: ignore
     received_chunks = []
 
-    # This should NOT raise httpx.ReadError or any other exception
-    # It should handle the error gracefully and just return what was received
-    async for chunk in stream:
-        received_chunks.append(chunk)
-    print(f"received_chunks: {received_chunks}")
+    with pytest.raises(httpx.ReadError, match="^Upstream response body was incomplete$"):
+        async for chunk in stream:
+            received_chunks.append(chunk)
 
-    # Should have received the first chunk before the error
-    assert received_chunks == [b"chunk1"]
-    assert len(received_chunks) == 1
+    assert received_chunks == [b"data1", b"data2"]
+    assert mock_response.closed is True
 
 
 @pytest.mark.asyncio
-async def test_client_payload_error_graceful_handling():
-    """Test that ClientPayloadError is handled gracefully without stacktrace"""
-    # Create a ClientPayloadError directly
-    client_error = aiohttp.client_exceptions.ClientPayloadError(
-        "Response payload is not completed"
-    )
-
+async def test_unrelated_runtime_error_is_preserved_and_releases_connection():
     mock_response = MockAiohttpResponse(
-        content_chunks=[b"data1", b"data2", b"data3"],
-        exception_to_raise=client_error,
-        exception_at_chunk=2,  # Error occurs at chunk 2
+        exception_to_raise=RuntimeError("unrelated failure"),
+        exception_at_chunk=1,
     )
-
     stream = AiohttpResponseStream(mock_response)  # type: ignore
-    received_chunks = []
-
-    # This should handle the error gracefully without raising
-    async for chunk in stream:
-        received_chunks.append(chunk)
-
-    # Should have received chunks before the error
-    assert received_chunks == [b"data1", b"data2"]
-    assert len(received_chunks) == 2
+    with pytest.raises(RuntimeError, match="^unrelated failure$"):
+        async for _ in stream:
+            pass
+    assert mock_response.closed is True
 
 
 @pytest.mark.asyncio
