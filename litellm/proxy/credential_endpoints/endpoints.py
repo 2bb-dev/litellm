@@ -9,8 +9,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, Path
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+from litellm.litellm_core_utils.credential_ownership import FIELD, updated_credential_info
 from litellm.litellm_core_utils.litellm_logging import _get_masked_values
-from litellm.proxy._types import CommonProxyErrors, UserAPIKeyAuth
+from litellm.proxy._types import CommonProxyErrors, LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.encrypt_decrypt_utils import encrypt_value_helper
 from litellm.proxy.utils import handle_exception_on_proxy, jsonify_object
@@ -18,6 +19,13 @@ from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.types.utils import CreateCredentialItem, CredentialItem
 
 router = APIRouter()
+
+
+def _require_ownership_registration_admin(
+    credential: CredentialItem | CreateCredentialItem, auth: UserAPIKeyAuth
+) -> None:
+    if FIELD in credential.credential_info and auth.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(status_code=403, detail="Credential ownership registration requires a proxy administrator")
 
 
 class CredentialHelperUtils:
@@ -58,6 +66,7 @@ async def create_credential(
     from litellm.proxy.proxy_server import llm_router, prisma_client
 
     try:
+        _require_ownership_registration_admin(credential, user_api_key_dict)
         if prisma_client is None:
             raise HTTPException(
                 status_code=500,
@@ -274,12 +283,11 @@ def update_db_credential(
 
         merged_credential.credential_values.update(encrypted_params)
 
-    # update model info
-    if encrypted_credential.credential_info:
-        """Update credential info"""
-        if "credential_info" not in merged_credential.credential_info:
-            merged_credential.credential_info = {}
-        merged_credential.credential_info.update(encrypted_credential.credential_info)
+    merged_credential.credential_info = updated_credential_info(
+        db_credential.credential_info,
+        encrypted_credential.credential_info,
+        binding_changed=bool(encrypted_credential.credential_values),
+    )
 
     return merged_credential
 
@@ -300,6 +308,8 @@ async def update_credential(
     [BETA] endpoint. This might change unexpectedly.
     """
     from litellm.proxy.proxy_server import prisma_client
+
+    _require_ownership_registration_admin(credential, user_api_key_dict)
 
     try:
         if prisma_client is None:
@@ -333,9 +343,7 @@ async def update_credential(
             in_memory_values = dict(existing_in_memory.credential_values or {})
             if credential.credential_values:
                 in_memory_values.update(credential.credential_values)
-            in_memory_info = dict(existing_in_memory.credential_info or {})
-            if credential.credential_info:
-                in_memory_info.update(credential.credential_info)
+            in_memory_info = merged_credential.credential_info.copy()
             updated_in_memory = CredentialItem(
                 credential_name=new_name,
                 credential_values=in_memory_values,

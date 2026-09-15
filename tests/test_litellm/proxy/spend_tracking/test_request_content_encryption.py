@@ -462,13 +462,46 @@ def test_oversized_complete_request_is_capture_failure_not_silently_truncated(pr
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider_failed", [False, True])
 @pytest.mark.parametrize("failure_mode", ["none", "crypto", "transform"])
+@pytest.mark.parametrize("ownership_source", ["platform", "byok", "unknown"])
 async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_billing(
-    protected_config, tmp_path, provider_failed, failure_mode
+    protected_config, tmp_path, provider_failed, failure_mode, ownership_source
 ):
     from litellm.proxy import proxy_server
     from litellm.proxy.utils import PrismaClient
 
     response, kwargs = make_call(provider_failed)
+    from litellm.litellm_core_utils.credential_ownership import (
+        CONTEXT,
+        FIELD,
+        STAMP,
+        resolve_ownership,
+        select_credential,
+    )
+
+    registration = {
+        "v": 1,
+        "source": ownership_source,
+        "registration_id": "3e15c0c2-feca-4104-a648-8d579315ef51",
+        "registration_revision": "e7ca1c3e-b6ea-4ce0-8538-b8f149448038",
+    }
+    route = {
+        "model_info": {"id": "completed-deployment", FIELD: registration},
+        "litellm_params": {
+            "model": "openai/test-model",
+            "api_key": "synthetic-key",
+            "api_base": "https://example.invalid/v1",
+        },
+    }
+    kwargs[STAMP] = resolve_ownership(
+        {
+            **route["litellm_params"],
+            "metadata": {CONTEXT: select_credential(route, {}, "completed-deployment")},
+        },
+        {},
+        {},
+    )
+    kwargs["litellm_params"]["metadata"]["model_info"] = {"id": "completed-deployment"}
+    kwargs["litellm_params"]["metadata"][FIELD] = {**registration, "source": "forged"}
     original = copy.deepcopy(kwargs)
     spool = SQLiteSpendLogSpool(str(tmp_path / "spend.sqlite"))
     client = SimpleNamespace(
@@ -542,6 +575,11 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
         marker = json.loads(row["metadata"])["openorange_request_log"]
         for persisted in (row, batch["payload_copy"]):
             persisted_metadata = json.loads(persisted["metadata"])
+            assert persisted_metadata[FIELD]["source"] == ownership_source
+            assert persisted_metadata[FIELD]["deployment_id"] == "completed-deployment"
+            assert persisted_metadata[FIELD]["registration_id"] == (
+                registration["registration_id"] if ownership_source != "unknown" else None
+            )
             facts = persisted_metadata["additional_usage_values"]
             assert facts["prompt_tokens_details"]["cache_creation_token_details"] == {
                 "ephemeral_5m_input_tokens": 1,

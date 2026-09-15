@@ -7,6 +7,7 @@ from collections.abc import Mapping
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
+from litellm.litellm_core_utils.credential_ownership import FIELD, safe_ownership
 from litellm.proxy._types import SpendLogsPayload
 from litellm.proxy.spend_tracking.request_content_encryption import (
     CaptureFailure,
@@ -139,6 +140,8 @@ def _usage(value: object, depth: int = 0) -> dict[str, JsonValue]:
 def safe_metadata(value: object) -> dict[str, JsonValue]:
     source = _object(value)
     result: dict[str, JsonValue] = {}
+    if FIELD in source:
+        result[FIELD] = safe_ownership(source[FIELD], _object(source[FIELD]).get("deployment_id"))
     for key, item in source.items():
         if key == "user_api_key" and isinstance(item, str) and re.fullmatch(r"[a-f0-9]{64}", item):
             result[key] = item
@@ -207,7 +210,7 @@ def safe_metadata(value: object) -> dict[str, JsonValue]:
     if isinstance(nested, dict):
         # Do not recursively retain arbitrary metadata trees.
         result["spend_logs_metadata"] = safe_metadata(
-            {key: item for key, item in nested.items() if key != "spend_logs_metadata"}
+            {key: item for key, item in nested.items() if key not in {"spend_logs_metadata", FIELD}}
         )
     return result
 
@@ -225,6 +228,7 @@ def protect_spend_payload(payload: SpendLogsPayload) -> SpendLogsPayload:
     """Return a new row. Neither inference objects nor the input row are mutated."""
     source = _SPEND_FIELDS.validate_python(payload)
     metadata = safe_metadata(source.get("metadata"))
+    metadata[FIELD] = safe_ownership(metadata.get(FIELD), source.get("model_id"))
     content: dict[str, JsonValue] = {
         "v": 1,
         "request": _content_value(source.get("proxy_server_request")),
@@ -266,6 +270,7 @@ def failed_spend_payload(payload: SpendLogsPayload) -> SpendLogsPayload:
     metadata: dict[str, JsonValue] = {"status": "failure" if source.get("status") == "failure" else "success"}
     try:
         original = _object(source.get("metadata"))
+        metadata[FIELD] = safe_ownership(original.get(FIELD), source.get("model_id"))
         metadata["usage_object"] = _usage(original.get("usage_object"))
         metadata["additional_usage_values"] = _usage(original.get("additional_usage_values"))
     except Exception:

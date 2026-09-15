@@ -613,9 +613,17 @@ def load_credentials_from_list(kwargs: dict):
     CredentialAccessor = getattr(sys.modules[__name__], "CredentialAccessor")
 
     credential_name = kwargs.get("litellm_credential_name")
-    if credential_name and litellm.credential_list:
-        credential_accessor = CredentialAccessor.get_credential_values(credential_name)
-        for key, value in credential_accessor.items():
+    credential_values, credential_info, ambiguous = (
+        CredentialAccessor.get_credential_snapshot(credential_name) if credential_name else ({}, {}, False)
+    )
+    from litellm.litellm_core_utils.credential_ownership import STAMP, resolve_ownership
+
+    stamp = resolve_ownership(kwargs, credential_values, credential_info, credential_ambiguous=ambiguous)
+    logging_obj = kwargs.get("litellm_logging_obj")
+    if logging_obj is not None:
+        logging_obj.model_call_details[STAMP] = stamp
+    if credential_name:
+        for key, value in credential_values.items():
             if key not in kwargs:
                 kwargs[key] = value
 
@@ -1323,6 +1331,7 @@ def client(original_function):
             assert logging_obj is not None, "logging_obj should not be None after function_setup"
 
             ## LOAD CREDENTIALS
+            kwargs["litellm_logging_obj"] = logging_obj
             load_credentials_from_list(kwargs)
             kwargs["litellm_logging_obj"] = logging_obj
             LLMCachingHandler = _get_cached_llm_caching_handler()
