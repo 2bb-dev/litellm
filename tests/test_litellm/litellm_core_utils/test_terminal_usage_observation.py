@@ -175,3 +175,59 @@ def test_terminal_native_counts_keep_absent_cache_writes_null(provider):
     assert session.usage_snapshot.cache_read_tokens == 0
     assert session.usage_snapshot.cache_write_tokens is None
     assert session.native_usage_final
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"cache_read_input_tokens": 2},
+        {"prompt_tokens_details": {"cached_tokens": 2}},
+        {"prompt_cache_miss_tokens": 7},
+    ],
+)
+def test_deepseek_conflicting_native_cache_meters_cannot_authorize_observation(extra):
+    from litellm.litellm_core_utils.terminal_usage_evidence import terminal_snapshot
+
+    session = native_session("deepseek")
+    observe_native_usage(
+        {STAMP: session},
+        {
+            "usage": {
+                "prompt_tokens": 9,
+                "completion_tokens": 3,
+                "total_tokens": 12,
+                "prompt_cache_hit_tokens": 1,
+                **extra,
+            }
+        },
+    )
+    assert session.usage_invalid
+    assert terminal_snapshot(session).state == "unobserved"
+
+
+@pytest.mark.parametrize("reason", ["aborted", "insufficient_system_resource"])
+def test_deepseek_interrupted_stream_keeps_partial_measurement(reason):
+    from litellm.litellm_core_utils.terminal_usage_evidence import terminal_snapshot
+
+    session = native_session("deepseek")
+    observe_native_usage(
+        {STAMP: session},
+        {
+            "choices": [{"finish_reason": reason}],
+            "usage": {
+                "prompt_tokens": 9,
+                "completion_tokens": 3,
+                "total_tokens": 12,
+                "prompt_cache_hit_tokens": 1,
+                "prompt_cache_miss_tokens": 8,
+            },
+        },
+        streamed=True,
+    )
+    fact = terminal_snapshot(session)
+    assert session.native_usage_final is False
+    assert fact.state == "partial"
+    assert fact.prompt_tokens == 9
+    assert fact.completion_tokens == 3
+    assert fact.cache_read_tokens == 1
+    assert fact.cache_write_tokens is None

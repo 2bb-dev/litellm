@@ -259,6 +259,7 @@ async def run_router_platform_case(
     client_disconnect=False,
     cancelled_scope=False,
     usage_case=None,
+    supplier_partial=False,
 ):
     upstream, calls, replies = native_server
     central, routers = central_server
@@ -455,7 +456,11 @@ async def run_router_platform_case(
         fallbacks=[{"managed": ["managed-fallback"]}] if local_fallback else [],
         terminal_receipt_authority=local_authority,
     )
-    if disconnect:
+    if supplier_partial:
+        partial = response_body(native_provider)
+        partial["usage"].update({"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
+        replies.append((200, {**partial, "_test_stream_disconnect": True}))
+    elif disconnect:
         replies.append((0, {}))
     elif fallback:
         replies.append((429, {"error": {"type": "rate_limit_error", "message": "synthetic"}}))
@@ -499,11 +504,21 @@ async def run_router_platform_case(
             break
         await asyncio.sleep(0.02)
     assert capture.rows, "actual SpendLogs writer did not receive private terminal evidence"
-    row = capture.rows[-1]
+    row = next((item for item in capture.rows if item["model_id"] == "local-fallback-deployment"), capture.rows[-1])
     envelope = Envelope.model_validate_json(json.dumps(json.loads(row["metadata"])[FIELD]))
     assert envelope.local_attempt_id == row["request_id"]
     expected_local = "local-fallback-deployment" if local_fallback else "local-proxy-deployment"
-    assert envelope.local_deployment_id == row["model_id"] == expected_local
+    assert envelope.local_deployment_id == row["model_id"] == expected_local, [
+        [
+            (item["request_id"], item["model_id"], item["status"], json.loads(item["metadata"])[FIELD]["state"])
+            for item in capture.rows
+        ],
+        [(call["path"], call["body"].get("stream")) for call in calls],
+        [
+            (parse_jws(token).claims.event, getattr(parse_jws(token).claims, "outcome", None))
+            for token in envelope.receipts
+        ],
+    ]
     if local_fallback:
         envelopes = [
             Envelope.model_validate_json(json.dumps(json.loads(item["metadata"])[FIELD])) for item in capture.rows
@@ -517,6 +532,25 @@ async def run_router_platform_case(
         assert earlier.correlation_id != envelope.correlation_id
         assert earlier.receipts, "failed local Router attempt must remain independently retained"
         assert all(parse_jws(token).claims.local_attempt_id == earlier.local_attempt_id for token in earlier.receipts)
+        if supplier_partial:
+            failed_row = next(item for item in capture.rows if item["request_id"] == earlier.local_attempt_id)
+            failed_metadata = json.loads(failed_row["metadata"])
+            failed_measurement = UsageEnvelope.model_validate_json(json.dumps(failed_metadata[USAGE_EVIDENCE_FIELD]))
+            assert (
+                verify_usage_set(failed_measurement, earlier, local_authority.settings.issuer, local_authority.keys)
+                == "complete"
+            )
+            failed_usage = parse_usage(failed_measurement.measurements[0]).claims.usage
+            assert failed_usage.state == "partial"
+            assert failed_usage.prompt_tokens == 9
+            assert failed_usage.cache_read_tokens == failed_usage.cache_write_tokens == 0
+            assert failed_metadata[USAGE_FIELD]["state"] == "partial"
+            assert (
+                next(
+                    parse_jws(token).claims for token in earlier.receipts if parse_jws(token).claims.event == "finished"
+                ).outcome
+                == "failure"
+            )
     assert envelope.state == "complete", envelope
     assert verify_set(envelope, local_authority.settings.issuer, local_authority.keys) == "complete"
     for name in ("audience", "local_request_id", "local_attempt_id", "correlation_id"):
@@ -665,6 +699,7 @@ async def run_router_platform_case(
             "llms/chatgpt/chat/transformation.py",
             "llms/chatgpt/responses/transformation.py",
             "llms/custom_httpx/http_handler.py",
+            "llms/custom_httpx/aiohttp_transport.py",
             "llms/custom_httpx/llm_http_handler.py",
             "proxy/hooks/proxy_track_cost_callback.py",
             "proxy/utils.py",
@@ -695,6 +730,7 @@ async def run_router_platform_case(
                 "usage_case": usage_case,
                 "local_fallback": local_fallback,
                 "supplier_disconnect": disconnect,
+                "supplier_partial": supplier_partial,
                 "client_disconnect": client_disconnect,
                 "cancelled_scope": cancelled_scope,
             },
@@ -915,6 +951,25 @@ async def test_local_router_fallback_has_distinct_immutable_source_rows(
         False,
         local_fallback=True,
         disconnect=disconnect,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["anthropic", "deepseek"])
+async def test_supplier_partial_stream_retains_measurements_before_local_fallback(
+    monkeypatch, tmp_path, authority_server, native_server, central_server, provider
+):
+    await run_router_platform_case(
+        monkeypatch,
+        tmp_path,
+        authority_server,
+        native_server,
+        central_server,
+        provider,
+        True,
+        True,
+        local_fallback=True,
+        supplier_partial=True,
     )
 
 

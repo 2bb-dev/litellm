@@ -192,11 +192,14 @@ def _deepseek_native(body: dict[str, object], streamed: bool) -> tuple[dict[str,
     if usage is None:
         return None
     fields = _VALUES.validate_python(usage)
-    normalized = (
-        {**fields, "cache_read_input_tokens": fields["prompt_cache_hit_tokens"]}
-        if "prompt_cache_hit_tokens" in fields
-        else fields
+    read = _value(
+        fields, (("prompt_cache_hit_tokens",), ("cache_read_input_tokens",), ("prompt_tokens_details", "cached_tokens"))
     )
+    missed = _value(fields, (("prompt_cache_miss_tokens",),))
+    prompt = _value(fields, (("prompt_tokens",),))
+    if read is not None and missed is not None and prompt is not None and read + missed != prompt:
+        raise ValueError("inconsistent_native_cache_measurement")
+    normalized = {**fields, "cache_read_input_tokens": read}
     choices = body.get("choices")
     final = not streamed or (
         isinstance(choices, list)
