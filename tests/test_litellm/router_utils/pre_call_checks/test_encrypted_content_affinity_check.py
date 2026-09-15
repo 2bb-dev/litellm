@@ -717,6 +717,69 @@ from litellm.router_utils.pre_call_checks.encrypted_content_affinity_check impor
 
 
 @pytest.mark.asyncio
+async def test_previous_response_affinity_survives_default_priority_changes():
+    check = EncryptedContentAffinityCheck()
+    original = {"model_info": {"id": "original"}, "litellm_params": {"model": "gpt-5"}}
+    replacement = {"model_info": {"id": "replacement"}, "litellm_params": {"model": "gpt-5"}}
+    response_id = ResponsesAPIRequestUtils._build_responses_api_response_id(
+        model_id="original", custom_llm_provider="openai", response_id="resp_previous"
+    )
+    request = {"previous_response_id": response_id, "input": "Continue"}
+    selected = await check.async_filter_deployments(
+        model="gpt-5",
+        healthy_deployments=[replacement, original],
+        messages=None,
+        request_kwargs=request,
+    )
+    assert selected == [original]
+    assert request["_encrypted_content_affinity_pinned"] is True
+
+    from litellm.exceptions import BadRequestError
+
+    with pytest.raises(BadRequestError, match="no longer configured"):
+        await check.async_filter_deployments(
+            model="gpt-5",
+            healthy_deployments=[replacement],
+            messages=None,
+            request_kwargs={"previous_response_id": response_id},
+        )
+
+
+@pytest.mark.asyncio
+async def test_continuation_affinity_rejects_conflicting_encrypted_origin():
+    check = EncryptedContentAffinityCheck()
+    response_id = ResponsesAPIRequestUtils._build_responses_api_response_id(
+        model_id="original", custom_llm_provider="openai", response_id="resp_previous"
+    )
+    item_id = ResponsesAPIRequestUtils._build_encrypted_item_id("different", "rs_test")
+    from litellm.exceptions import BadRequestError
+
+    with pytest.raises(BadRequestError, match="different deployments"):
+        await check.async_filter_deployments(
+            model="gpt-5",
+            healthy_deployments=[],
+            messages=None,
+            request_kwargs={"previous_response_id": response_id, "input": [{"id": item_id}]},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous", [None, 12, "resp_native", "resp_not-valid-base64"])
+async def test_unencoded_previous_response_keeps_existing_selection(previous):
+    check = EncryptedContentAffinityCheck()
+    deployments = [{"model_info": {"id": "original"}}]
+    assert (
+        await check.async_filter_deployments(
+            model="gpt-5",
+            healthy_deployments=deployments,
+            messages=None,
+            request_kwargs={"previous_response_id": previous},
+        )
+        == deployments
+    )
+
+
+@pytest.mark.asyncio
 async def test_encrypted_content_affinity_does_not_create_litellm_metadata_for_chat():
     """
     For chat completions / embeddings, request_kwargs uses 'metadata' (not
