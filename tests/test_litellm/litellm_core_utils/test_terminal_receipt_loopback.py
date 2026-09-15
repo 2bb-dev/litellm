@@ -458,7 +458,11 @@ async def run_router_platform_case(
     )
     if supplier_partial:
         partial = response_body(native_provider)
-        partial["usage"].update({"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
+        partial["usage"].update(
+            {"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+            if native_provider == "anthropic"
+            else {"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 9}
+        )
         replies.append((200, {**partial, "_test_stream_disconnect": True}))
     elif disconnect:
         replies.append((0, {}))
@@ -471,6 +475,18 @@ async def run_router_platform_case(
         body["usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     elif usage_case == "explicit_cache":
         body["usage"].update({"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
+    elif usage_case == "unestablished_writes":
+        body["usage"].update(
+            {
+                "prompt_cache_hit_tokens": 0,
+                "cache_creation_input_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 7},
+                "cache_creation": {"ephemeral_5m_input_tokens": 5, "ephemeral_1h_input_tokens": 2},
+            }
+        )
+        body["_test_unestablished_writes"] = True
+    elif usage_case in {"responses_write_zero", "responses_write_nonzero"}:
+        body["_test_responses_write"] = 0 if usage_case == "responses_write_zero" else 7
     if provider == "chatgpt":
         body["model"] = "gpt-6-astra"
     replies.append((200, body))
@@ -543,7 +559,8 @@ async def run_router_platform_case(
             failed_usage = parse_usage(failed_measurement.measurements[0]).claims.usage
             assert failed_usage.state == "partial"
             assert failed_usage.prompt_tokens == 9
-            assert failed_usage.cache_read_tokens == failed_usage.cache_write_tokens == 0
+            assert failed_usage.cache_read_tokens == 0
+            assert failed_usage.cache_write_tokens == (0 if provider == "anthropic" else None)
             assert failed_metadata[USAGE_FIELD]["state"] == "partial"
             assert (
                 next(
@@ -612,6 +629,20 @@ async def run_router_platform_case(
     assert len(measurement.measurements) == len(finished)
     observations = [parse_usage(token).claims.usage for token in measurement.measurements]
     scalar = json.loads(row["metadata"])[USAGE_FIELD]
+    if usage_case == "unestablished_writes":
+        assert observations[0].prompt_tokens == 9
+        assert observations[0].completion_tokens == 3
+        assert observations[0].cache_read_tokens == 0
+        assert observations[0].cache_write_tokens is None
+        assert observations[0].cache_write_5m_tokens is None
+        assert observations[0].cache_write_1h_tokens is None
+    if usage_case in {"responses_write_zero", "responses_write_nonzero"}:
+        assert observations[0].prompt_tokens == 9
+        assert observations[0].completion_tokens == 3
+        assert observations[0].cache_read_tokens == 0
+        assert observations[0].cache_write_tokens == (0 if usage_case == "responses_write_zero" else 7)
+        assert observations[0].cache_write_5m_tokens is None
+        assert observations[0].cache_write_1h_tokens is None
     if len(finished) > 1:
         assert scalar["state"] == "unobserved"
         assert all(scalar[name] is None for name in UsageSnapshot.model_fields)
@@ -869,6 +900,19 @@ def responses_server():
                     "output_tokens_details": {"reasoning_tokens": 0},
                 },
             }
+            if original.get("_test_unestablished_writes"):
+                result["usage"].update(
+                    {
+                        "cache_creation_input_tokens": 7,
+                        "input_tokens_details": {
+                            "cached_tokens": 0,
+                            "cache_creation_tokens": 7,
+                        },
+                        "cache_creation": {"ephemeral_5m_input_tokens": 5, "ephemeral_1h_input_tokens": 2},
+                    }
+                )
+            if "_test_responses_write" in original:
+                result["usage"]["input_tokens_details"]["cache_write_tokens"] = original["_test_responses_write"]
             events = [
                 {
                     "type": "response.created",
@@ -1036,4 +1080,59 @@ async def test_local_stream_close_retains_attempt_row_and_supplier_execution_evi
         True,
         client_disconnect=True,
         cancelled_scope=cancelled_scope,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["deepseek", "chatgpt"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_native_unestablished_write_aliases_stay_null_in_signed_measurement(
+    monkeypatch,
+    tmp_path,
+    authority_server,
+    native_server,
+    responses_server,
+    central_server,
+    sidecar_server,
+    provider,
+    stream,
+):
+    await run_router_platform_case(
+        monkeypatch,
+        tmp_path,
+        authority_server,
+        responses_server if provider == "chatgpt" else native_server,
+        central_server,
+        provider,
+        False,
+        stream,
+        delegated_server=sidecar_server if provider == "chatgpt" else None,
+        usage_case="unestablished_writes",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("usage_case", ["responses_write_zero", "responses_write_nonzero"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_native_responses_write_measurement_is_signed_before_sdk_defaults(
+    monkeypatch,
+    tmp_path,
+    authority_server,
+    responses_server,
+    central_server,
+    sidecar_server,
+    usage_case,
+    stream,
+):
+    await run_router_platform_case(
+        monkeypatch,
+        tmp_path,
+        authority_server,
+        responses_server,
+        central_server,
+        "chatgpt",
+        False,
+        stream,
+        delegated_server=sidecar_server,
+        usage_case=usage_case,
     )

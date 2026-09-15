@@ -179,10 +179,11 @@ def _chatgpt_native(body: dict[str, object], streamed: bool) -> tuple[dict[str, 
         return None
     fields = _VALUES.validate_python(usage)
     normalized = {
-        **fields,
         "prompt_tokens": fields.get("input_tokens"),
         "completion_tokens": fields.get("output_tokens"),
-        "prompt_tokens_details": fields.get("input_tokens_details"),
+        "total_tokens": fields.get("total_tokens"),
+        "cache_read_input_tokens": _value(fields, (("input_tokens_details", "cached_tokens"),)),
+        "cache_creation_input_tokens": _value(fields, (("input_tokens_details", "cache_write_tokens"),)),
     }
     return normalized, not streamed or body.get("type") == "response.completed"
 
@@ -199,7 +200,12 @@ def _deepseek_native(body: dict[str, object], streamed: bool) -> tuple[dict[str,
     prompt = _value(fields, (("prompt_tokens",),))
     if read is not None and missed is not None and prompt is not None and read + missed != prompt:
         raise ValueError("inconsistent_native_cache_measurement")
-    normalized = {**fields, "cache_read_input_tokens": read}
+    normalized = {
+        "prompt_tokens": fields.get("prompt_tokens"),
+        "completion_tokens": fields.get("completion_tokens"),
+        "total_tokens": fields.get("total_tokens"),
+        "cache_read_input_tokens": read,
+    }
     choices = body.get("choices")
     final = not streamed or (
         isinstance(choices, list)
