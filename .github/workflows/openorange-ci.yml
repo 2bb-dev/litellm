@@ -59,6 +59,7 @@ jobs:
             tests/test_litellm/llms/custom_httpx/test_llm_http_handler.py \
             tests/llm_responses_api_testing/test_base_responses_api_streaming_iterator.py \
             tests/test_litellm/proxy/test_litellm_pre_call_utils.py \
+            tests/test_litellm/router_utils/pre_call_checks/test_encrypted_content_affinity_check.py \
             tests/test_litellm/proxy/spend_tracking/test_spend_tracking_utils.py \
             tests/test_litellm/integrations/test_langfuse.py \
             tests/test_litellm/proxy/db/test_db_spend_update_writer.py \

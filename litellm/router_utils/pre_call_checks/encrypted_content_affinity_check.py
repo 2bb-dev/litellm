@@ -31,7 +31,7 @@ This pre-call check is responsible only for the routing decision: it reads the e
 the matching deployment.
 
 Safe to enable globally:
-- Only activates when encoded markers appear in the request ``input``.
+- Activates for encoded input markers or an encoded ``previous_response_id``.
 - No effect on embedding models, chat completions, or first-time requests.
 - No quota reduction -- first requests are fully load balanced.
 - No cache required.
@@ -241,12 +241,25 @@ class EncryptedContentAffinityCheck(CustomLogger):
             request_kwargs["litellm_metadata"]["encrypted_content_affinity_enabled"] = True
 
         request_input = request_kwargs.get("input")
-        model_id = self._extract_model_id_from_input(request_input)
+        input_model_id = self._extract_model_id_from_input(request_input)
+        previous_response_id = request_kwargs.get("previous_response_id")
+        previous_model_id = (
+            ResponsesAPIRequestUtils.get_model_id_from_response_id(previous_response_id)
+            if isinstance(previous_response_id, str)
+            else None
+        )
+        if input_model_id and previous_model_id and input_model_id != previous_model_id:
+            raise BadRequestError(
+                message="previous_response_id and encrypted_content refer to different deployments.",
+                model=model,
+                llm_provider="",
+            )
+        model_id = previous_model_id or input_model_id
         if not model_id:
             return typed_healthy_deployments
 
         verbose_router_logger.debug(
-            "EncryptedContentAffinityCheck: decoded model_id=%s from input item IDs",
+            "EncryptedContentAffinityCheck: decoded continuation model_id=%s",
             model_id,
         )
 
