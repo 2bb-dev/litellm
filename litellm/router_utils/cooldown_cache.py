@@ -11,6 +11,7 @@ from typing_extensions import TypedDict
 from litellm import verbose_logger
 from litellm.caching.caching import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
+from litellm.litellm_core_utils.request_content_mode import encryption_enabled
 from litellm.litellm_core_utils.sensitive_data_masker import SensitiveDataMasker
 
 if TYPE_CHECKING:
@@ -50,7 +51,9 @@ class CooldownCache:
 
             # Store the cooldown information for the deployment separately
             cooldown_data = CooldownCacheValue(
-                exception_received=self.exception_masker._mask_value(str(original_exception)),
+                exception_received="Protected request logging: exception detail suppressed"
+                if encryption_enabled()
+                else self.exception_masker._mask_value(str(original_exception)),
                 status_code=str(exception_status),
                 timestamp=current_time,
                 cooldown_time=cooldown_time,

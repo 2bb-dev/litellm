@@ -278,8 +278,9 @@ class TestResponseAPILoggingUtils:
     @pytest.mark.parametrize("stream", (False, True))
     @pytest.mark.parametrize("is_async", (False, True))
     @pytest.mark.parametrize("cache_write_tokens", (None, 0, 300))
+    @pytest.mark.parametrize("redact", (False, True))
     async def test_responses_cache_writes_reach_logging_and_cost(
-        self, stream: bool, is_async: bool, cache_write_tokens: int | None, cache_write_deployment: str
+        self, stream: bool, is_async: bool, cache_write_tokens: int | None, cache_write_deployment: str, redact: bool
     ) -> None:
         started = datetime(2026, 9, 7, tzinfo=timezone.utc)
         logger = Logging(
@@ -319,6 +320,7 @@ class TestResponseAPILoggingUtils:
                 "output_tokens_details": {"reasoning_tokens": 20},
             },
         }
+        logger.model_call_details["standard_callback_dynamic_params"] = {"turn_off_message_logging": redact}
         config = OpenAIResponsesAPIConfig()
         if stream:
             iterator = BaseResponsesAPIStreamingIterator(

@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import ssl
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +18,93 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging as LitellmLogging
 from litellm.litellm_core_utils.litellm_logging import set_callbacks
 from litellm.types.utils import ModelResponse, TextCompletionResponse
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_call", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_responses_usage_callback_survives_redacted_transport_state(async_call, stream):
+    from litellm.responses.main import mock_responses_api_response
+    from litellm.types.llms.openai import ResponseCompletedEvent
+
+    received = []
+
+    class UsageReceiver(CustomLogger):
+        def log_success_event(self, kwargs, response_obj, start_time, end_time):
+            received.append((kwargs["response_cost"], response_obj))
+
+        async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+            received.append((kwargs["response_cost"], response_obj))
+
+    receiver = UsageReceiver()
+    result = mock_responses_api_response("private response")
+    result._hidden_params.update({"transport": ssl.create_default_context(), "response_cost": 0.125})
+    original_usage = result.usage.model_dump()
+    logger = LitellmLogging(
+        model=result.model,
+        messages=[{"role": "user", "content": "private prompt"}],
+        stream=stream,
+        call_type="aresponses" if async_call else "responses",
+        start_time=time.time(),
+        litellm_call_id="redaction-usage-test",
+        function_id="redaction-usage-test",
+        dynamic_success_callbacks=[receiver],
+        dynamic_async_success_callbacks=[receiver],
+    )
+    logger.model_call_details["standard_callback_dynamic_params"] = {"turn_off_message_logging": True}
+    logger.model_call_details["stream"] = stream
+    event = ResponseCompletedEvent(type="response.completed", response=result) if stream else result
+    if async_call:
+        await logger.async_success_handler(result=event)
+    else:
+        logger.success_handler(result=event)
+
+    assert len(received) == 1
+    cost, logged = received[0]
+    assert cost == 0.125
+    usage = logged.usage if isinstance(logged.usage, dict) else logged.usage.model_dump()
+    assert usage["prompt_tokens"] == original_usage["input_tokens"]
+    assert usage["completion_tokens"] == original_usage["output_tokens"]
+    assert usage["total_tokens"] == original_usage["total_tokens"]
+    assert logged.output[0].content[0].text == "redacted-by-litellm"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_call", [False, True])
+async def test_responses_redacted_logging_hook_cannot_mutate_caller_metadata(async_call):
+    from litellm.responses.main import mock_responses_api_response
+
+    class MetadataRedactor(CustomLogger):
+        def logging_hook(self, kwargs, result, call_type):
+            result.metadata.clear()
+            return kwargs, result
+
+        async def async_logging_hook(self, kwargs, result, call_type):
+            result.metadata.clear()
+            return kwargs, result
+
+    receiver = MetadataRedactor()
+    result = mock_responses_api_response("private response")
+    result.metadata = {"task": "original"}
+    result._hidden_params["transport"] = ssl.create_default_context()
+    logger = LitellmLogging(
+        model=result.model,
+        messages=[{"role": "user", "content": "private prompt"}],
+        stream=False,
+        call_type="aresponses" if async_call else "responses",
+        start_time=time.time(),
+        litellm_call_id="redaction-metadata-test",
+        function_id="redaction-metadata-test",
+        dynamic_success_callbacks=[receiver],
+        dynamic_async_success_callbacks=[receiver],
+    )
+    logger.model_call_details["standard_callback_dynamic_params"] = {"turn_off_message_logging": True}
+    if async_call:
+        await logger.async_success_handler(result=result)
+    else:
+        logger.success_handler(result=result)
+
+    assert result.metadata == {"task": "original"}
 
 
 @pytest.fixture

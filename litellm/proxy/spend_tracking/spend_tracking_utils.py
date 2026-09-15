@@ -671,8 +671,10 @@ def _get_messages_for_spend_logs_payload(
 ) -> str:
     if _should_store_prompts_and_responses_in_spend_logs():
         if standard_logging_payload is not None:
+            from litellm.litellm_core_utils.request_content_mode import encryption_enabled
+
             call_type = standard_logging_payload.get("call_type", "")
-            if call_type == "_arealtime":
+            if call_type == "_arealtime" or encryption_enabled():
                 messages = standard_logging_payload.get("messages")
                 if messages is not None:
                     try:
@@ -691,8 +693,8 @@ def _sanitize_request_body_for_spend_logs_payload(
     max_string_length_prompt_in_db: Optional[int] = None,
 ) -> dict:
     """
-    Recursively sanitize request body to prevent logging large base64 strings or other large values.
-    Truncates strings longer than MAX_STRING_LENGTH_PROMPT_IN_DB characters and handles nested dictionaries.
+    Recursively sanitize request bodies. Unprotected logs truncate strings longer
+    than MAX_STRING_LENGTH_PROMPT_IN_DB; protected logs use the whole-envelope bound.
 
     Also strips keys listed in _SENSITIVE_REQUEST_BODY_KEYS (e.g. secret_fields
     which contains raw HTTP headers including Authorization tokens).
@@ -701,11 +703,13 @@ def _sanitize_request_body_for_spend_logs_payload(
         LITELLM_TRUNCATED_PAYLOAD_FIELD,
         LITELLM_TRUNCATION_DB_SAFEGUARD_NOTE,
     )
+    from litellm.litellm_core_utils.request_content_mode import encryption_enabled
 
     if visited is None:
         visited = set()
     if max_string_length_prompt_in_db is None:
         max_string_length_prompt_in_db = _get_max_string_length_prompt_in_db()
+    truncate_strings = not encryption_enabled()
 
     # Get the object's memory address to track visited objects
     obj_id = id(request_body)
@@ -719,7 +723,7 @@ def _sanitize_request_body_for_spend_logs_payload(
         elif isinstance(value, list):
             return [_sanitize_value(item) for item in value]
         elif isinstance(value, str):
-            if len(value) > max_string_length_prompt_in_db:
+            if truncate_strings and len(value) > max_string_length_prompt_in_db:
                 # Keep 35% from beginning and 65% from end (end is usually more important)
                 # This split ensures we keep more context from the end of conversations
                 start_ratio = 0.35
@@ -907,8 +911,9 @@ def _sanitize_error_information_for_spend_logs(
     strings can echo the full request body, producing multi-megabyte spend-log
     rows.
 
-    - Always: cap ``error_message`` and ``traceback`` with the existing
-      ``MAX_STRING_LENGTH_PROMPT_IN_DB`` DB-storage safeguard.
+    - Unprotected mode: cap ``error_message`` and ``traceback`` with the existing
+      ``MAX_STRING_LENGTH_PROMPT_IN_DB`` DB-storage safeguard. Protected mode
+      uses the overall encrypted-content size limit instead.
     - When ``store_prompts_in_spend_logs`` is False: additionally redact
       ``'input'`` / ``'messages'`` / ``'prompt'`` values *and* Pydantic v2
       ``input_value=...`` assignments inside both ``error_message`` and

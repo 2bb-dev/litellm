@@ -1408,6 +1408,16 @@ async def _get_health_readiness_details(
     Detailed health payload for authenticated diagnostics.
     """
     from litellm.proxy.proxy_server import prisma_client, version
+    from litellm.proxy.spend_tracking.request_content_policy import (
+        protected_profile_failure,
+        protected_tag_budget_failure,
+    )
+
+    profile_failure = protected_profile_failure() or await protected_tag_budget_failure()
+    if profile_failure is not None:
+        if response is not None:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "unhealthy", "request_logging": profile_failure.code}
 
     try:
         # get success callback
@@ -1558,6 +1568,15 @@ async def health_readiness(response: Response):
     if GracefulShutdownManager.is_shutting_down():
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "shutting_down"}
+
+    from litellm.proxy.spend_tracking.request_content_policy import (
+        protected_profile_failure,
+        protected_tag_budget_failure,
+    )
+
+    if protected_profile_failure() is not None or await protected_tag_budget_failure() is not None:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "unhealthy", "request_logging": "unavailable"}
 
     if _allow_public_health_readiness_details():
         return await _get_health_readiness_details(response=response)
