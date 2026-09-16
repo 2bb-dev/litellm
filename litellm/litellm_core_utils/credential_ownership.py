@@ -2,10 +2,12 @@
 
 import hashlib
 import re
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 from uuid import UUID
+from weakref import ReferenceType, ref
 
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
 
@@ -124,6 +126,7 @@ class _Selection:
     key_digest: bytes | None = field(repr=False)
     api_base: str | None = field(repr=False)
     rejection: str | None
+    shared_session: ReferenceType[object] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +181,40 @@ def _auth_fields() -> frozenset[str]:
     }
 
 
+def _plain_shared_session(session: object) -> bool:
+    from aiohttp import ClientRequest, ClientResponse, ClientSession, TCPConnector
+
+    if type(session) is not ClientSession or not isinstance(session, ClientSession) or session.closed:
+        return False
+    state = _mapping(vars(session))
+    return not (
+        session.auth is not None
+        or session.headers
+        or session.trust_env
+        or session.trace_configs
+        or session.cookie_jar
+        or state.get("_middlewares")
+        or state.get("_default_proxy") is not None
+        or state.get("_default_proxy_auth") is not None
+        or state.get("_base_url") is not None
+        or state.get("_request_class") is not ClientRequest
+        or state.get("_response_class") is not ClientResponse
+        or "request" in state
+        or "_request" in state
+        or type(session.connector) is not TCPConnector
+    )
+
+
+def _proxy_shared_session(session: object) -> bool:
+    proxy = sys.modules.get("litellm.proxy.proxy_server")
+    return (
+        session is not None
+        and proxy is not None
+        and session is getattr(proxy, "shared_aiohttp_session", None)
+        and _plain_shared_session(session)
+    )
+
+
 def select_credential(deployment: Mapping[str, object], request: Mapping[str, object], deployment_id: object) -> object:
     """Router-owned selection snapshot. Every fallback must replace the snapshot."""
     params = _mapping(deployment.get("litellm_params"))
@@ -185,6 +222,8 @@ def select_credential(deployment: Mapping[str, object], request: Mapping[str, ob
     name = params.get("litellm_credential_name")
     model = params.get("model")
     base = params.get("api_base")
+    shared_session = request.get("shared_session")
+    proxy_session = _proxy_shared_session(shared_session)
     # The initial slice proves simple API-key transports only. Dynamic/custom auth
     # cannot inherit a static registration merely because the route has one.
     unsupported = any(
@@ -199,11 +238,12 @@ def select_credential(deployment: Mapping[str, object], request: Mapping[str, ob
         api_base=base if isinstance(base, str) else None,
         rejection=(
             "credential_override"
-            if any(key in request for key in _auth_fields())
+            if any(key in request for key in _auth_fields() if key != "shared_session" or not proxy_session)
             else "ambiguous"
             if unsupported or (info.get("db_model") is True and not isinstance(name, str))
             else None
         ),
+        shared_session=ref(shared_session) if proxy_session else None,
     )
 
 
@@ -256,9 +296,14 @@ def resolve_ownership(
         return _stamp(selection, None, "unregistered")
     if named and (selection.registration is not None or selection.key_digest is not None):
         return _stamp(selection, None, "ambiguous")
+    shared_session = selection.shared_session() if selection.shared_session is not None else None
+    if request.get("shared_session") is not shared_session or (
+        selection.shared_session is not None and not _proxy_shared_session(shared_session)
+    ):
+        return _stamp(selection, None, "credential_override")
     if any(
         request.get(key) is not None
-        for key in _auth_fields() - {"api_key", "api_base", "litellm_credential_name", "client"}
+        for key in _auth_fields() - {"api_key", "api_base", "litellm_credential_name", "client", "shared_session"}
     ):
         return _stamp(selection, None, "credential_override")
     if named and any(key not in {"api_key", "api_base"} for key in credential_values):

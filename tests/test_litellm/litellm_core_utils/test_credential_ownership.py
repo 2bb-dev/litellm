@@ -351,6 +351,130 @@ def test_db_model_registration_is_not_reviewed_static_authority():
     assert ownership_for_spend(resolve_ownership(selected_request(route), {}, {}), "selected-a")["source"] == "unknown"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["none", "caller", "swap", "closed", "auth", "headers", "cookies", "trace", "method", "json"]
+)
+async def test_only_unchanged_plain_proxy_shared_session_retains_named_proof(monkeypatch, change):
+    from aiohttp import BasicAuth, ClientSession, TraceConfig
+
+    from litellm.proxy import proxy_server
+
+    async with ClientSession() as session, ClientSession() as other:
+        monkeypatch.setattr(proxy_server, "shared_aiohttp_session", session)
+        route = deployment(named=True)
+        route["model_info"]["db_model"] = True
+        candidate = other if change == "caller" else {"trusted": True} if change == "json" else session
+        request = selected_request(route, {"shared_session": candidate})
+        request["metadata"] = copy.deepcopy(request["metadata"])
+        if change == "swap":
+            request["shared_session"] = other
+        elif change == "closed":
+            await session.close()
+        elif change == "auth":
+            session._default_auth = BasicAuth("synthetic", "synthetic")
+        elif change == "headers":
+            session.headers["Authorization"] = "Bearer synthetic-other"
+        elif change == "cookies":
+            session.cookie_jar.update_cookies({"synthetic": "synthetic"})
+        elif change == "trace":
+            session.trace_configs.append(TraceConfig())
+        elif change == "method":
+            session.__dict__["_request"] = object()
+        stamp = resolve_ownership(request, {"api_key": "synthetic-key"}, {FIELD: {**REGISTRATION, "source": "byok"}})
+        fact = ownership_for_spend(stamp, "selected-a")
+        assert fact["source"] == ("byok" if change == "none" else "unknown")
+        assert fact["provenance"] == ("credential_registration" if change == "none" else "credential_override")
+
+
+@pytest.mark.asyncio
+async def test_authenticated_proxy_startup_pool_named_venice_spend(monkeypatch, upstream_server):
+    import asyncio
+
+    import httpx
+
+    from litellm.integrations.custom_logger import CustomLogger
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    ready = asyncio.Event()
+    rows = []
+
+    class Capture(CustomLogger):
+        async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+            rows.append(get_logging_payload(kwargs, response_obj, start_time, end_time))
+            ready.set()
+
+    for name in (
+        "callbacks",
+        "success_callback",
+        "failure_callback",
+        "_async_success_callback",
+        "_async_failure_callback",
+        "input_callback",
+    ):
+        monkeypatch.setattr(litellm, name, [])
+    monkeypatch.setattr(litellm, "callbacks", [Capture()])
+    registration = {**REGISTRATION, "source": "byok"}
+    monkeypatch.setattr(
+        litellm,
+        "credential_list",
+        [
+            CredentialItem(
+                credential_name="registered-name",
+                credential_values={"api_key": "synthetic-byok-key"},
+                credential_info={FIELD: registration},
+            )
+        ],
+    )
+    base, calls, _ = upstream_server
+    route = deployment(named=True)
+    route["model_info"]["db_model"] = True
+    route["litellm_params"].update(model="veniceai/test-model", api_base=base)
+    router = litellm.Router(model_list=[route], num_retries=0, fallbacks=[])
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    monkeypatch.setattr(proxy_server, "master_key", "sk-synthetic-proxy")
+    monkeypatch.setattr(proxy_server, "general_settings", {"master_key": "sk-synthetic-proxy"})
+    session = await proxy_server._initialize_shared_aiohttp_session()
+    assert session is not None
+    monkeypatch.setattr(proxy_server, "shared_aiohttp_session", session)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy_server.app), base_url="http://localhost:4000"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer sk-synthetic-proxy"},
+                json={
+                    "model": "requested-group",
+                    "messages": [{"role": "user", "content": "synthetic"}],
+                    "max_tokens": 16,
+                    "num_retries": 0,
+                    "model_group_retry_policy": {},
+                    "disable_fallbacks": True,
+                    "max_fallbacks": 0,
+                    "fallbacks": [],
+                    "context_window_fallbacks": [],
+                    "content_policy_fallbacks": [],
+                },
+            )
+        assert response.status_code == 200
+        await asyncio.wait_for(ready.wait(), 5)
+        row = rows[-1]
+        assert json.loads(row["metadata"])[FIELD] == {
+            **registration,
+            "provenance": "credential_registration",
+            "deployment_id": "selected-a",
+        }
+        assert row["request_id"] == response.json()["id"]
+        assert row["model_id"] == "selected-a"
+        assert row["custom_llm_provider"] == "veniceai"
+        assert (row["prompt_tokens"], row["completion_tokens"]) == (9, 3)
+        assert len(calls) == 1 and calls[0][1] == "Bearer synthetic-byok-key"
+    finally:
+        await session.close()
+
+
 @pytest.mark.parametrize(
     "patch_registration,expected",
     [
