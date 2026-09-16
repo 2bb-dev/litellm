@@ -1,0 +1,55 @@
+{
+  "testOnly": true,
+  "instanceUid": "018fcb42-59ea-7000-8000-000000000001",
+  "recordId": "synthetic-python-fixture-1",
+  "privateKey": {
+    "n": "zmSUo0jwINaTJg1JwU_KI7IBFAO3X7X4AnNbGDQSvZvs-rTmv0q7RZmzwb-44eJCb7BtjJGDdKA9sQa56JuxFSTWCrHdCxzTh_Ajjz9-TBu9esq7ED70NL4GhkGElWbVWGRrJ_ESUyoYRgzDsr9P3_Nmvgiy7OgRd5VvPj1Mf2HbFCiE9Itv1OMm8t8wULq8bO0mbvTioXZb1YmcAv8wqXkyJim-UowQ1oN1RobqfBzXo1iegV9lHgWxK5PiJOToSIC-jREzUFjFGt9ADhdKpk8T5zKevWndqvTiYGNhJ5Wx_P6oO6yya3wneGb_AKSLizGjB7l9vzQUjz5x3PPFxgUY0h4k3FFb66Er9ISdVjxFlTHGYK4xU8KTv2BXsF94e_1W3dMO1w_V6fUzAfcjtd5hhPU9PoPmXVi-YhjM-XlHky0wL8uGB4vrStR98X0reKlZpDCMjbfX2FtcHYffyYLxUqaVu0ptyB0CaxG4ZmqrWnC2EgMQKLhc8J6dBnDr",
+    "e": "AQAB",
+    "d": "1n8jUB3EjiNWPCd2xpuJao-GOf-ivqr7lVeGm8uCkhozr3anrkMKswPDMRjIjDH89jMB4Abo3q-qUUJIutmFk9dtfyGvws6WJNuYGTmcbAraKF_CJfWALDPC6W9KaYj122dlEoEw0Vn8bl7yIBmzheEpSY8yncrKI4v_rUvrJnea0_TWqmw_hg6NCGqW2jM39cOdykEMKt46rzIp42U25niq0HB1MTh8gDse7cmer3qfhKOjNAn-jNF6CIjvxRLJynzyjdC2Pb77x5pM3BZV4jNmaLVp0H9sATwTqQsxcmUsnrnygvbrXuVKWdJ1csMkeiU4IQGbu5r-9Pq6ddcqMblFRElegJMYFx2ABEagOEM-LainXOOdUccAmBWuiRz3SSRwtCJEg-d0ciEEn5Pk42qoL6fR0G04-UsYS2xJURxz4ad1sYuQJPu1wA4XMatd3VXP23y_TlGcNPO2bJfsHI-4Ezri2lxgVw2LR9mhwuATm9-DOTSgnWpU-uDra8k",
+    "p": "_q_XxSPB0fAs5BmnAPlg_o7dMVhaFuIP66hkmebAh8Djkzi7ffYPL6vcmg_WulT-PvR10UJrx17MIyxkoj9ByaqNA5crMuij_1MHJVhJZQsaRk6AcJiTCIGmjtI85KZ_NIPuNNXsp2tlgSrZ8HtvYu1AfO846rYxNfQMWceAqdnoQWm4_TRBhc8UCjIWeGT8NWVPmdqCGtYJuYPyf-W8CtblL91b-3k3RsVzHp19PIQmTazR9xMD9SA2-5QsWPQp",
+    "q": "z3T-y68SZRxq6X-nd4x8Ql0Z2HDdI0Zp46iSFSot3R0RpV118nPG_mkTFzdSB-AduAy3j043KDgCcR59K54oVDxFQRTga4IEa4rju8U8GuNR6BR0KALuOTxyhntX8MA-A4janaNoqGToq0MjsL4vyULtIjykq6lt4tkAsDSDrKCcGxUVyYuidcW_Zn5QdhCJFt0S450JT7KvMsYrnoPRR22BttqwgHK_6EJXpqEBHEMnhHKg0X5G2t61KL5qZv7z",
+    "dp": "k_cfOXZztX9-5SqOHv_DPUFM-s0k0eSWcUgM4mjwdC45SSANtbmNyxli-dK34ttcNsEZ7fBT46mMmebBtI1hsEM419wsidAk70KShTzMrzqLEkurTT8nNSr11EYKgKDGiIEZlHKwoffAKhH2OkPMS8Ig1DS7cYlV_82Am2xPsN5blB1TDzAb3RyYvO-qpFmvOWpZm74aFnNBhRlGes3CuN1um6dUOD6NQb2XCzNePhlck4YTGiNfCjukFfdY6Hk5",
+    "dq": "FmYnbI6Giew7juJ9jmbYs8GhnMDy33Am1rHItAhN02XkFdq1dWwSvD1UFlmevcLw8oJM_2gOhIUnnlcQZLk62X14bMJ4SKNNHt9sH0X4a17H5SrwL7HBTuS76NFAeXoIOBF6qTKPhj7-8B7bp6WhOzXCrMOnc_FjL-8GKABDh0wADtyD8bLl45lqRQK2ZUj7xEAyXekCrFw6llzXMNJCslecfcW28Ody2Pzwwcj4ebi2d5J40qWzuMX7AV8t1dkJ",
+    "qi": "p5rn89vjNXDttvaXq9hQK-2WWu0dcR8WD51tqz-8iIlBhC8Hm4baPxYWG3NfGfycEcEDJiWyJTKKMqdD3oh9gTH-bZcaTNUA3Ng587__rtW4LJMfDoUQ8EwOzJp9VOYVYhCUDwG3LAPsVTsBoHEsaC5aAxG3HcEvTlOEcQCCqs4wQIAJEhlfhVMi1bBtx57UX5LqtdUHYtlYHX5MR5Sw2oAOzGnzEIDGjQpQW4qqmP7RCZN1zcfpXIWw_Avrkux5",
+    "kty": "RSA"
+  },
+  "publicKey": {
+    "n": "zmSUo0jwINaTJg1JwU_KI7IBFAO3X7X4AnNbGDQSvZvs-rTmv0q7RZmzwb-44eJCb7BtjJGDdKA9sQa56JuxFSTWCrHdCxzTh_Ajjz9-TBu9esq7ED70NL4GhkGElWbVWGRrJ_ESUyoYRgzDsr9P3_Nmvgiy7OgRd5VvPj1Mf2HbFCiE9Itv1OMm8t8wULq8bO0mbvTioXZb1YmcAv8wqXkyJim-UowQ1oN1RobqfBzXo1iegV9lHgWxK5PiJOToSIC-jREzUFjFGt9ADhdKpk8T5zKevWndqvTiYGNhJ5Wx_P6oO6yya3wneGb_AKSLizGjB7l9vzQUjz5x3PPFxgUY0h4k3FFb66Er9ISdVjxFlTHGYK4xU8KTv2BXsF94e_1W3dMO1w_V6fUzAfcjtd5hhPU9PoPmXVi-YhjM-XlHky0wL8uGB4vrStR98X0reKlZpDCMjbfX2FtcHYffyYLxUqaVu0ptyB0CaxG4ZmqrWnC2EgMQKLhc8J6dBnDr",
+    "e": "AQAB",
+    "kty": "RSA",
+    "alg": "RSA-OAEP-256",
+    "use": "enc",
+    "key_ops": [
+      "encrypt"
+    ],
+    "kid": "bw-8dDA5Bb_rt1mm6mvIxMJnh3yX7InPZn3A1dgW7AU"
+  },
+  "content": {
+    "v": 1,
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "SYNTHETIC Python interoperability request"
+        }
+      ]
+    },
+    "messages": [],
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "content": "SYNTHETIC Python interoperability response"
+          }
+        }
+      ]
+    },
+    "metadata": {},
+    "request_tags": []
+  },
+  "envelope": {
+    "format": "openorange.request-log.v1",
+    "jwe": "eyJhbGciOiJSU0EtT0FFUC0yNTYiLCJlbmMiOiJBMjU2R0NNIiwidHlwIjoib3Blbm9yYW5nZS1yZXF1ZXN0LWNvbnRlbnQrandlIiwia2lkIjoiYnctOGREQTVCYl9ydDFtbTZtdkl4TUpuaDN5WDdJblBabjNBMWRnVzdBVSIsInYiOjEsImluc3RhbmNlVWlkIjoiMDE4ZmNiNDItNTllYS03MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwicHVycG9zZSI6InJlcXVlc3QtbG9nIiwicmVjb3JkSWQiOiJzeW50aGV0aWMtcHl0aG9uLWZpeHR1cmUtMSJ9.TrNCvcvDNtdNnYhnkXddvFZ1hiqIeruYqJzM6sOpAt_f8-SiXZuth8m_2W7GeBdj0QTningE_hujHf8ytjnFTWBGq1mopxgJPVeoUmwcuYyAS1CUdYXKqi9YrUYHeLwfWHeEjLCqArdwscnRs3VwoRLFj5wvtj--IUM_HxdQx01blc8hwRE6KWmbbOpPEquIy_kiBcneqYn1-LrsNG4OVGGNeXeESbD1tLL5WZSzue1HNHezXFR89HAxdwa_guWhIzqWj_kRRRPDZts5h7Nsby9U8-KNNsIq3Za-uKv-eWcFOE61uF0yluATUety9BEeq44aIybhr8grtCersx1Q3VbOhYk0Qj8bjRSIawDfYW3uiA2KuIxaUTX_7YA8jyuLYeksRa5fTlYwb3-3gStOS6lkPeVClBe29bd8nQBNj30bRPrekONYjpyZhs633tPYsJL_7yEJQsbZjwDxIkPD4JPeouAxYLWapdbxFYuOwVjTjdjBCt2-khPrIjcd4Z-A.wE_-YacYh9G1Hd1I.2sLUOu0wZBmCtUZlp33ToWfJ4MogtULMT9rm25leSPd7kErlCK0YHbIs4jnVSP2wkCGWGSU4FqibXpm-6YigMTsu9OdUX7tnbw7p2KgUbUcy6kB_enpcqIqLsnZhh8VbUS3ibgB9PKjWl5uzhWYw-34HYIfyy6jmYFr-WKteRzY30Wlb-BGyamNylt8-T_A8UZuGPHkaits3nh1cKqKG1ofuf8XpU5hCS9FGpt20ncvuv-JJRh40kjleYfRe4fOpt7YeTyfvrGlKcQeO9IqViBJx2pGHvm5A3LcyFV5pToivCrvjJXf9wZrRi0c0mXOkp5Q.s1gSw_BfV85N8tAnwRc_Iw"
+  },
+  "producer": "OpenOrange browser request-log-crypto using jose 6.2.12"
+}

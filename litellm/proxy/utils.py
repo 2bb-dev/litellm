@@ -1360,6 +1360,14 @@ class ProxyLogging:
         """
         verbose_proxy_logger.debug("Inside Proxy Logging Pre-call hook!")
 
+        from litellm.proxy.spend_tracking.request_content_policy import (
+            enforce_protected_profile,
+            enforce_protected_tag_budget_profile,
+        )
+
+        enforce_protected_profile(data)
+        await enforce_protected_tag_budget_profile()
+
         self._init_response_taking_too_long_task(data=data)
 
         if data is None:
@@ -2012,6 +2020,47 @@ class ProxyLogging:
                                       Otherwise, returns None and the original exception is used.
         """
 
+        # Lift the first-handoff instant onto request_data (top-level
+        # internal key, not metadata) so failure-path callbacks can still
+        # compute preprocessing latency after the logging object is popped.
+        _logging_obj = request_data.get("litellm_logging_obj")
+        if _logging_obj is not None:
+            _model_call_details = getattr(_logging_obj, "model_call_details", {})
+            _first_handoff = _model_call_details.get("first_api_call_start_time")
+            if _first_handoff is not None:
+                request_data["first_api_call_start_time"] = _first_handoff
+
+            # A stream that broke mid-flight still billed the provider for the
+            # chunks already delivered; the streaming handler stashes that
+            # recovered usage and cost here. Lift them onto request_data so the
+            # failure-path spend callbacks (which run after the logging object
+            # is popped) record the real partial spend instead of zero.
+            _recovered_usage = _model_call_details.get("combined_usage_object")
+            if _recovered_usage is not None:
+                request_data["combined_usage_object"] = _recovered_usage
+                request_data["response_cost"] = _model_call_details.get("response_cost")
+
+        from litellm.litellm_core_utils.request_content_mode import encryption_enabled
+        from litellm.proxy.spend_tracking.request_content_policy import (
+            ProtectedProfileUnavailable,
+            protected_profile_failure,
+            request_policy_failure,
+        )
+
+        if encryption_enabled() and (
+            isinstance(original_exception, ProtectedProfileUnavailable)
+            or protected_profile_failure() is not None
+            or request_policy_failure(request_data) is not None
+        ):
+            from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
+
+            await _ProxyDBLogger().async_post_call_failure_hook(
+                request_data=request_data,
+                original_exception=original_exception,
+                user_api_key_dict=user_api_key_dict,
+            )
+            return original_exception if isinstance(original_exception, HTTPException) else None
+
         ### ALERTING ###
         await self.update_request_status(litellm_call_id=request_data.get("litellm_call_id", ""), status="fail")
         if AlertType.llm_exceptions in self.alert_types and not isinstance(
@@ -2048,26 +2097,6 @@ class ProxyLogging:
                 route=route,
                 original_exception=original_exception,
             )
-
-        # Lift the first-handoff instant onto request_data (top-level
-        # internal key, not metadata) so failure-path callbacks can still
-        # compute preprocessing latency after the logging object is popped.
-        _logging_obj = request_data.get("litellm_logging_obj")
-        if _logging_obj is not None:
-            _model_call_details = getattr(_logging_obj, "model_call_details", {})
-            _first_handoff = _model_call_details.get("first_api_call_start_time")
-            if _first_handoff is not None:
-                request_data["first_api_call_start_time"] = _first_handoff
-
-            # A stream that broke mid-flight still billed the provider for the
-            # chunks already delivered; the streaming handler stashes that
-            # recovered usage and cost here. Lift them onto request_data so the
-            # failure-path spend callbacks (which run after the logging object
-            # is popped) record the real partial spend instead of zero.
-            _recovered_usage = _model_call_details.get("combined_usage_object")
-            if _recovered_usage is not None:
-                request_data["combined_usage_object"] = _recovered_usage
-                request_data["response_cost"] = _model_call_details.get("response_cost")
 
         # Remove before callbacks iterate — not serialisable
         request_data.pop("litellm_logging_obj", None)
@@ -2364,7 +2393,12 @@ class ProxyLogging:
             # Build litellm_call_info — normalized routing metadata for callbacks
             litellm_call_info = self._build_litellm_call_info(data=data, response=response)
 
+            from litellm.litellm_core_utils.request_content_mode import encryption_enabled
+            from litellm.proxy.spend_tracking.request_content_policy import approved_callback
+
             for callback in litellm.callbacks:
+                if encryption_enabled() and not approved_callback(callback):
+                    continue
                 _callback: Optional[CustomLogger] = None
                 if isinstance(callback, str):
                     _callback = litellm.litellm_core_utils.litellm_logging.get_custom_logger_compatible_class(

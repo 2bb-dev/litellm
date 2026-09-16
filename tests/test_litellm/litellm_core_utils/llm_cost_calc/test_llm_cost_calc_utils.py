@@ -1768,3 +1768,49 @@ def test_threshold_keys_exclude_service_tier_variants():
     usage = Usage(prompt_tokens=350_000, completion_tokens=1_000, total_tokens=351_000)
     prompt_base, *_ = _get_token_base_cost(model_info=model_info, usage=usage)
     assert prompt_base == 3e-6
+@pytest.mark.parametrize(
+    "instant,expected",
+    [
+        ("2026-09-07T00:59:59+00:00", 0.22),
+        ("2026-09-07T01:00:00+00:00", 0.44),
+        ("2026-09-10T03:59:59+00:00", 0.44),
+        ("2026-09-10T04:00:00+00:00", 0.15),
+        ("2026-09-12T02:00:00+00:00", 0.15),
+    ],
+)
+def test_explicit_dated_recurring_schedule(instant: str, expected: float) -> None:
+    from copy import deepcopy
+    from datetime import datetime
+    from typing import cast
+
+    from pydantic import TypeAdapter
+
+    from litellm.litellm_core_utils.llm_cost_calc.utils import resolve_token_pricing
+    from litellm.types.utils import TokenPricingPeriod
+
+    windows = [
+        {"hours_utc": ["00:00-01:00", "04:00-06:00", "10:00-00:00"], "weekdays": [1, 2, 3, 4, 5]},
+        {"hours_utc": "00:00-00:00", "weekdays": [6, 7]},
+    ]
+    period = {
+        "effective_until": "2026-09-10T04:00:00Z",
+        "input_cost_per_token": 0.44,
+        "off_peak_pricing": {"windows": windows, "input_cost_per_token": 0.22},
+    }
+    TypeAdapter(TokenPricingPeriod).validate_python(period)
+    info = cast(
+        ModelInfo,
+        {
+            "input_cost_per_token": 0.3,
+            "output_cost_per_token": 1.2,
+            "off_peak_pricing": {"windows": windows, "input_cost_per_token": 0.15},
+            "pricing_periods": [period],
+        },
+    )
+    original = deepcopy(info)
+    result = resolve_token_pricing(
+        info, Usage(prompt_tokens=10, completion_tokens=1), None, datetime.fromisoformat(instant)
+    )
+    assert result["input_cost_per_token"] == expected
+    assert result["output_cost_per_token"] == 1.2
+    assert info == original

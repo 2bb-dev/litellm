@@ -7,6 +7,7 @@ from logging import Formatter
 from typing import Any, Dict, Optional
 
 from litellm.litellm_core_utils.secret_redaction import redact_string
+from litellm.litellm_core_utils.request_content_mode import encryption_enabled
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 
@@ -49,6 +50,17 @@ class SecretRedactionFilter(logging.Filter):
     _formatter = logging.Formatter()
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if encryption_enabled():
+            if not getattr(record, "openorange_content_safe", False):
+                record.msg = "Protected request logging: diagnostic detail suppressed"
+                record.args = None
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+            for key in list(record.__dict__):
+                if key not in _STANDARD_RECORD_ATTRS and key not in {"exc_text", "stack_info"}:
+                    del record.__dict__[key]
+            return True
         if not _ENABLE_SECRET_REDACTION:
             return True
 

@@ -22,6 +22,7 @@ from litellm.llms.vertex_ai.common_utils import (
     redact_vertex_ai_metadata_from_logged_object,
 )
 from litellm.secret_managers.main import str_to_bool
+from litellm.types.llms.openai import ResponseCompletedEvent, ResponseFailedEvent, ResponseIncompleteEvent
 from litellm.types.utils import StandardCallbackDynamicParams
 
 if TYPE_CHECKING:
@@ -162,12 +163,16 @@ def perform_redaction(model_call_details: dict, result):
     redact_vertex_ai_metadata_from_litellm_params(model_call_details)
 
     # Redact streaming response
-    if model_call_details.get("stream", False) is True and "complete_streaming_response" in model_call_details:
-        _streaming_response = model_call_details["complete_streaming_response"]
+    for response_field in ("complete_streaming_response", "async_complete_streaming_response"):
+        if model_call_details.get("stream", False) is not True or response_field not in model_call_details:
+            continue
+        _streaming_response = model_call_details[response_field]
         if hasattr(_streaming_response, "choices"):
             for choice in _streaming_response.choices:
                 _redact_choice_content(choice)
             redact_vertex_ai_metadata_from_logged_object(_streaming_response)
+        elif isinstance(_streaming_response, litellm.ResponsesAPIResponse):
+            model_call_details[response_field] = perform_redaction({}, _streaming_response)
         elif hasattr(_streaming_response, "output"):
             _redact_responses_api_output(_streaming_response.output)
             # Redact reasoning field in ResponsesAPIResponse
@@ -186,7 +191,14 @@ def perform_redaction(model_call_details: dict, result):
             # For async objects, return a simple redacted response without deepcopy
             return {"text": "redacted-by-litellm"}
 
-        _result = copy.deepcopy(result)
+        if isinstance(result, (ResponseCompletedEvent, ResponseFailedEvent, ResponseIncompleteEvent)):
+            return result.model_copy(update={"response": perform_redaction({}, result.response)})
+        if isinstance(result, litellm.ResponsesAPIResponse):
+            # Private transport state can contain clients/SSLContext that cannot be deep-copied.
+            _result = result.model_copy(update=copy.deepcopy(dict(result)))
+            _result._hidden_params = dict(result._hidden_params)
+        else:
+            _result = copy.deepcopy(result)
         if isinstance(_result, litellm.ModelResponse):
             if hasattr(_result, "choices") and _result.choices is not None:
                 for choice in _result.choices:

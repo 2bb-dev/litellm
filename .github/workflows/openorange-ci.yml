@@ -52,6 +52,7 @@ jobs:
             tests/test_litellm/litellm_core_utils/llm_cost_calc/test_off_peak_pricing.py \
             tests/test_litellm/litellm_core_utils/llm_cost_calc/test_llm_cost_calc_utils.py \
             tests/test_litellm/litellm_core_utils/test_safe_json_dumps.py \
+            tests/test_litellm/litellm_core_utils/test_redact_messages.py \
             tests/test_litellm/llms/chatgpt/chat/test_chatgpt_transformation.py \
             tests/test_litellm/llms/chatgpt/responses/test_chatgpt_responses_transformation.py \
             tests/test_litellm/llms/deepseek/chat/test_deepseek_chat_transformation.py \
@@ -60,10 +61,15 @@ jobs:
             tests/test_litellm/proxy/test_litellm_pre_call_utils.py \
             tests/test_litellm/router_utils/pre_call_checks/test_encrypted_content_affinity_check.py \
             tests/test_litellm/proxy/spend_tracking/test_spend_tracking_utils.py \
+            tests/test_litellm/proxy/spend_tracking/test_request_content_encryption.py \
+            tests/test_litellm/proxy/spend_tracking/test_request_content_policy.py \
             tests/test_litellm/integrations/test_langfuse.py \
             tests/test_litellm/proxy/db/test_db_spend_update_writer.py \
             tests/proxy_unit_tests/test_update_spend.py \
             tests/test_litellm/proxy/test_spend_log_cleanup.py
+          uv run --no-sync pytest -q \
+            tests/test_litellm/litellm_core_utils/test_litellm_logging.py \
+            -k test_responses_usage_callback_survives_redacted_transport_state
 
       - name: Verify OSS dependency graph and imports
         run: |
