@@ -413,7 +413,8 @@ async def test_encrypted_content_affinity_no_effect_on_chat_completions():
 
 
 @pytest.mark.asyncio
-async def test_encrypted_content_affinity_bypasses_rpm_limits():
+@pytest.mark.parametrize("routing_strategy", ["usage-based-routing", "usage-based-routing-v2"])
+async def test_encrypted_content_affinity_bypasses_rpm_limits(routing_strategy):
     """
     When encrypted content affinity pins to a deployment, the request
     goes through even if normal routing would avoid it (usage-based-routing-v2).
@@ -450,7 +451,7 @@ async def test_encrypted_content_affinity_bypasses_rpm_limits():
             },
         ],
         optional_pre_call_checks=["encrypted_content_affinity"],
-        routing_strategy="usage-based-routing-v2",
+        routing_strategy=routing_strategy,
         num_retries=0,
     )
 
@@ -754,7 +755,7 @@ async def test_continuation_affinity_rejects_conflicting_encrypted_origin():
     item_id = ResponsesAPIRequestUtils._build_encrypted_item_id("different", "rs_test")
     from litellm.exceptions import BadRequestError
 
-    with pytest.raises(BadRequestError, match="different deployments"):
+    with pytest.raises(BadRequestError, match="different account boundaries"):
         await check.async_filter_deployments(
             model="gpt-5",
             healthy_deployments=[],
@@ -989,6 +990,28 @@ async def test_affinity_falls_back_to_same_encryption_boundary_on_model_group_sw
         )
 
     assert r2._hidden_params["model_id"] == "gpt-5.4-account-a"
+
+    assert ResponsesAPIRequestUtils.get_model_id_from_response_id(r2.id) == "gpt-5.4-account-a"
+    with patch(
+        "litellm.llms.custom_httpx.llm_http_handler.BaseLLMHTTPHandler.async_response_api_handler",
+        new_callable=AsyncMock,
+        return_value=_build_mock_response([], response_id="resp_third"),
+    ) as upstream:
+        r3 = await router.aresponses(
+            model="gpt-5.4",
+            previous_response_id=r2.id,
+            input=[{"type": "reasoning", "id": encoded_id, "encrypted_content": "synthetic"}],
+        )
+        assert r3._hidden_params["model_id"] == "gpt-5.4-account-a"
+        upstream.assert_awaited_once()
+
+        other_id = ResponsesAPIRequestUtils._build_encrypted_item_id("gpt-5.3-codex-account-b", "rs_other")
+        with pytest.raises(litellm.BadRequestError, match="different account boundaries"):
+            await router.aresponses(
+                model="gpt-5.4", previous_response_id=r2.id,
+                input=[{"type": "reasoning", "id": other_id, "encrypted_content": "synthetic"}],
+            )
+        upstream.assert_awaited_once()
 
 
 @pytest.mark.asyncio

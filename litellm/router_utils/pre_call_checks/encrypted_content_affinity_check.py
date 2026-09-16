@@ -202,6 +202,16 @@ class EncryptedContentAffinityCheck(CustomLogger):
         ]
         return matches, originating
 
+    def _origins_share_encryption_boundary(self, first_id: str, second_id: str) -> bool:
+        if self.router is None:
+            return False
+        first = self.router.get_deployment(model_id=first_id)
+        second = self.router.get_deployment(model_id=second_id)
+        if first is None or second is None:
+            return False
+        boundary = self._encryption_boundary_key(first.litellm_params)
+        return boundary is not None and boundary == self._encryption_boundary_key(second.litellm_params)
+
     # ------------------------------------------------------------------
     # Request routing  (pre-call filter)
     # ------------------------------------------------------------------
@@ -248,9 +258,14 @@ class EncryptedContentAffinityCheck(CustomLogger):
             if isinstance(previous_response_id, str)
             else None
         )
-        if input_model_id and previous_model_id and input_model_id != previous_model_id:
+        if (
+            input_model_id
+            and previous_model_id
+            and input_model_id != previous_model_id
+            and not self._origins_share_encryption_boundary(input_model_id, previous_model_id)
+        ):
             raise BadRequestError(
-                message="previous_response_id and encrypted_content refer to different deployments.",
+                message="previous_response_id and encrypted_content refer to different account boundaries.",
                 model=model,
                 llm_provider="",
             )
