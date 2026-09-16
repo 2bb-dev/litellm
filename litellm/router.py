@@ -10278,6 +10278,7 @@ class Router:
         """
         if (
             self.routing_strategy != "usage-based-routing-v2"
+            and self.routing_strategy != "usage-based-routing"
             and self.routing_strategy != "simple-shuffle"
             and self.routing_strategy != "cost-based-routing"
             and self.routing_strategy != "latency-based-routing"
