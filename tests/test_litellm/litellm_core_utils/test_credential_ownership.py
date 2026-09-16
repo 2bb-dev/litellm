@@ -74,16 +74,21 @@ def test_explicit_route_registration_and_immutable_stamp(source):
         {"azure_ad_token": "synthetic"},
     ],
 )
-def test_request_overrides_never_inherit_ownership(override):
-    stamp = resolve_ownership(selected_request(deployment(), override), {}, {})
+@pytest.mark.parametrize("provider", ["openai", "veniceai"])
+def test_request_overrides_never_inherit_ownership(override, provider):
+    route = deployment()
+    route["litellm_params"]["model"] = f"{provider}/test-model"
+    stamp = resolve_ownership(selected_request(route, override), {}, {})
     assert ownership_for_spend(stamp, "selected-a")["provenance"] == "credential_override"
 
 
-def test_late_hook_override_and_unregistered_environment_key_are_unknown():
-    request = selected_request(deployment())
+@pytest.mark.parametrize("provider", ["openai", "veniceai"])
+def test_late_hook_override_and_unregistered_environment_key_are_unknown(provider):
+    route = deployment()
+    route["litellm_params"]["model"] = f"{provider}/test-model"
+    request = selected_request(route)
     request["api_key"] = "changed-after-router"
     assert ownership_for_spend(resolve_ownership(request, {}, {}), "selected-a")["source"] == "unknown"
-    route = deployment()
     route["model_info"].pop(FIELD)
     route["litellm_params"]["api_key"] = "os.environ/PLATFORM_KEY"
     assert ownership_for_spend(resolve_ownership(selected_request(route), {}, {}), "selected-a")["source"] == "unknown"
@@ -113,8 +118,10 @@ def test_malformed_registration_is_unknown(invalid):
     assert ownership_for_spend(resolve_ownership(selected_request(route), {}, {}), "selected-a")["source"] == "unknown"
 
 
-def test_named_resolution_uses_one_snapshot_and_survives_rotation(monkeypatch):
+@pytest.mark.parametrize("provider", ["openai", "veniceai"])
+def test_named_resolution_uses_one_snapshot_and_survives_rotation(monkeypatch, provider):
     route = deployment(named=True)
+    route["litellm_params"]["model"] = f"{provider}/test-model"
     credential = CredentialItem(
         credential_name="registered-name",
         credential_values={"api_key": "synthetic-old"},
@@ -209,10 +216,11 @@ def test_projection_rejects_mismatched_selected_deployment():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "veniceai"])
 @pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("synchronous", [False, True])
 async def test_real_router_sdk_callbacks_stamp_actual_completed_credential(
-    monkeypatch, fallback, synchronous, upstream_server
+    monkeypatch, provider, fallback, synchronous, upstream_server
 ):
     import asyncio
     import httpx
@@ -265,9 +273,11 @@ async def test_real_router_sdk_callbacks_stamp_actual_completed_credential(
     ):
         monkeypatch.setattr(litellm, name, [])
     monkeypatch.setattr(litellm, "callbacks", [capture])
-    routes = [deployment(), deployment("byok", "selected-b")]
+    primary_source = "byok" if provider == "veniceai" and not fallback else "platform"
+    routes = [deployment(primary_source), deployment("byok", "selected-b")]
     base_url, calls, replies = upstream_server
     for route in routes:
+        route["litellm_params"]["model"] = f"{provider}/test-model"
         route["litellm_params"]["api_base"] = base_url
     if fallback:
         replies.append((429, {"error": {"message": "synthetic retry", "type": "rate_limit_error"}}))
@@ -307,9 +317,21 @@ async def test_real_router_sdk_callbacks_stamp_actual_completed_credential(
         kwargs = capture.rows[-1]
         expected_id = "selected-b" if fallback else "selected-a"
         fact = ownership_for_spend(kwargs.get(STAMP), expected_id)
-        assert fact["source"] == ("byok" if fallback else "platform"), fact
+        assert fact["source"] == ("byok" if fallback else primary_source), fact
         assert kwargs["litellm_params"]["metadata"]["model_info"]["id"] == expected_id
         assert response.usage.total_tokens == 12
+        if provider == "veniceai":
+            from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+            row = get_logging_payload(kwargs, response, datetime.now(timezone.utc), datetime.now(timezone.utc))
+            metadata = json.loads(row["metadata"])
+            assert metadata[FIELD] == fact
+            assert row["model_id"] == expected_id
+            assert row["custom_llm_provider"] == "veniceai"
+            assert row["request_id"] == response.id
+            assert (row["prompt_tokens"], row["completion_tokens"]) == (9, 3)
+            assert "openorange_terminal_evidence" not in metadata
+            assert "openorange_terminal_usage_evidence" not in metadata
         if fallback:
             assert capture.failures
             assert ownership_for_spend(capture.failures[0].get(STAMP), "selected-a")["source"] == "platform"

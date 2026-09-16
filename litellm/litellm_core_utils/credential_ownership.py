@@ -245,7 +245,7 @@ def resolve_ownership(
     ):
         return _stamp(selection, None, "ambiguous")
     if request.get("model") != selection.model or not (selection.model or "").startswith(
-        ("openai/", "venice/", "anthropic/", "deepseek/")
+        ("openai/", "veniceai/", "anthropic/", "deepseek/")
     ):
         return _stamp(selection, None, "ambiguous")
     if request.get("litellm_credential_name") != selection.credential_name:
