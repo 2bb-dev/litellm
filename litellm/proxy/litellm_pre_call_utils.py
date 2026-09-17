@@ -2895,7 +2895,7 @@ async def add_litellm_data_to_request(
         data["api_version"] = dynamic_api_version
 
     ## Forward any LLM API Provider specific headers in extra_headers
-    add_provider_specific_headers_to_request(data=data, headers=_headers)
+    add_provider_specific_headers_to_request(data=data, headers=_headers, raw_headers=request.headers)
 
     ## Cache Controls
     cache_control_header = _headers.get("Cache-Control", None)
@@ -4099,11 +4099,60 @@ async def add_guardrails_from_policy_engine(
     )
 
 
+def _get_venice_e2ee_headers(headers: dict | Headers) -> dict[str, str]:
+    # These public handshake values must survive the proxy hop together.
+    # Forward only the explicit Venice allowlist, never proxy auth or cookies.
+    venice_names = {
+        "x-venice-tee-client-pub-key",
+        "x-venice-tee-model-pub-key",
+        "x-venice-tee-signing-algo",
+    }
+    venice_headers = {}
+    for name, value in headers.items():
+        normalized = name.lower()
+        if normalized in venice_names:
+            if normalized in venice_headers and venice_headers[normalized] != value:
+                raise HTTPException(status_code=400, detail="Conflicting Venice E2EE headers")
+            venice_headers[normalized] = value
+    if not venice_headers:
+        return {}
+    if set(venice_headers) != venice_names or any(
+        not isinstance(value, str) or not value.strip() for value in venice_headers.values()
+    ):
+        raise HTTPException(status_code=400, detail="Incomplete Venice E2EE handshake headers")
+    return venice_headers
+
+
+def _add_venice_e2ee_headers(data: dict, headers: dict | Headers) -> None:
+    venice_headers = _get_venice_e2ee_headers(headers)
+    if not venice_headers:
+        return
+    existing = data.get("extra_headers")
+    if existing is None:
+        existing = {}
+    if not isinstance(existing, dict):
+        raise HTTPException(status_code=400, detail="extra_headers must be an object")
+    merged = {}
+    for name, value in existing.items():
+        normalized = name.lower()
+        if normalized in venice_headers:
+            if value != venice_headers[normalized]:
+                raise HTTPException(status_code=400, detail="Conflicting Venice E2EE headers")
+        else:
+            merged[name] = value
+    data["extra_headers"] = {**merged, **venice_headers}
+
+
 def add_provider_specific_headers_to_request(
     data: dict,
     headers: dict,
+    raw_headers: Headers | None = None,
 ):
     from litellm.llms.anthropic.common_utils import is_anthropic_oauth_key
+
+    if raw_headers is not None:
+        _get_venice_e2ee_headers(raw_headers)
+    _add_venice_e2ee_headers(data, headers)
 
     anthropic_headers = {}
     # boolean to indicate if a header was added
