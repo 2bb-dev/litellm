@@ -18,6 +18,7 @@ from litellm.litellm_core_utils.request_content_mode import (
     protection_marker_path,
 )
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.db.prisma_client import PrismaWrapper
 from litellm.proxy.db.spend_log_queue import SQLiteSpendLogSpool
 from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger, _get_request_tags_for_cost_tracking
 from litellm.proxy.spend_tracking.request_content_encryption import CaptureFailure, INSTANCE_ENV, configured_encryptor
@@ -68,7 +69,7 @@ def protected_runtime(monkeypatch, tmp_path):
         spend_log_transactions=[],
         db=SimpleNamespace(query_raw=AsyncMock(return_value=[{"configured": False}])),
     )
-    client.writer_db = client.db
+    client.writer_db = PrismaWrapper(client.db, iam_token_db_auth=False)
     collector = _ProxyDBLogger()
     for name in CALLBACK_LISTS:
         monkeypatch.setattr(litellm, name, [])
@@ -259,6 +260,7 @@ async def test_tag_budget_profile_query_never_sends_request_tags_to_caches(prote
         await call
     cache.async_get_cache.assert_not_awaited()
     cache.async_set_cache.assert_not_awaited()
+    protected_runtime.client.db.query_raw.assert_awaited_once()
     assert CANARY not in str(protected_runtime.client.db.query_raw.call_args)
     assert _get_request_tags_for_cost_tracking({"request_tags": [CANARY]}, {"tags": [CANARY]}) is None
 
@@ -266,6 +268,23 @@ async def test_tag_budget_profile_query_never_sends_request_tags_to_caches(prote
 @pytest.mark.asyncio
 async def test_unreadable_tag_budget_configuration_fails_closed(protected_runtime):
     protected_runtime.client.db.query_raw.side_effect = RuntimeError(CANARY)
+    assert await protected_tag_budget_failure() == ProfileFailure("collector_unavailable")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [[], [{"configured": "false"}], [{"configured": False}, {"configured": False}]])
+async def test_malformed_delegated_tag_budget_result_fails_closed(protected_runtime, result):
+    protected_runtime.client.db.query_raw.return_value = result
+    assert await protected_tag_budget_failure() == ProfileFailure("collector_unavailable")
+    protected_runtime.client.db.query_raw.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "database", [SimpleNamespace(), SimpleNamespace(query_raw=None), SimpleNamespace(query_raw=Mock(return_value=[]))]
+)
+async def test_unavailable_delegated_tag_budget_query_fails_closed(protected_runtime, database):
+    protected_runtime.client.writer_db = PrismaWrapper(database, iam_token_db_auth=False)
     assert await protected_tag_budget_failure() == ProfileFailure("collector_unavailable")
 
 
@@ -301,7 +320,9 @@ async def test_hung_tag_budget_query_is_cancelled_and_fails_closed(protected_run
 
 @pytest.mark.asyncio
 async def test_tag_budget_policy_uses_authoritative_writer_not_lagging_replica(protected_runtime):
-    protected_runtime.client.writer_db = SimpleNamespace(query_raw=AsyncMock(return_value=[{"configured": True}]))
+    protected_runtime.client.writer_db = PrismaWrapper(
+        SimpleNamespace(query_raw=AsyncMock(return_value=[{"configured": True}])), iam_token_db_auth=False
+    )
     assert await protected_tag_budget_failure() == ProfileFailure("tag_budget_unsupported")
     protected_runtime.client.db.query_raw.assert_not_awaited()
 
