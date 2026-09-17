@@ -2155,6 +2155,8 @@ def exception_type(  # type: ignore
     extra_kwargs={},
 ):
     """Maps an LLM Provider Exception to OpenAI Exception Format"""
+    from litellm.llms.openai_like.json_loader import JSONProviderRegistry
+
     if any(isinstance(original_exception, exc_type) for exc_type in litellm.LITELLM_EXCEPTION_TYPES):
         return original_exception
     exception_mapping_worked = False
@@ -2260,6 +2262,7 @@ def exception_type(  # type: ignore
                 or custom_llm_provider == "text-completion-openai"
                 or custom_llm_provider == "custom_openai"
                 or custom_llm_provider in litellm.openai_compatible_providers
+                or JSONProviderRegistry.exists(custom_llm_provider)
                 or custom_llm_provider == "mistral"
             ):
                 _map_openai_exception(
