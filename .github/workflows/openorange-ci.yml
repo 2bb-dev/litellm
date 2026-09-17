@@ -48,6 +48,7 @@ jobs:
       - name: Run focused fork regressions
         run: |
           uv run --no-sync pytest -q \
+            tests/test_litellm/responses/test_responses_utils.py \
             tests/litellm/test_effective_token_pricing.py \
             tests/test_litellm/litellm_core_utils/llm_cost_calc/test_off_peak_pricing.py \
             tests/test_litellm/litellm_core_utils/llm_cost_calc/test_llm_cost_calc_utils.py \
