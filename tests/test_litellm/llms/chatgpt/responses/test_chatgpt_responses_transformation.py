@@ -124,6 +124,8 @@ class TestChatGPTResponsesAPITransformation:
         )
         logging_obj = MagicMock()
         logging_obj.dynamic_success_callbacks = []
+        # Native usage observation reads the call context from a real mapping.
+        logging_obj.model_call_details = {}
         handler = BaseLLMHTTPHandler()
         handler._call_agentic_completion_hooks = AsyncMock(return_value=None)
 
