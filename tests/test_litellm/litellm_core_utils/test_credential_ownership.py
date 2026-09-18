@@ -113,6 +113,32 @@ def test_explicit_custom_llm_provider_param_is_ambiguous():
     assert (fact["source"], fact["provenance"]) == ("unknown", "ambiguous")
 
 
+@pytest.mark.parametrize("provider", ["openai", "litellm_proxy"])
+def test_router_resolves_environment_key_before_selection(monkeypatch, provider):
+    # Static server configuration binds `api_key: os.environ/NAME`; the Router
+    # resolves it while loading the deployment, so selection digests the real key.
+    monkeypatch.setenv("OPENORANGE_TEST_UPSTREAM_KEY", "synthetic-upstream-key")
+    route = deployment()
+    route["litellm_params"]["model"] = f"{provider}/test-model"
+    route["litellm_params"]["api_key"] = "os.environ/OPENORANGE_TEST_UPSTREAM_KEY"
+    router = litellm.Router(model_list=[route], num_retries=0)
+    loaded = router.get_deployment(model_id="selected-a")
+    assert loaded is not None
+    params = loaded.litellm_params.model_dump(exclude_none=True)
+    assert params["api_key"] == "synthetic-upstream-key"
+    stored = {
+        "model_name": loaded.model_name,
+        "model_info": loaded.model_info.model_dump(exclude_none=True),
+        "litellm_params": params,
+    }
+    fact = ownership_for_spend(resolve_ownership(selected_request(stored), {}, {}), "selected-a")
+    assert (fact["source"], fact["provenance"], fact["deployment_id"]) == (
+        "platform",
+        "route_registration",
+        "selected-a",
+    )
+
+
 @pytest.mark.parametrize("model", ["openrouter/test-model", "chatgpt/test-model", "litellm_proxyx/test-model"])
 def test_unlisted_provider_prefix_stays_ambiguous(model):
     route = deployment()
