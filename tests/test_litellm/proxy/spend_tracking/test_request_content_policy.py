@@ -134,6 +134,54 @@ def test_actual_proxy_and_usage_router_callbacks_fit_the_protected_profile(prote
     assert protected_profile_failure() is None
 
 
+@pytest.mark.asyncio
+async def test_config_refresh_preserves_initialized_callback_identity(protected_runtime, monkeypatch, tmp_path):
+    from litellm.proxy import proxy_server
+
+    callbacks = tmp_path / "callbacks"
+    callbacks.mkdir()
+    (callbacks / "request_context.py").write_text(
+        "from litellm.integrations.custom_logger import CustomLogger\n"
+        "class OpenOrangeRequestContextCallback(CustomLogger):\n"
+        "    pass\n"
+        "handler = OpenOrangeRequestContextCallback()\n"
+    )
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "model_list: []\n"
+        "general_settings:\n"
+        "  store_prompts_in_spend_logs: true\n"
+        "litellm_settings:\n"
+        "  callbacks: [callbacks.request_context.handler]\n"
+    )
+    monkeypatch.delenv("LITELLM_CONFIG_BUCKET_NAME", raising=False)
+    monkeypatch.setattr(proxy_server, "store_model_in_db", False)
+    pc = proxy_server.ProxyConfig()
+    with monkeypatch.context() as startup:
+        startup.setattr(proxy_server, "prisma_client", None)
+        await pc.load_config(router=None, config_file_path=str(config))
+    proxy_server.proxy_logging_obj._init_litellm_callbacks()
+    initialized = next(
+        callback for callback in litellm.callbacks if type(callback).__module__ == "callbacks.request_context"
+    )
+    assert protected_profile_failure() is None
+
+    (callbacks / "request_context.py").unlink()
+    for _ in range(2):
+        pc._add_callbacks_from_db_config({"litellm_settings": {"callbacks": ["callbacks.request_context.handler"]}})
+        assert protected_profile_failure() is None
+        assert sum(callback is initialized for callback in litellm.callbacks) == 1
+        assert not any(isinstance(callback, str) for callback in litellm.callbacks)
+
+    pc._add_callbacks_from_db_config({"litellm_settings": {"callbacks": ["callbacks.request_context.other_handler"]}})
+    assert protected_profile_failure() == ProfileFailure("unsupported_callback")
+    litellm.callbacks.remove("callbacks.request_context.other_handler")
+    litellm.callbacks.remove(initialized)
+    pc._add_callbacks_from_db_config({"litellm_settings": {"callbacks": ["callbacks.request_context.handler"]}})
+    assert "callbacks.request_context.handler" in litellm.callbacks
+    assert protected_profile_failure() == ProfileFailure("unsupported_callback")
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
