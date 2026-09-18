@@ -114,6 +114,7 @@ from litellm.router_utils.cooldown_handlers import (
 from litellm.router_utils.fallback_event_handlers import (
     _check_non_standard_fallback_format,
     get_fallback_model_group,
+    is_invalid_encrypted_content_error,
     run_async_fallback,
 )
 from litellm.router_utils.get_retry_from_policy import (
@@ -5952,7 +5953,9 @@ class Router:
         }
         try:
             return await run_async_fallback(*args, **failover_kwargs)
-        except (openai.APIError, RouterRateLimitError, RouterRateLimitErrorBasic):
+        except (openai.APIError, RouterRateLimitError, RouterRateLimitErrorBasic) as e:
+            if is_invalid_encrypted_content_error(e):
+                raise
             # Expected model-level failure on the retried deployment. All
             # litellm provider errors derive from openai.APIError; if every
             # remaining deployment in the group is in cooldown the router
@@ -5983,7 +5986,7 @@ class Router:
         original_model_group: Optional[str] = kwargs.get("model")  # type: ignore
         fallback_failure_exception_str = ""
 
-        if disable_fallbacks is True or original_model_group is None:
+        if is_invalid_encrypted_content_error(e) or disable_fallbacks is True or original_model_group is None:
             raise e
 
         input_kwargs = {
@@ -6192,6 +6195,8 @@ class Router:
 
                 return response
         except Exception as new_exception:
+            if is_invalid_encrypted_content_error(new_exception):
+                raise
             parent_otel_span = _get_parent_otel_span_from_kwargs(kwargs)
             verbose_router_logger.error(
                 "litellm.router.py::async_function_with_fallbacks() - Error occurred while trying to do fallbacks - {}\n{}\n\nDebug Information:\nCooldown Deployments={}".format(
@@ -6350,6 +6355,8 @@ class Router:
             response = add_retry_headers_to_response(response=response, attempted_retries=0, max_retries=None)
             return response
         except Exception as e:
+            if is_invalid_encrypted_content_error(e):
+                raise
             current_attempt = None
             original_exception = e
             deployment_num_retries = getattr(e, "num_retries", None)
@@ -6436,6 +6443,8 @@ class Router:
                     return response
 
                 except Exception as e:
+                    if is_invalid_encrypted_content_error(e):
+                        raise
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
                     original_exception = e
