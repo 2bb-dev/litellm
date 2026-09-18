@@ -18,6 +18,15 @@ else:
     LitellmRouter = Any
 
 
+def is_invalid_encrypted_content_error(error: Exception) -> bool:
+    if not isinstance(error, litellm.BadRequestError):
+        return False
+    if error.code == "invalid_encrypted_content":
+        return True
+    # Proxy chains can preserve the inner provider code only in the message.
+    return "invalid_encrypted_content" in error.message
+
+
 def _check_stripped_model_group(model_group: str, fallback_key: str) -> bool:
     """
     Handles wildcard routing scenario
@@ -114,7 +123,7 @@ async def run_async_fallback(
     """
 
     ### BASE CASE ### MAX FALLBACK DEPTH REACHED
-    if fallback_depth >= max_fallbacks:
+    if is_invalid_encrypted_content_error(original_exception) or fallback_depth >= max_fallbacks:
         raise original_exception
 
     error_from_fallbacks = original_exception
@@ -154,6 +163,8 @@ async def run_async_fallback(
             )
             return response
         except Exception as e:
+            if is_invalid_encrypted_content_error(e):
+                raise
             error_from_fallbacks = e
             fallback_errors = fallback_errors + (get_fallback_error_info(e),)
             await log_failure_fallback_event(
