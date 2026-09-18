@@ -138,7 +138,7 @@ def parse_public_config(raw: bytes, instance_uid: str) -> EncryptionKey | Captur
 def encrypt_content(
     key: EncryptionKey, record_id: str, content: Mapping[str, JsonValue]
 ) -> ContentEnvelope | CaptureFailure:
-    if not 1 <= len(record_id) <= 512 or any(ord(char) < 32 or ord(char) == 127 for char in record_id):
+    if not 1 <= len(record_id) <= 1024 or any(ord(char) < 32 or ord(char) == 127 for char in record_id):
         return CaptureFailure("invalid_record_id")
     try:
         plaintext = json.dumps(content, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")

@@ -41,7 +41,7 @@ def protected_config(monkeypatch, tmp_path):
     from litellm.proxy.spend_tracking import request_content_encryption
 
     monkeypatch.setattr(request_content_encryption, "_runtime_failure", None)
-    config = {"version": 1, "instanceUid": FIXTURE["instanceUid"], "publicKey": FIXTURE["publicKey"]}
+    config = {"version": 1, "instanceUid": FIXTURE["instanceUid"], "publicKey": copy.deepcopy(FIXTURE["publicKey"])}
     path = tmp_path / "public.json"
     path.write_text(json.dumps(config))
     monkeypatch.setenv(CONFIG_ENV, str(path))
@@ -83,6 +83,37 @@ def test_python_encrypts_with_public_key_only(protected_config):
     header, content = decrypt(first)
     assert header["recordId"] == "test-row-1"
     assert content == FIXTURE["content"]
+
+
+@pytest.mark.parametrize("length", [697, 1024])
+def test_wrapped_response_record_id_survives_capture(protected_config, monkeypatch, length):
+    from litellm.proxy import proxy_server
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    monkeypatch.setattr(proxy_server, "general_settings", {"store_prompts_in_spend_logs": True})
+    response, kwargs = make_call()
+    record_id = "resp_" + "A" * (length - 5)
+    response.id = record_id
+    raw = get_logging_payload(
+        kwargs, response, datetime(2026, 9, 7, tzinfo=timezone.utc), datetime(2026, 9, 7, 0, 0, 1, tzinfo=timezone.utc)
+    )
+    protected = protect_spend_payload(raw)
+    assert protected["request_id"] == record_id
+    assert protected["spend"] == raw["spend"]
+    assert json.loads(protected["metadata"])["openorange_request_log"]["content_status"] == "encrypted"
+    envelope = json.loads(protected["proxy_server_request"])
+    header, content = decrypt(envelope)
+    assert header["recordId"] == record_id
+    assert CANARY in json.dumps(content)
+    assert CANARY not in json.dumps(protected, default=str)
+    assert len(envelope["jwe"].split(".")[0]) <= 2048
+
+
+@pytest.mark.parametrize("record_id", ["", "r" * 1025, "resp_\ninvalid", "resp_\x7finvalid"])
+def test_request_record_id_limit_remains_fail_closed(protected_config, record_id):
+    encryptor = configured_encryptor()
+    assert isinstance(encryptor, RequestContentEncryptor)
+    assert encryptor.encrypt(record_id, {"v": 1}) == CaptureFailure("invalid_record_id")
 
 
 @pytest.mark.parametrize(
