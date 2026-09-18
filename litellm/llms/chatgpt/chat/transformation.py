@@ -55,7 +55,13 @@ class ChatGPTConfig(OpenAIConfig):
             headers, model, messages, optional_params, litellm_params, api_key, api_base
         )
 
-        account_id = self.authenticator.get_account_id()
+        from litellm.litellm_core_utils.terminal_receipt_oauth import AccountSnapshot, record_account
+
+        snapshot = self.authenticator.get_account_snapshot(api_key)
+        account_id = snapshot.account_id if type(snapshot) is AccountSnapshot else self.authenticator.get_account_id()
+        from litellm.litellm_core_utils.terminal_receipt_hooks import CALL_CONTEXT
+
+        record_account(CALL_CONTEXT.validate_python(litellm_params), snapshot)
         session_id = ensure_chatgpt_session_id(litellm_params)
         default_headers = get_chatgpt_default_headers(api_key or "", account_id, session_id)
         final_headers = {**default_headers, **validated_headers}

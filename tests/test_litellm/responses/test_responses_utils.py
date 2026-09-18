@@ -2,21 +2,47 @@ import base64
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
-from fastapi.testclient import TestClient
 
-sys.path.insert(
-    0, os.path.abspath("../../..")
-)  # Adds the parent directory to the system path
+sys.path.insert(0, os.path.abspath("../../.."))  # Adds the parent directory to the system path
 
 import litellm
-from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
 from litellm.responses.utils import ResponseAPILoggingUtils, ResponsesAPIRequestUtils
-from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
+from litellm.types.llms.openai import (
+    ResponseAPIUsage,
+    ResponseCompletedEvent,
+    ResponsesAPIOptionalRequestParams,
+)
 from litellm.types.utils import Usage
+
+
+@pytest.fixture
+def cache_write_deployment() -> Iterator[str]:
+    deployment_id = "openai/cache-write-regression"
+    with patch.dict(litellm.model_cost):
+        litellm.register_model(
+            {
+                deployment_id: {
+                    "litellm_provider": "openai",
+                    "mode": "responses",
+                    "input_cost_per_token": 2e-6,
+                    "output_cost_per_token": 8e-6,
+                    "cache_read_input_token_cost": 0.5e-6,
+                    "cache_creation_input_token_cost": 3e-6,
+                }
+            }
+        )
+        yield deployment_id
+    litellm.utils._invalidate_model_cost_lowercase_map()
+    litellm.utils._cached_get_model_info_helper.cache_clear()
 
 
 class TestResponsesAPIRequestUtils:
@@ -215,10 +241,123 @@ class TestResponseAPILoggingUtils:
         assert result.prompt_tokens == 10
         assert result.completion_tokens == 20
         assert result.total_tokens == 30
-        assert (
-            result.prompt_tokens_details
-            and result.prompt_tokens_details.cached_tokens == 2
+        assert result.prompt_tokens_details and result.prompt_tokens_details.cached_tokens == 2
+
+    @pytest.mark.parametrize("typed", (False, True))
+    @pytest.mark.parametrize("cache_write_tokens", (None, 0, 300))
+    def test_transform_response_api_usage_preserves_cache_writes(
+        self, typed: bool, cache_write_tokens: int | None
+    ) -> None:
+        raw_usage = {
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "total_tokens": 1050,
+            "input_tokens_details": {
+                "cached_tokens": 200,
+                **({"cache_write_tokens": cache_write_tokens} if cache_write_tokens is not None else {}),
+            },
+            "output_tokens_details": {"reasoning_tokens": 20},
+        }
+        original = json.dumps(raw_usage, sort_keys=True)
+        usage = ResponseAPIUsage(**raw_usage) if typed else raw_usage
+
+        result = ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(usage)
+
+        assert result.prompt_tokens == 1000
+        assert result.completion_tokens == 50
+        assert result.total_tokens == 1050
+        assert result.prompt_tokens_details is not None
+        assert result.prompt_tokens_details.cached_tokens == 200
+        assert getattr(result.prompt_tokens_details, "cache_write_tokens", None) == cache_write_tokens
+        assert result.completion_tokens_details is not None
+        assert result.completion_tokens_details.reasoning_tokens == 20
+        assert json.dumps(raw_usage, sort_keys=True) == original
+        assert result.model_dump()["prompt_tokens_details"].get("cache_write_tokens") == cache_write_tokens
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", (False, True))
+    @pytest.mark.parametrize("is_async", (False, True))
+    @pytest.mark.parametrize("cache_write_tokens", (None, 0, 300))
+    @pytest.mark.parametrize("redact", (False, True))
+    async def test_responses_cache_writes_reach_logging_and_cost(
+        self, stream: bool, is_async: bool, cache_write_tokens: int | None, cache_write_deployment: str, redact: bool
+    ) -> None:
+        started = datetime(2026, 9, 7, tzinfo=timezone.utc)
+        logger = Logging(
+            model="gpt-5.5",
+            messages=[],
+            stream=stream,
+            call_type="aresponses" if is_async else "responses",
+            start_time=started,
+            litellm_call_id="cache-write-regression",
+            function_id="cache-write-regression",
         )
+        logger.update_environment_variables(
+            litellm_params={
+                "metadata": {
+                    "model_info": {"id": cache_write_deployment, **litellm.model_cost[cache_write_deployment]}
+                },
+                "aresponses": is_async,
+            },
+            optional_params={},
+            custom_llm_provider="openai",
+        )
+        raw_response = {
+            "id": "resp_cache_write_regression",
+            "object": "response",
+            "created_at": int(started.timestamp()),
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 50,
+                "total_tokens": 1050,
+                "input_tokens_details": {
+                    "cached_tokens": 200,
+                    **({"cache_write_tokens": cache_write_tokens} if cache_write_tokens is not None else {}),
+                },
+                "output_tokens_details": {"reasoning_tokens": 20},
+            },
+        }
+        logger.model_call_details["standard_callback_dynamic_params"] = {"turn_off_message_logging": redact}
+        config = OpenAIResponsesAPIConfig()
+        if stream:
+            iterator = BaseResponsesAPIStreamingIterator(
+                response=httpx.Response(200),
+                model="gpt-5.5",
+                responses_api_provider_config=config,
+                logging_obj=logger,
+                custom_llm_provider="openai",
+            )
+            result = iterator._process_chunk(
+                json.dumps({"type": "response.completed", "sequence_number": 1, "response": raw_response})
+            )
+            assert isinstance(result, ResponseCompletedEvent)
+        else:
+            result = config.transform_response_api_response(
+                model="gpt-5.5", raw_response=httpx.Response(200, json=raw_response), logging_obj=logger
+            )
+
+        if is_async:
+            await logger.async_success_handler(
+                result=result, start_time=started, end_time=started + timedelta(seconds=1)
+            )
+        else:
+            logger.success_handler(result=result, start_time=started, end_time=started + timedelta(seconds=1))
+
+        payload = logger.model_call_details["standard_logging_object"]
+        assert payload is not None
+        assert payload["prompt_tokens"] == 1000
+        assert payload["completion_tokens"] == 50
+        assert payload["total_tokens"] == 1050
+        usage = payload["response"]["usage"]
+        assert usage["prompt_tokens_details"]["cached_tokens"] == 200
+        assert usage["prompt_tokens_details"].get("cache_write_tokens") == cache_write_tokens
+        assert usage["completion_tokens_details"]["reasoning_tokens"] == 20
+        writes = cache_write_tokens or 0
+        expected_cost = (800 - writes) * 2e-6 + 200 * 0.5e-6 + writes * 3e-6 + 50 * 8e-6
+        assert payload["response_cost"] == pytest.approx(expected_cost)
 
     def test_transform_response_api_usage_with_none_values(self):
         """Test transformation handles None values properly"""

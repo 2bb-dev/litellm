@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -36,10 +37,84 @@ from litellm.litellm_core_utils.llm_cost_calc.utils import (
     PromptTokensDetailsResult,
     _calculate_input_cost,
     _get_token_base_cost,
+    _parse_prompt_tokens_details,
     calculate_cache_writing_cost,
     generic_cost_per_token,
+    resolve_token_pricing,
 )
 from litellm.types.utils import CacheCreationTokenDetails, Usage
+
+
+@pytest.mark.parametrize(
+    "writes,creation,expected",
+    ((None, None, 0), (0, 0, 0), (300, None, 300), (None, 300, 300), (300, 300, 300), (300, 100, 300), (0, 300, 300)),
+)
+def test_parse_prompt_tokens_details_cache_write_alias(writes: int | None, creation: int | None, expected: int) -> None:
+    usage = Usage(
+        prompt_tokens=1000,
+        completion_tokens=50,
+        prompt_tokens_details=PromptTokensDetailsWrapper(
+            cached_tokens=200,
+            cache_write_tokens=writes,
+            cache_creation_tokens=creation,
+        ),
+    )
+    result = _parse_prompt_tokens_details(usage)
+    assert result["cache_creation_tokens"] == expected
+    assert result["cache_hit_tokens"] == 200
+
+
+@pytest.mark.parametrize("write_rate", (None, 0.0, 3e-6))
+@pytest.mark.parametrize("tokens,input_rate", ((199999, 2e-6), (200001, 4e-6)))
+@pytest.mark.parametrize("off_peak", (False, True))
+def test_cache_write_price_defaults_to_effective_input_rate(
+    write_rate: float | None, tokens: int, input_rate: float, off_peak: bool
+) -> None:
+    rates = resolve_token_pricing(
+        ModelInfo(
+            input_cost_per_token=2e-6,
+            output_cost_per_token=8e-6,
+            input_cost_per_token_above_200k_tokens=4e-6,
+            cache_creation_input_token_cost=write_rate,
+            off_peak_pricing={"hours_utc": "00:00-01:00", "input_cost_per_token": 1e-6},
+        ),
+        Usage(prompt_tokens=tokens, completion_tokens=0),
+        None,
+        datetime(2026, 9, 7, 0 if off_peak else 2, tzinfo=timezone.utc),
+    )
+    expected_input_rate = 1e-6 if off_peak else input_rate
+    assert rates["input_cost_per_token"] == expected_input_rate
+    assert rates["cache_creation_input_token_cost"] == (expected_input_rate if write_rate is None else write_rate)
+
+
+@pytest.mark.parametrize("write_rate", (None, 0.0, 3e-6))
+@pytest.mark.parametrize(
+    "instant,expected_input",
+    (("2026-09-07T00:30:00+00:00", 1e-6), ("2026-09-07T02:00:00+00:00", 2e-6), ("2026-09-10T00:00:00+00:00", 4e-6)),
+)
+def test_cache_write_fallback_uses_dated_recurring_rate(
+    write_rate: float | None, instant: str, expected_input: float
+) -> None:
+    rates = resolve_token_pricing(
+        ModelInfo(
+            input_cost_per_token=8e-6,
+            output_cost_per_token=9e-6,
+            cache_creation_input_token_cost=write_rate,
+            off_peak_pricing={"hours_utc": "00:00-01:00", "input_cost_per_token": 4e-6},
+            pricing_periods=[
+                {
+                    "effective_until": "2026-09-10T00:00:00Z",
+                    "input_cost_per_token": 2e-6,
+                    "off_peak_pricing": {"hours_utc": "00:00-01:00", "input_cost_per_token": 1e-6},
+                }
+            ],
+        ),
+        Usage(prompt_tokens=1000, completion_tokens=0),
+        None,
+        datetime.fromisoformat(instant),
+    )
+    assert rates["input_cost_per_token"] == expected_input
+    assert rates["cache_creation_input_token_cost"] == (expected_input if write_rate is None else write_rate)
 
 
 def test_reasoning_tokens_no_price_set():

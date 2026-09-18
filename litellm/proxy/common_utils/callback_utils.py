@@ -1,6 +1,8 @@
 import copy
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Optional
 
+from pydantic import TypeAdapter
+
 import litellm
 from litellm import get_secret
 from litellm._logging import verbose_proxy_logger
@@ -19,6 +21,7 @@ from litellm.types.utils import (
 )
 
 _CALLBACK_VAR_MASKER = SensitiveDataMasker()
+_CALLBACK_OBJECTS: TypeAdapter[tuple[object, ...]] = TypeAdapter(tuple[object, ...])
 # Compound names that are credential-bearing but don't contain any of the
 # default sensitive segments (so SensitiveDataMasker won't flag them).
 _EXTRA_SENSITIVE_CALLBACK_KEYS = {"gcs_path_service_account"}
@@ -42,7 +45,7 @@ def initialize_callbacks_on_proxy(
     config_file_path: str,
     litellm_settings: dict,
     callback_specific_params: Optional[dict] = None,
-):
+) -> dict[str, object]:
     if not isinstance(callback_specific_params, dict):
         callback_specific_params = {}
     from litellm.integrations.custom_logger import CustomLogger
@@ -305,6 +308,13 @@ def initialize_callbacks_on_proxy(
             from litellm.integrations.prometheus import PrometheusLogger
 
             PrometheusLogger._mount_metrics_endpoint()
+        resolved_callbacks: dict[str, object] = {
+            name: instance
+            for name, instance in zip(
+                _CALLBACK_OBJECTS.validate_python(value), _CALLBACK_OBJECTS.validate_python(imported_list)
+            )
+            if isinstance(name, str) and not isinstance(instance, str)
+        }
     else:
         litellm.callbacks = [
             get_instance_fn(
@@ -312,7 +322,11 @@ def initialize_callbacks_on_proxy(
                 config_file_path=config_file_path,
             )
         ]
+        resolved_callbacks = (
+            {value: _CALLBACK_OBJECTS.validate_python(vars(litellm)["callbacks"])[0]} if isinstance(value, str) else {}
+        )
     verbose_proxy_logger.debug(f"{blue_color_code} Initialized Callbacks - {litellm.callbacks} {reset_color_code}")
+    return resolved_callbacks
 
 
 def get_model_group_from_litellm_kwargs(kwargs: dict) -> Optional[str]:

@@ -196,15 +196,31 @@ class DBSpendUpdateWriter:
             request_tags = copy.deepcopy(payload.get("request_tags"))
 
             # Keep _insert_spend_log_to_db awaited inline (not a task, preserve current behavior)
+            from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP as TERMINAL_STAMP
+            from litellm.litellm_core_utils.terminal_receipt_hooks import (
+                OPAQUE_VALUE,
+                failure_updates_were_queued,
+                mark_failure_updates_queued,
+            )
+
+            terminal_failure = (
+                OPAQUE_VALUE.validate_python((kwargs or {}).get(TERMINAL_STAMP))
+                if payload.get("status") == "failure"
+                else None
+            )
             if disable_spend_logs is False:
                 await self._insert_spend_log_to_db(
                     payload=copy.deepcopy(payload),
                     prisma_client=prisma_client,
+                    terminal_failure=terminal_failure,
                 )
             else:
                 verbose_proxy_logger.debug(
                     "disable_spend_logs=True. Skipping writing spend logs to db. Other spend updates - Key/User/Team table will still occur."
                 )
+
+            if failure_updates_were_queued(terminal_failure):
+                return
 
             # Single task replaces 11 create_task() calls
             asyncio.create_task(
@@ -222,6 +238,7 @@ class DBSpendUpdateWriter:
                     request_tags=request_tags,
                 )
             )
+            mark_failure_updates_queued(terminal_failure)
 
             if not encryption_enabled():
                 self._enqueue_tool_registry_upsert(
@@ -742,6 +759,7 @@ class DBSpendUpdateWriter:
         payload: Union[dict, SpendLogsPayload],
         prisma_client: Optional[PrismaClient] = None,
         spend_logs_url: Optional[str] = os.getenv("SPEND_LOGS_URL"),
+        terminal_failure: object = None,
     ) -> Optional[PrismaClient]:
         verbose_proxy_logger.debug(
             "Writing spend log to db - request_id: {}, spend: {}".format(
@@ -749,7 +767,12 @@ class DBSpendUpdateWriter:
             )
         )
         if prisma_client is not None:
-            await enqueue_spend_log(prisma_client, dict(payload))
+            durable = await enqueue_spend_log(prisma_client, dict(payload))
+            if durable:
+                from litellm.litellm_core_utils.terminal_receipt_hooks import attempt_row_id, mark_failure_persisted
+
+                if payload.get("status") == "failure" and payload.get("request_id") == attempt_row_id(terminal_failure):
+                    mark_failure_persisted(terminal_failure)
         else:
             verbose_proxy_logger.debug("prisma_client is None. Skipping writing spend logs to db.")
 

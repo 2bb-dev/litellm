@@ -277,13 +277,13 @@ def create_spend_log_spool_from_env() -> Optional[SQLiteSpendLogSpool]:
     return spool
 
 
-async def enqueue_spend_log(prisma_client: Any, payload: Dict[str, Any]) -> None:
+async def enqueue_spend_log(prisma_client: Any, payload: Dict[str, Any]) -> bool:
     """Persist a row, falling back to memory if the local spool is unavailable."""
     spool = getattr(prisma_client, "_spend_log_spool", None)
     if spool is not None:
         try:
             await spool.enqueue(payload)
-            return
+            return True
         except Exception as error:
             verbose_proxy_logger.error(
                 "Spend tracking - durable enqueue failed; retaining row in memory. error=%s",
@@ -292,6 +292,7 @@ async def enqueue_spend_log(prisma_client: Any, payload: Dict[str, Any]) -> None
 
     async with prisma_client._spend_log_transactions_lock:
         prisma_client.spend_log_transactions.append(payload)
+    return False
 
 
 async def spend_log_queue_stats(prisma_client: Any) -> SpendLogQueueStats:

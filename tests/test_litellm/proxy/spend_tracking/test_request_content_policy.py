@@ -18,6 +18,7 @@ from litellm.litellm_core_utils.request_content_mode import (
     protection_marker_path,
 )
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.db.prisma_client import PrismaWrapper
 from litellm.proxy.db.spend_log_queue import SQLiteSpendLogSpool
 from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger, _get_request_tags_for_cost_tracking
 from litellm.proxy.spend_tracking.request_content_encryption import CaptureFailure, INSTANCE_ENV, configured_encryptor
@@ -68,7 +69,7 @@ def protected_runtime(monkeypatch, tmp_path):
         spend_log_transactions=[],
         db=SimpleNamespace(query_raw=AsyncMock(return_value=[{"configured": False}])),
     )
-    client.writer_db = client.db
+    client.writer_db = PrismaWrapper(client.db, iam_token_db_auth=False)
     collector = _ProxyDBLogger()
     for name in CALLBACK_LISTS:
         monkeypatch.setattr(litellm, name, [])
@@ -131,6 +132,54 @@ def test_actual_proxy_and_usage_router_callbacks_fit_the_protected_profile(prote
     monkeypatch.setattr(proxy_server, "llm_router", router)
     proxy_server.proxy_logging_obj._init_litellm_callbacks(llm_router=router)
     assert protected_profile_failure() is None
+
+
+@pytest.mark.asyncio
+async def test_config_refresh_preserves_initialized_callback_identity(protected_runtime, monkeypatch, tmp_path):
+    from litellm.proxy import proxy_server
+
+    callbacks = tmp_path / "callbacks"
+    callbacks.mkdir()
+    (callbacks / "request_context.py").write_text(
+        "from litellm.integrations.custom_logger import CustomLogger\n"
+        "class OpenOrangeRequestContextCallback(CustomLogger):\n"
+        "    pass\n"
+        "handler = OpenOrangeRequestContextCallback()\n"
+    )
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "model_list: []\n"
+        "general_settings:\n"
+        "  store_prompts_in_spend_logs: true\n"
+        "litellm_settings:\n"
+        "  callbacks: [callbacks.request_context.handler]\n"
+    )
+    monkeypatch.delenv("LITELLM_CONFIG_BUCKET_NAME", raising=False)
+    monkeypatch.setattr(proxy_server, "store_model_in_db", False)
+    pc = proxy_server.ProxyConfig()
+    with monkeypatch.context() as startup:
+        startup.setattr(proxy_server, "prisma_client", None)
+        await pc.load_config(router=None, config_file_path=str(config))
+    proxy_server.proxy_logging_obj._init_litellm_callbacks()
+    initialized = next(
+        callback for callback in litellm.callbacks if type(callback).__module__ == "callbacks.request_context"
+    )
+    assert protected_profile_failure() is None
+
+    (callbacks / "request_context.py").unlink()
+    for _ in range(2):
+        pc._add_callbacks_from_db_config({"litellm_settings": {"callbacks": ["callbacks.request_context.handler"]}})
+        assert protected_profile_failure() is None
+        assert sum(callback is initialized for callback in litellm.callbacks) == 1
+        assert not any(isinstance(callback, str) for callback in litellm.callbacks)
+
+    pc._add_callbacks_from_db_config({"litellm_settings": {"callbacks": ["callbacks.request_context.other_handler"]}})
+    assert protected_profile_failure() == ProfileFailure("unsupported_callback")
+    litellm.callbacks.remove("callbacks.request_context.other_handler")
+    litellm.callbacks.remove(initialized)
+    pc._add_callbacks_from_db_config({"litellm_settings": {"callbacks": ["callbacks.request_context.handler"]}})
+    assert "callbacks.request_context.handler" in litellm.callbacks
+    assert protected_profile_failure() == ProfileFailure("unsupported_callback")
 
 
 @pytest.mark.parametrize(
@@ -259,6 +308,7 @@ async def test_tag_budget_profile_query_never_sends_request_tags_to_caches(prote
         await call
     cache.async_get_cache.assert_not_awaited()
     cache.async_set_cache.assert_not_awaited()
+    protected_runtime.client.db.query_raw.assert_awaited_once()
     assert CANARY not in str(protected_runtime.client.db.query_raw.call_args)
     assert _get_request_tags_for_cost_tracking({"request_tags": [CANARY]}, {"tags": [CANARY]}) is None
 
@@ -266,6 +316,23 @@ async def test_tag_budget_profile_query_never_sends_request_tags_to_caches(prote
 @pytest.mark.asyncio
 async def test_unreadable_tag_budget_configuration_fails_closed(protected_runtime):
     protected_runtime.client.db.query_raw.side_effect = RuntimeError(CANARY)
+    assert await protected_tag_budget_failure() == ProfileFailure("collector_unavailable")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [[], [{"configured": "false"}], [{"configured": False}, {"configured": False}]])
+async def test_malformed_delegated_tag_budget_result_fails_closed(protected_runtime, result):
+    protected_runtime.client.db.query_raw.return_value = result
+    assert await protected_tag_budget_failure() == ProfileFailure("collector_unavailable")
+    protected_runtime.client.db.query_raw.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "database", [SimpleNamespace(), SimpleNamespace(query_raw=None), SimpleNamespace(query_raw=Mock(return_value=[]))]
+)
+async def test_unavailable_delegated_tag_budget_query_fails_closed(protected_runtime, database):
+    protected_runtime.client.writer_db = PrismaWrapper(database, iam_token_db_auth=False)
     assert await protected_tag_budget_failure() == ProfileFailure("collector_unavailable")
 
 
@@ -301,7 +368,9 @@ async def test_hung_tag_budget_query_is_cancelled_and_fails_closed(protected_run
 
 @pytest.mark.asyncio
 async def test_tag_budget_policy_uses_authoritative_writer_not_lagging_replica(protected_runtime):
-    protected_runtime.client.writer_db = SimpleNamespace(query_raw=AsyncMock(return_value=[{"configured": True}]))
+    protected_runtime.client.writer_db = PrismaWrapper(
+        SimpleNamespace(query_raw=AsyncMock(return_value=[{"configured": True}])), iam_token_db_auth=False
+    )
     assert await protected_tag_budget_failure() == ProfileFailure("tag_budget_unsupported")
     protected_runtime.client.db.query_raw.assert_not_awaited()
 

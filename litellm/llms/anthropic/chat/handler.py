@@ -67,6 +67,7 @@ from ..common_utils import AnthropicError, process_anthropic_headers
 from .transformation import ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY, AnthropicConfig
 
 if TYPE_CHECKING:
+    from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
     from litellm.llms.base_llm.chat.transformation import BaseConfig
 
@@ -78,7 +79,7 @@ async def make_call(
     data: str,
     model: str,
     messages: list,
-    logging_obj,
+    logging_obj: "Logging",
     timeout: Union[float, httpx.Timeout] | None,
     json_mode: bool,
     speed: str | None = None,
@@ -112,8 +113,11 @@ async def make_call(
                 raise e
         raise AnthropicError(status_code=500, message=str(e))
 
+    from litellm.litellm_core_utils.terminal_receipt_hooks import CALL_CONTEXT
+    from litellm.litellm_core_utils.terminal_usage_observation import observe_lines_async
+
     completion_stream = ModelResponseIterator(
-        streaming_response=response.aiter_lines(),
+        streaming_response=observe_lines_async(response.aiter_lines(), CALL_CONTEXT.validate_python(logging_obj.model_call_details)),
         sync_stream=False,
         json_mode=json_mode,
         speed=speed,
@@ -138,7 +142,7 @@ def make_sync_call(
     data: str,
     model: str,
     messages: list,
-    logging_obj,
+    logging_obj: "Logging",
     timeout: Union[float, httpx.Timeout] | None,
     json_mode: bool,
     speed: str | None = None,
@@ -180,8 +184,11 @@ def make_sync_call(
             headers=response_headers,
         )
 
+    from litellm.litellm_core_utils.terminal_receipt_hooks import CALL_CONTEXT
+    from litellm.litellm_core_utils.terminal_usage_observation import observe_lines
+
     completion_stream = ModelResponseIterator(
-        streaming_response=response.iter_lines(),
+        streaming_response=observe_lines(response.iter_lines(), CALL_CONTEXT.validate_python(logging_obj.model_call_details)),
         sync_stream=True,
         json_mode=json_mode,
         speed=speed,

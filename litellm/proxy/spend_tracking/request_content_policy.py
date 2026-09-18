@@ -3,10 +3,10 @@
 import asyncio
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import MethodType
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal
 
 from fastapi import HTTPException
 from pydantic import TypeAdapter, ValidationError
@@ -18,6 +18,7 @@ from litellm.proxy.spend_tracking.request_content_encryption import encryption_r
 _FIELDS: TypeAdapter[Mapping[str, object]] = TypeAdapter(Mapping[str, object])
 _ROWS: TypeAdapter[tuple[Mapping[str, object], ...]] = TypeAdapter(tuple[Mapping[str, object], ...])
 _CALLBACKS: TypeAdapter[tuple[object, ...]] = TypeAdapter(tuple[object, ...])
+_BUDGET_QUERY: TypeAdapter[Callable[[str], Awaitable[object]]] = TypeAdapter(Callable[[str], Awaitable[object]])
 _CALLBACK_LISTS = (
     "callbacks",
     "input_callback",
@@ -98,11 +99,6 @@ class ProfileFailure:
 class ProtectedProfileUnavailable(HTTPException):
     def __init__(self) -> None:
         super().__init__(status_code=503, detail="Encrypted request logging is unavailable")
-
-
-@runtime_checkable
-class BudgetQuery(Protocol):
-    async def query_raw(self, query: str) -> object: ...
 
 
 def _class_name(value: object) -> str:
@@ -209,13 +205,11 @@ async def protected_tag_budget_failure() -> ProfileFailure | None:
 
     if prisma_client is None:
         return ProfileFailure("collector_unavailable")
-    database: object = prisma_client.writer_db
-    if not isinstance(database, BudgetQuery):
-        return ProfileFailure("collector_unavailable")
     try:
+        query_raw = _BUDGET_QUERY.validate_python(getattr(prisma_client.writer_db, "query_raw", None))
         rows = _ROWS.validate_python(
             await asyncio.wait_for(
-                database.query_raw(
+                query_raw(
                     'SELECT EXISTS (SELECT 1 FROM "LiteLLM_TagTable" t '
                     'JOIN "LiteLLM_BudgetTable" b ON b.budget_id = t.budget_id '
                     "WHERE b.max_budget IS NOT NULL) AS configured"

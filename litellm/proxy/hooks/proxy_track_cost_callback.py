@@ -35,8 +35,51 @@ from litellm.utils import get_end_user_id_for_cost_tracking
 
 
 class _ProxyDBLogger(CustomLogger):
-    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+    async def async_log_success_event(
+        self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+    ) -> None:
         await self._PROXY_track_cost_callback(kwargs, response_obj, start_time, end_time)
+
+    async def async_log_failure_event(
+        self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+    ) -> None:
+        from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP
+        from litellm.litellm_core_utils.terminal_receipt_hooks import (
+            CALL_CONTEXT,
+            Session,
+            attempt_row_id,
+            failure_was_persisted,
+        )
+
+        session = kwargs.get(STAMP)
+        if type(session) is not Session or attempt_row_id(session) is None:
+            return
+        async with session.failure_lock:
+            if failure_was_persisted(session):
+                return
+            from litellm.proxy.proxy_server import proxy_logging_obj
+
+            params = CALL_CONTEXT.validate_python(kwargs.get("litellm_params") or {})
+            metadata = CALL_CONTEXT.validate_python(get_litellm_metadata_from_kwargs(kwargs=kwargs))
+            cost = kwargs.get("response_cost")
+            identities = {key: value if isinstance(value, str) else None for key, value in metadata.items()}
+            failed_metadata = {**metadata, "status": "failure"}
+            failed_kwargs = {
+                **kwargs,
+                "litellm_params": {**params, "metadata": failed_metadata, "litellm_metadata": failed_metadata},
+            }
+            await proxy_logging_obj.db_spend_update_writer.update_database(
+                token=identities.get("user_api_key"),
+                response_cost=max(float(cost), 0.0) if isinstance(cost, (int, float)) else 0.0,
+                user_id=identities.get("user_api_key_user_id"),
+                end_user_id=get_end_user_id_for_cost_tracking(params),
+                team_id=identities.get("user_api_key_team_id"),
+                org_id=identities.get("user_api_key_org_id"),
+                kwargs=failed_kwargs,
+                completion_response=response_obj,
+                start_time=start_time,
+                end_time=end_time,
+            )
 
     async def async_post_call_failure_hook(
         self,
@@ -44,7 +87,25 @@ class _ProxyDBLogger(CustomLogger):
         original_exception: Exception,
         user_api_key_dict: UserAPIKeyAuth,
         traceback_str: Optional[str] = None,
+        terminal_details: Optional[dict[str, object]] = None,
     ):
+        from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP
+        from litellm.litellm_core_utils.terminal_receipt_hooks import CALL_CONTEXT, OPAQUE_VALUE, attempt_row_id
+
+        logger = OPAQUE_VALUE.validate_python(request_data.get("litellm_logging_obj"))
+        details = (
+            terminal_details
+            if terminal_details is not None
+            else CALL_CONTEXT.validate_python(getattr(logger, "model_call_details", {}))
+        )
+        if attempt_row_id(details.get(STAMP)) is not None:
+            await self.async_log_failure_event(
+                details,
+                None,
+                start_time if isinstance(start_time := details.get("start_time"), datetime) else datetime.now(),
+                end_time if isinstance(end_time := details.get("end_time"), datetime) else datetime.now(),
+            )
+            return
         try:
             await _release_budget_reservation(budget_reservation=user_api_key_dict.budget_reservation)
         except Exception:

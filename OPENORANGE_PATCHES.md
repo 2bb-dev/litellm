@@ -3,6 +3,11 @@
 `main` mirrors upstream LiteLLM. `openorange` is the production integration
 branch consumed by OpenOrange through an exact submodule commit.
 
+Layer and Platform pin only commits reachable from `openorange`. Never pin an
+open pull-request head: stacked topic branches that ship through a pin drift
+away from `openorange`, and the next pin taken from the integration branch then
+silently drops their behavior. Land the stack first, then pin the merge commit.
+
 ## Fork Invariants
 
 Upstream syncs must preserve these behaviors:
@@ -86,6 +91,8 @@ Without the flag, existing exclusive thresholds are unchanged.
 - `tests/llm_responses_api_testing/test_base_responses_api_streaming_iterator.py`
 - `tests/test_litellm/proxy/test_litellm_pre_call_utils.py`
 - `tests/test_litellm/proxy/spend_tracking/test_spend_tracking_utils.py`
+- `tests/test_litellm/litellm_core_utils/test_credential_ownership.py`
+- `tests/test_litellm/litellm_core_utils/test_native_credential_ownership.py`
 - `tests/test_litellm/integrations/test_langfuse.py`
 - `tests/test_litellm/proxy/db/test_db_spend_update_writer.py`
 - `tests/proxy_unit_tests/test_update_spend.py`

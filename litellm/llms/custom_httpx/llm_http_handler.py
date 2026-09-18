@@ -450,6 +450,12 @@ class BaseLLMHTTPHandler:
             litellm_params=litellm_params,
         )
 
+        if custom_llm_provider == "chatgpt":
+            from litellm.litellm_core_utils.terminal_receipt_hooks import CALL_CONTEXT
+            from litellm.litellm_core_utils.terminal_receipt_oauth import bind_account
+
+            bind_account(CALL_CONTEXT.validate_python(litellm_params), logging_obj.model_call_details)
+
         api_base = provider_config.get_complete_url(
             api_base=api_base,
             api_key=api_key,
@@ -629,7 +635,7 @@ class BaseLLMHTTPHandler:
         original_data: dict,
         model: str,
         messages: list,
-        logging_obj,
+        logging_obj: LiteLLMLoggingObj,
         optional_params: dict,
         litellm_params: dict,
         timeout: Union[float, httpx.Timeout],
@@ -678,8 +684,10 @@ class BaseLLMHTTPHandler:
 
             completion_stream: Any = MockResponseIterator(model_response=model_response, json_mode=json_mode)
         else:
+            from litellm.litellm_core_utils.terminal_usage_observation import observe_lines
+
             completion_stream = provider_config.get_model_response_iterator(
-                streaming_response=response.iter_lines(),
+                streaming_response=observe_lines(response.iter_lines(), logging_obj.model_call_details),
                 sync_stream=True,
                 json_mode=json_mode,
             )
@@ -814,8 +822,10 @@ class BaseLLMHTTPHandler:
 
             completion_stream: Any = MockResponseIterator(model_response=model_response, json_mode=json_mode)
         else:
+            from litellm.litellm_core_utils.terminal_usage_observation import observe_lines_async
+
             completion_stream = provider_config.get_model_response_iterator(
-                streaming_response=response.aiter_lines(), sync_stream=False
+                streaming_response=observe_lines_async(response.aiter_lines(), logging_obj.model_call_details), sync_stream=False
             )
             if isinstance(completion_stream, BaseModelResponseIterator):
                 completion_stream.http_response = response
@@ -2371,6 +2381,11 @@ class BaseLLMHTTPHandler:
             litellm_params=litellm_params,
         )
 
+        if custom_llm_provider == "chatgpt":
+            from litellm.litellm_core_utils.terminal_receipt_oauth import bind_account
+
+            bind_account(dict(litellm_params), logging_obj.model_call_details, responses=True)
+
         if extra_headers:
             headers.update(extra_headers)
 
@@ -2448,6 +2463,7 @@ class BaseLLMHTTPHandler:
                     headers=headers,
                     timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
                     stream=stream,
+                    logging_obj=logging_obj,
                     **body_kwargs,
                 )
                 if fake_stream is True:
@@ -2478,6 +2494,7 @@ class BaseLLMHTTPHandler:
                     headers=headers,
                     timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
                     stream=stream,
+                    logging_obj=logging_obj,
                     **body_kwargs,
                 )
                 if stream:
@@ -2566,6 +2583,11 @@ class BaseLLMHTTPHandler:
             litellm_params=litellm_params,
         )
 
+        if custom_llm_provider == "chatgpt":
+            from litellm.litellm_core_utils.terminal_receipt_oauth import bind_account
+
+            bind_account(dict(litellm_params), logging_obj.model_call_details, responses=True)
+
         if extra_headers:
             headers.update(extra_headers)
 
@@ -2640,6 +2662,7 @@ class BaseLLMHTTPHandler:
                     headers=headers,
                     timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
                     stream=stream,
+                    logging_obj=logging_obj,
                     **body_kwargs,
                 )
 
@@ -2672,6 +2695,7 @@ class BaseLLMHTTPHandler:
                     headers=headers,
                     timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
                     stream=stream,
+                    logging_obj=logging_obj,
                     **body_kwargs,
                 )
                 if stream:

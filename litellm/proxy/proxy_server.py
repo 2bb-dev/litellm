@@ -3479,6 +3479,7 @@ class ProxyConfig:
 
     def __init__(self) -> None:
         self.config: Dict[str, Any] = {}
+        self._initialized_callback_objects: dict[str, object] = {}
         self._last_semantic_filter_config: Optional[Dict[str, Any]] = None
         self._last_hashicorp_vault_config: Optional[Dict[str, Any]] = None
         self.worker_registry: List["WorkerRegistryEntry"] = []
@@ -4089,12 +4090,15 @@ class ProxyConfig:
 
                     litellm.priority_reservation_settings = PriorityReservationSettings(**value)
                 elif key == "callbacks":
-                    initialize_callbacks_on_proxy(
-                        value=value,
-                        premium_user=premium_user,
-                        config_file_path=config_file_path,
-                        litellm_settings=litellm_settings,
-                        callback_specific_params=callback_settings,
+                    self._initialized_callback_objects = (
+                        initialize_callbacks_on_proxy(
+                            value=value,
+                            premium_user=premium_user,
+                            config_file_path=config_file_path,
+                            litellm_settings=litellm_settings,
+                            callback_specific_params=callback_settings,
+                        )
+                        or {}
                     )
 
                 elif key == "model_group_settings":
@@ -5058,6 +5062,11 @@ class ProxyConfig:
             event_types: List of event types (e.g., ["success"], ["failure"], or ["success", "failure"])
             existing_callbacks: The existing callback list to check against
         """
+        initialized = self._initialized_callback_objects.get(callback)
+        if initialized is not None and any(
+            existing is initialized for existing in cast(List[object], existing_callbacks)
+        ):
+            return
         if callback in litellm._known_custom_logger_compatible_callbacks:
             for event_type in event_types:
                 _add_custom_logger_callback_to_specific_event(callback, event_type)
