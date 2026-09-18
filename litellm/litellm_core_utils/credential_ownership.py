@@ -284,8 +284,12 @@ def resolve_ownership(
         or any(request.get(key) is not None for key in ("mock_response", "mock_tool_calls", "mock_timeout"))
     ):
         return _stamp(selection, None, "ambiguous")
+    # Inspected transports only. ``litellm_proxy/`` is the OpenAI-compatible
+    # connection to a configured upstream proxy: a registration there attests
+    # the connection credential and the local deployment, never the terminal
+    # supplier credential behind that proxy.
     if request.get("model") != selection.model or not (selection.model or "").startswith(
-        ("openai/", "veniceai/", "anthropic/", "deepseek/")
+        ("openai/", "veniceai/", "anthropic/", "deepseek/", "litellm_proxy/")
     ):
         return _stamp(selection, None, "ambiguous")
     if request.get("litellm_credential_name") != selection.credential_name:

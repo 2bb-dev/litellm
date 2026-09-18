@@ -50,9 +50,11 @@ def selected_request(route, overrides=None):
     }
 
 
+@pytest.mark.parametrize("provider", ["openai", "litellm_proxy"])
 @pytest.mark.parametrize("source", ["platform", "byok"])
-def test_explicit_route_registration_and_immutable_stamp(source):
+def test_explicit_route_registration_and_immutable_stamp(source, provider):
     route = deployment(source)
+    route["litellm_params"]["model"] = f"{provider}/test-model"
     request = selected_request(route)
     stamp = resolve_ownership(request, {}, {})
     route["model_info"][FIELD]["source"] = "byok" if source == "platform" else "platform"
@@ -74,7 +76,7 @@ def test_explicit_route_registration_and_immutable_stamp(source):
         {"azure_ad_token": "synthetic"},
     ],
 )
-@pytest.mark.parametrize("provider", ["openai", "veniceai"])
+@pytest.mark.parametrize("provider", ["openai", "veniceai", "litellm_proxy"])
 def test_request_overrides_never_inherit_ownership(override, provider):
     route = deployment()
     route["litellm_params"]["model"] = f"{provider}/test-model"
@@ -82,7 +84,7 @@ def test_request_overrides_never_inherit_ownership(override, provider):
     assert ownership_for_spend(stamp, "selected-a")["provenance"] == "credential_override"
 
 
-@pytest.mark.parametrize("provider", ["openai", "veniceai"])
+@pytest.mark.parametrize("provider", ["openai", "veniceai", "litellm_proxy"])
 def test_late_hook_override_and_unregistered_environment_key_are_unknown(provider):
     route = deployment()
     route["litellm_params"]["model"] = f"{provider}/test-model"
@@ -92,6 +94,31 @@ def test_late_hook_override_and_unregistered_environment_key_are_unknown(provide
     route["model_info"].pop(FIELD)
     route["litellm_params"]["api_key"] = "os.environ/PLATFORM_KEY"
     assert ownership_for_spend(resolve_ownership(selected_request(route), {}, {}), "selected-a")["source"] == "unknown"
+
+
+@pytest.mark.parametrize("provider", ["openai", "litellm_proxy"])
+def test_registered_route_with_unresolved_environment_key_is_credential_override(provider):
+    route = deployment()
+    route["litellm_params"]["model"] = f"{provider}/test-model"
+    route["litellm_params"]["api_key"] = "os.environ/PLATFORM_KEY"
+    fact = ownership_for_spend(resolve_ownership(selected_request(route), {}, {}), "selected-a")
+    assert (fact["source"], fact["provenance"]) == ("unknown", "credential_override")
+
+
+def test_explicit_custom_llm_provider_param_is_ambiguous():
+    route = deployment()
+    route["litellm_params"]["model"] = "litellm_proxy/test-model"
+    route["litellm_params"]["custom_llm_provider"] = "litellm_proxy"
+    fact = ownership_for_spend(resolve_ownership(selected_request(route), {}, {}), "selected-a")
+    assert (fact["source"], fact["provenance"]) == ("unknown", "ambiguous")
+
+
+@pytest.mark.parametrize("model", ["openrouter/test-model", "chatgpt/test-model", "litellm_proxyx/test-model"])
+def test_unlisted_provider_prefix_stays_ambiguous(model):
+    route = deployment()
+    route["litellm_params"]["model"] = model
+    fact = ownership_for_spend(resolve_ownership(selected_request(route), {}, {}), "selected-a")
+    assert (fact["source"], fact["provenance"]) == ("unknown", "ambiguous")
 
 
 @pytest.mark.parametrize("metadata_key", ["metadata", "litellm_metadata"])
@@ -216,7 +243,7 @@ def test_projection_rejects_mismatched_selected_deployment():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider", ["openai", "veniceai"])
+@pytest.mark.parametrize("provider", ["openai", "veniceai", "litellm_proxy"])
 @pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("synchronous", [False, True])
 async def test_real_router_sdk_callbacks_stamp_actual_completed_credential(
@@ -320,14 +347,14 @@ async def test_real_router_sdk_callbacks_stamp_actual_completed_credential(
         assert fact["source"] == ("byok" if fallback else primary_source), fact
         assert kwargs["litellm_params"]["metadata"]["model_info"]["id"] == expected_id
         assert response.usage.total_tokens == 12
-        if provider == "veniceai":
+        if provider in ("veniceai", "litellm_proxy"):
             from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
 
             row = get_logging_payload(kwargs, response, datetime.now(timezone.utc), datetime.now(timezone.utc))
             metadata = json.loads(row["metadata"])
             assert metadata[FIELD] == fact
             assert row["model_id"] == expected_id
-            assert row["custom_llm_provider"] == "veniceai"
+            assert row["custom_llm_provider"] == provider
             assert row["request_id"] == response.id
             assert (row["prompt_tokens"], row["completion_tokens"]) == (9, 3)
             assert "openorange_terminal_evidence" not in metadata
