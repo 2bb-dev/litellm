@@ -3,13 +3,14 @@
 from uuid import uuid4
 
 import pytest
-from openai.types.chat import ChatCompletion
+from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
 from litellm.litellm_core_utils.credential_ownership import strip_ownership
 from litellm.litellm_core_utils.terminal_receipt_client import Authority
 from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP, Terminal
 from litellm.litellm_core_utils.terminal_usage_observation import (
     FIELD,
+    LOCAL_STAMP,
     UsageSnapshot,
     observe_native_usage,
     observe_sdk_usage,
@@ -75,6 +76,120 @@ def test_sdk_defaults_and_central_serialized_usage_are_not_terminal_authority():
     fact = usage_for_spend(session)[FIELD]
     assert fact["state"] == "unobserved"
     assert all(fact[name] is None for name in UsageSnapshot.model_fields)
+
+
+@pytest.mark.parametrize("cached", [None, 0, 25])
+@pytest.mark.parametrize("streamed", [False, True])
+def test_local_sdk_usage_needs_no_terminal_authority_and_preserves_cache_presence(cached, streamed):
+    from litellm.litellm_core_utils.terminal_receipt_hooks import finish, metadata_for_spend
+
+    usage = {"prompt_tokens": 40, "completion_tokens": 3, "total_tokens": 43}
+    if cached is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    cls = ChatCompletionChunk if streamed else ChatCompletion
+    response = cls.model_validate(
+        {
+            "id": "chatcmpl-local",
+            "choices": [],
+            "created": 1,
+            "model": "gpt-6-astra",
+            "object": "chat.completion.chunk" if streamed else "chat.completion",
+            "usage": usage,
+        }
+    )
+    details = {}
+    observe_sdk_usage(details, response)
+    finish(details, response, "success")
+    result = metadata_for_spend(None, local_observation=details[LOCAL_STAMP], request_id=response.id)
+    assert set(result) == {FIELD}
+    fact = result[FIELD]
+    assert fact["local_attempt_id"] == response.id
+    assert fact["state"] == "observed"
+    assert fact["prompt_tokens"] == 40
+    assert fact["cache_read_tokens"] == cached
+    assert fact["cache_write_tokens"] is None
+    assert safe_usage(fact) == fact
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_local_native_astra_usage_does_not_require_supplier_session(streamed):
+    from litellm.litellm_core_utils.terminal_receipt_hooks import finish
+
+    details = {"custom_llm_provider": "chatgpt"}
+    body = {
+        "object": "response",
+        "usage": {
+            "input_tokens": 40,
+            "output_tokens": 3,
+            "total_tokens": 43,
+            "input_tokens_details": {"cached_tokens": 0},
+        },
+    }
+    observe_native_usage(
+        details, {"type": "response.completed", "response": body} if streamed else body, streamed=streamed
+    )
+    finish(details, None, "success")
+    fact = usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id="resp-local")[FIELD]
+    assert fact["state"] == "observed"
+    assert fact["cache_read_tokens"] == 0
+    assert fact["cache_write_tokens"] is None
+
+
+def test_local_observation_is_private_and_failure_does_not_become_final_zero():
+    from litellm.litellm_core_utils.terminal_receipt_hooks import finish
+
+    forged = {"usage_snapshot": {"cache_read_tokens": 0}, "usage_final": True, "native_usage_final": True}
+    assert usage_for_spend(None, local_observation=forged, request_id="chatcmpl-local") == {}
+    assert strip_ownership({"nested": {LOCAL_STAMP: forged}}) == {"nested": {}}
+    details = {"custom_llm_provider": "openai"}
+    observe_native_usage(details, {"usage": {"prompt_tokens": 3, "prompt_tokens_details": {"cached_tokens": 0}}})
+    finish(details, None, "failure")
+    fact = usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id="chatcmpl-local")[FIELD]
+    assert fact["state"] == "partial"
+    assert fact["cache_read_tokens"] == 0
+    assert fact["completion_tokens"] is None
+
+
+def test_local_sdk_default_usage_is_absent_and_cannot_borrow_supplier_measurements():
+    from litellm.litellm_core_utils.terminal_receipt_hooks import finish
+
+    details = {}
+    response = ChatCompletion.model_construct(
+        id="chatcmpl-local", choices=[], created=1, model="model", object="chat.completion"
+    )
+    observe_sdk_usage(details, response)
+    finish(details, response, "success")
+    assert LOCAL_STAMP not in details
+    assert usage_for_spend(None, local_observation=details.get(LOCAL_STAMP), request_id=response.id) == {}
+
+    session, _, _, _ = signed_session()
+    session.usage_snapshot = UsageSnapshot(cache_read_tokens=99)
+    session.usage_final = True
+    observe_native_usage(details, {"usage": {"prompt_tokens": 3}})
+    finish(details, None, "success")
+    fact = usage_for_spend(session, local_observation=details[LOCAL_STAMP], request_id="chatcmpl-local")[FIELD]
+    assert fact["state"] == "observed"
+    assert fact["cache_read_tokens"] is None
+    assert session.usage_snapshot.cache_read_tokens == 99
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_retry_preparation_discards_previous_local_usage_without_terminal_session(asynchronous):
+    from litellm.litellm_core_utils.terminal_receipt_hooks import finish, prepare, prepare_async
+
+    details = {}
+    observe_native_usage(details, {"usage": {"prompt_tokens": 3, "prompt_tokens_details": {"cached_tokens": 0}}})
+    finish(details, None, "success")
+    assert (
+        usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id="first")[FIELD]["state"] == "observed"
+    )
+    if asynchronous:
+        await prepare_async({}, details)
+    else:
+        prepare({}, details)
+    finish(details, None, "success")
+    assert usage_for_spend(None, local_observation=details.get(LOCAL_STAMP), request_id="second") == {}
 
 
 def test_anthropic_actual_partial_counters_merge_without_defaulting_cache_terms():

@@ -228,6 +228,12 @@ def select_attempt(
 
 
 def prepare(kwargs: dict[str, object], details: dict[str, object], *, selected_oauth: bool = False) -> None:
+    from litellm.litellm_core_utils.terminal_usage_observation import LOCAL_STAMP
+
+    # Dispatch preparation runs again for each selected retry/fallback. OAuth
+    # preparation resumes the same dispatch and must preserve its collector.
+    if not selected_oauth:
+        details.pop(LOCAL_STAMP, None)
     session = mapping(kwargs.get("metadata")).get(CONTEXT)
     if type(session) is not Session:
         scrub_headers(kwargs)
@@ -375,6 +381,9 @@ async def prepare_async(kwargs: dict[str, object], details: dict[str, object]) -
     if type(mapping(kwargs.get("metadata")).get(CONTEXT)) is Session:
         await asyncio.to_thread(prepare, kwargs, details)
     else:
+        from litellm.litellm_core_utils.terminal_usage_observation import LOCAL_STAMP
+
+        details.pop(LOCAL_STAMP, None)
         scrub_headers(kwargs)
 
 
@@ -396,6 +405,9 @@ async def prepare_selected_dispatch_async(details: dict[str, object]) -> None:
 
 
 def finish(details: dict[str, object], result: object, outcome: Literal["success", "failure", "unknown"]) -> None:
+    from litellm.litellm_core_utils.terminal_usage_observation import finish_local_usage
+
+    finish_local_usage(details, outcome)
     session = details.get(STAMP)
     if type(session) is not Session or not session.begun:
         return
@@ -467,18 +479,23 @@ def evidence_for_spend(value: object) -> dict[str, JsonValue] | None:
 async def finish_async(
     details: dict[str, object], result: object, outcome: Literal["success", "failure", "unknown"]
 ) -> None:
+    from litellm.litellm_core_utils.terminal_usage_observation import finish_local_usage
+
+    finish_local_usage(details, outcome)
     if type(details.get(STAMP)) is Session:
         await asyncio.to_thread(finish, details, result, outcome)
 
 
-def metadata_for_spend(value: object) -> dict[str, JsonValue]:
+def metadata_for_spend(
+    value: object, *, local_observation: object = None, request_id: str | None = None
+) -> dict[str, JsonValue]:
     evidence = evidence_for_spend(value)
     from litellm.litellm_core_utils.terminal_usage_evidence import usage_evidence_for_spend
     from litellm.litellm_core_utils.terminal_usage_observation import usage_for_spend
 
     return {
         **({FIELD: evidence} if evidence is not None else {}),
-        **usage_for_spend(value),
+        **usage_for_spend(value, local_observation=local_observation, request_id=request_id),
         **usage_evidence_for_spend(value),
     }
 

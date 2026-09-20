@@ -262,6 +262,9 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
                 additional_args={"complete_input_dict": {}},
             )
             raw_response_json = raw_response.json()
+            from litellm.litellm_core_utils.terminal_usage_observation import observe_native_usage
+
+            observe_native_usage(logging_obj.model_call_details, raw_response_json)
             raw_response_json["created_at"] = _safe_convert_created_field(raw_response_json["created_at"])
         except Exception:
             raise OpenAIError(message=raw_response.text, status_code=raw_response.status_code)

@@ -391,6 +391,7 @@ def strip_ownership(value: object, depth: int = 0) -> object:
                 DISPATCH,
                 "openorange_terminal_evidence",
                 "openorange_usage_observation",
+                "_openorange_local_usage",
                 "openorange_terminal_usage_evidence",
                 "_openorange_terminal_context",
                 "_openorange_terminal_stamp",
