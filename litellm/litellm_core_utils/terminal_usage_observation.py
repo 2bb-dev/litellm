@@ -1,18 +1,20 @@
 """Private upstream usage presence, before adapter defaults or token estimates."""
 
 import json
+from dataclasses import dataclass, field
 from collections.abc import AsyncGenerator, AsyncIterator, Generator, Iterator
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from pydantic import Field, JsonValue, TypeAdapter, ValidationError, model_validator
 
-from litellm.litellm_core_utils.terminal_receipt_evidence import Closed, UUIDText
+from litellm.litellm_core_utils.terminal_receipt_evidence import Closed, Identifier
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.terminal_receipt_hooks import Session
 
 FIELD = "openorange_usage_observation"
+LOCAL_STAMP = "_openorange_local_usage"
 Quantity = Annotated[int, Field(strict=True, ge=0, le=9007199254740991)]
 _VALUES = TypeAdapter(dict[str, object])
 _OPAQUE = TypeAdapter(object)
@@ -32,7 +34,9 @@ class UsageSnapshot(Closed):
 
 class UsageObservation(UsageSnapshot):
     v: Annotated[int, Field(strict=True, ge=1, le=1)]
-    local_attempt_id: UUIDText
+    # A local spend row can use an upstream response ID, independently of the
+    # UUID identifiers used by the separate signed supplier receipt protocol.
+    local_attempt_id: Identifier
     state: Literal["observed", "partial", "unobserved"]
 
     @model_validator(mode="after")
@@ -40,6 +44,31 @@ class UsageObservation(UsageSnapshot):
         if self.state == "unobserved" and any(getattr(self, name) is not None for name in UsageSnapshot.model_fields):
             raise ValueError("invalid_usage_observation")
         return self
+
+
+@dataclass(slots=True)
+class LocalUsage:
+    """Only transport hooks can create this private, content-free snapshot."""
+
+    usage_snapshot: UsageSnapshot | None = None
+    native_usage_fields: dict[str, object] = field(default_factory=dict)
+    native_usage_final: bool = False
+    usage_final: bool = False
+    usage_invalid: bool = False
+
+
+def _local_usage(details: dict[str, object]) -> LocalUsage:
+    value = details.get(LOCAL_STAMP)
+    if type(value) is not LocalUsage:
+        value = LocalUsage()
+        details[LOCAL_STAMP] = value
+    return value
+
+
+def finish_local_usage(details: dict[str, object], outcome: str) -> None:
+    value = details.get(LOCAL_STAMP)
+    if type(value) is LocalUsage:
+        value.usage_final = outcome == "success"
 
 
 def _value(usage: dict[str, object], paths: tuple[tuple[str, ...], ...]) -> int | None:
@@ -98,23 +127,51 @@ def observe_sdk_usage(details: dict[str, object], response: object) -> None:
     from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP
     from litellm.litellm_core_utils.terminal_receipt_hooks import Session
 
-    session = details.get(STAMP)
-    if type(session) is not Session or session.root.authority.settings.role != "audience":
-        return
     if not isinstance(response, (ChatCompletion, ChatCompletionChunk)):
         return
     if "usage" not in response.model_fields_set or response.usage is None:
         return
-    with session.lock:
-        try:
-            session.local_usage_snapshot = snapshot(response.usage.model_dump(exclude_unset=True))
-        except (ValidationError, ValueError):
-            session.usage_invalid = True
+    local = _local_usage(details)
+    try:
+        local.usage_snapshot = snapshot(response.usage.model_dump(exclude_unset=True))
+        local.native_usage_final = isinstance(response, ChatCompletion) or response.choices == []
+    except (ValidationError, ValueError):
+        local.usage_invalid = True
+    session = details.get(STAMP)
+    if type(session) is Session and session.root.authority.settings.role == "audience":
+        with session.lock:
+            session.local_usage_snapshot = local.usage_snapshot
+            session.usage_invalid = session.usage_invalid or local.usage_invalid
 
 
-def usage_for_spend(value: object) -> dict[str, JsonValue]:
+def usage_for_spend(
+    value: object, *, local_observation: object = None, request_id: str | None = None
+) -> dict[str, JsonValue]:
     from litellm.litellm_core_utils.terminal_receipt_hooks import Session
 
+    if type(local_observation) is LocalUsage and request_id is not None:
+        observed = local_observation.usage_snapshot
+        state = (
+            "unobserved"
+            if observed is None or all(getattr(observed, name) is None for name in UsageSnapshot.model_fields)
+            else "observed"
+            if local_observation.usage_final
+            and local_observation.native_usage_final
+            and not local_observation.usage_invalid
+            else "partial"
+        )
+        try:
+            fact = UsageObservation.model_validate(
+                {
+                    "v": 1,
+                    "local_attempt_id": request_id,
+                    "state": state,
+                    **(observed or UsageSnapshot()).model_dump(),
+                }
+            )
+        except ValidationError:
+            return {}
+        return {FIELD: fact.model_dump(mode="json")}
     if type(value) is not Session or value.root.authority.settings.role != "audience":
         return {}
     observed = value.usage_snapshot
@@ -146,7 +203,7 @@ def safe_usage(value: object) -> dict[str, JsonValue]:
 
 
 def _anthropic_native(
-    session: "Session", body: dict[str, object], streamed: bool
+    session: "Session | LocalUsage", body: dict[str, object], streamed: bool
 ) -> tuple[dict[str, object], bool] | None:
     if streamed and body.get("type") == "message_start":
         source = _VALUES.validate_python(body.get("message") or {}).get("usage")
@@ -224,6 +281,32 @@ def observe_native_usage(details: dict[str, object], raw: object, *, streamed: b
     from litellm.litellm_core_utils.terminal_receipt_hooks import Session
 
     session = details.get(STAMP)
+    provider = details.get("custom_llm_provider")
+    if provider is None and type(session) is Session:
+        provider = session.terminal.provider
+    local = _local_usage(details)
+    try:
+        body = _VALUES.validate_python(raw)
+        if provider == "anthropic":
+            captured = _anthropic_native(local, body, streamed)
+        elif (
+            provider == "chatgpt"
+            or body.get("object") == "response"
+            or str(body.get("type", "")).startswith("response.")
+        ):
+            captured = _chatgpt_native(body, streamed)
+        elif provider == "deepseek":
+            captured = _deepseek_native(body, streamed)
+        elif body.get("usage") is not None:
+            captured = (_VALUES.validate_python(body["usage"]), not streamed or body.get("choices") == [])
+        else:
+            captured = None
+        if captured is not None:
+            normalized, final = captured
+            local.usage_snapshot = snapshot(normalized)
+            local.native_usage_final = final
+    except (ValidationError, ValueError, TypeError):
+        local.usage_invalid = True
     if type(session) is not Session or session.root.authority.settings.role != "producer" or session.relay:
         return
     with session.lock:
@@ -252,12 +335,12 @@ def observe_native_line(details: dict[str, object], line: str) -> None:
     from litellm.litellm_core_utils.terminal_receipt_hooks import Session
 
     session = details.get(STAMP)
-    if type(session) is not Session or session.root.authority.settings.role != "producer" or session.relay:
-        return
     if not line.startswith("data:"):
         return
     if len(line.encode()) > 65536:
-        session.usage_invalid = True
+        _local_usage(details).usage_invalid = True
+        if type(session) is Session:
+            session.usage_invalid = True
         return
     raw = line[5:].lstrip()
     if raw == "[DONE]":
@@ -265,7 +348,9 @@ def observe_native_line(details: dict[str, object], line: str) -> None:
     try:
         body = _OPAQUE.validate_json(raw)
     except ValueError:
-        session.usage_invalid = True
+        _local_usage(details).usage_invalid = True
+        if type(session) is Session:
+            session.usage_invalid = True
         return
     observe_native_usage(details, body, streamed=True)
 
@@ -274,7 +359,13 @@ def observe_lines(lines: Iterator[str], details: dict[str, object]) -> Iterator[
     from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP
     from litellm.litellm_core_utils.terminal_receipt_hooks import Session
 
-    if type(details.get(STAMP)) is not Session:
+    if type(details.get(STAMP)) is not Session and details.get("custom_llm_provider") not in {
+        "anthropic",
+        "chatgpt",
+        "deepseek",
+        "openai",
+        "litellm_proxy",
+    }:
         return lines
 
     def observed() -> Iterator[str]:
@@ -293,7 +384,13 @@ def observe_lines_async(lines: AsyncIterator[str], details: dict[str, object]) -
     from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP
     from litellm.litellm_core_utils.terminal_receipt_hooks import Session
 
-    if type(details.get(STAMP)) is not Session:
+    if type(details.get(STAMP)) is not Session and details.get("custom_llm_provider") not in {
+        "anthropic",
+        "chatgpt",
+        "deepseek",
+        "openai",
+        "litellm_proxy",
+    }:
         return lines
 
     async def observed() -> AsyncIterator[str]:

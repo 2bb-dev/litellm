@@ -1705,6 +1705,10 @@ class CustomStreamWrapper:
                 else:
                     chunk = next(self.completion_stream)  # type: ignore[arg-type]
                 if chunk is not None and chunk != b"":
+                    from litellm.litellm_core_utils.terminal_receipt_hooks import OPAQUE_VALUE
+                    from litellm.litellm_core_utils.terminal_usage_observation import observe_sdk_usage
+
+                    observe_sdk_usage(self.logging_obj.model_call_details, OPAQUE_VALUE.validate_python(chunk))
                     print_verbose(
                         f"PROCESSED CHUNK PRE CHUNK CREATOR: {chunk.decode('utf-8', errors='replace') if isinstance(chunk, bytes) else chunk}; custom_llm_provider: {self.custom_llm_provider}"
                     )

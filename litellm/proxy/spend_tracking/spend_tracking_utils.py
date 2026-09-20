@@ -29,6 +29,7 @@ from litellm.litellm_core_utils.safe_json_dumps import safe_dumps, strip_null_by
 from litellm.litellm_core_utils.credential_ownership import FIELD, STAMP, ownership_for_spend, strip_ownership
 from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP as TERMINAL_STAMP
 from litellm.litellm_core_utils.terminal_receipt_hooks import OPAQUE_VALUE, attempt_row_id, metadata_for_spend
+from litellm.litellm_core_utils.terminal_usage_observation import LOCAL_STAMP
 from litellm.proxy._types import SpendLogsMetadata, SpendLogsPayload
 from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
 from litellm.proxy.utils import PrismaClient, hash_token
@@ -396,10 +397,11 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
     custom_llm_provider = kwargs.get("custom_llm_provider")
     raw_model = cast(str, kwargs.get("model") or "")
     model_name = reconstruct_model_name(raw_model, custom_llm_provider, metadata or {})
+    spend_request_id = attempt_row_id(OPAQUE_VALUE.validate_python(kwargs.get(TERMINAL_STAMP))) or str(id)
 
     try:
         payload: SpendLogsPayload = SpendLogsPayload(
-            request_id=attempt_row_id(OPAQUE_VALUE.validate_python(kwargs.get(TERMINAL_STAMP))) or str(id),
+            request_id=spend_request_id,
             call_type=call_type or "",
             api_key=str(api_key),
             cache_hit=str(cache_hit),
@@ -414,7 +416,11 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
                 {
                     **cast(dict, strip_ownership(clean_metadata)),
                     FIELD: ownership_for_spend(kwargs.get(STAMP), _model_id),
-                    **metadata_for_spend(OPAQUE_VALUE.validate_python(kwargs.get(TERMINAL_STAMP))),
+                    **metadata_for_spend(
+                        OPAQUE_VALUE.validate_python(kwargs.get(TERMINAL_STAMP)),
+                        local_observation=kwargs.get(LOCAL_STAMP),
+                        request_id=spend_request_id,
+                    ),
                 }
             ),
             cache_key=cache_key,
