@@ -62,11 +62,14 @@ from litellm.litellm_core_utils.asyncify import asyncify, run_async_function
 from litellm.litellm_core_utils.core_helpers import (
     RequestRetryLimitError,
     _get_parent_otel_span_from_kwargs,
+    _RouterRequestMetadata,
+    advance_request_retry_count,
     coerce_token_limit,
     get_litellm_metadata_from_kwargs,
     get_metadata_variable_name_from_kwargs,
     get_or_create_metadata_bucket,
     get_request_retry_count,
+    initialize_request_retry_state,
     max_retries_per_request_hit,
 )
 from litellm.litellm_core_utils.coroutine_checker import coroutine_checker
@@ -613,23 +616,6 @@ def _replay_live_router_model_cost() -> None:
 
 
 set_live_deployment_replay(_replay_live_router_model_cost)
-
-
-# Kwargs that carry no signal about the failed attempt, so log_retry drops them from a
-# breadcrumb entirely: the request payload, the proxy's snapshot of the inbound request (its body
-# aliases the live request metadata, earlier breadcrumbs included, so copying it would nest every
-# breadcrumb inside the next one), and the router-internal walk state. Credentials are handled
-# separately by mask_credentials_in_payload, which scrubs credential-named values from whatever
-# kwargs remain rather than trying to enumerate every credential-bearing key here.
-RETRY_BREADCRUMB_EXCLUDED_KWARGS: Final = frozenset(
-    (
-        "messages",
-        "original_function",
-        "attempted_targets",
-        "proxy_server_request",
-    )
-)
-RETRY_BREADCRUMB_LIMIT: Final = 4
 
 
 class Router:
@@ -3508,6 +3494,7 @@ class Router:
         honour the precedence request > deployment litellm_params > litellm_settings while an
         absent num_retries still means "the caller did not ask for one".
         """
+        initialize_request_retry_state(kwargs, metadata_variable_name)
         kwargs.setdefault("litellm_trace_id", str(uuid.uuid4()))
         model_group_alias: str | None = None
         if self._get_model_from_alias(model=model):
@@ -5228,7 +5215,7 @@ class Router:
         # The pre-routing hook stamps its tier selection into this bucket during the primary
         # attempt; seeding it before the snapshot gives both the live kwargs and the copy a
         # bucket, so the post-call carry-over below always has somewhere to read and write.
-        kwargs.setdefault("litellm_metadata", {})  # mutable-ok: shared bucket  # rebind-ok: stamp must be readable here
+        initialize_request_retry_state(kwargs, "litellm_metadata")
 
         fallback_kwargs: Final[dict[str, object]] = kwargs.copy()
         if isinstance(fallback_kwargs.get("litellm_metadata"), dict):
@@ -5551,7 +5538,7 @@ class Router:
         # The pre-routing hook stamps its tier selection into this bucket during the primary
         # attempt; seeding it before the snapshot gives both the live kwargs and the copy a
         # bucket, so the post-call carry-over below always has somewhere to read and write.
-        kwargs.setdefault("litellm_metadata", {})  # mutable-ok: shared bucket  # rebind-ok: stamp must be readable here
+        initialize_request_retry_state(kwargs, "litellm_metadata")
 
         fallback_kwargs: Final[dict[str, object]] = kwargs.copy()  # mutable-ok: mutated below before re-entry
         if isinstance(fallback_kwargs.get("litellm_metadata"), dict):
@@ -7428,19 +7415,7 @@ class Router:
         Try calling the function_with_retries
         If it fails after num_retries, fall back to another model group
         """
-        if kwargs.get("fallback_depth", 0) == 0:
-            for bucket in ("metadata", "litellm_metadata"):
-                metadata = kwargs.get(bucket)
-                if isinstance(metadata, Mapping):
-                    kwargs[bucket] = {
-                        key: value
-                        for key, value in metadata.items()
-                        if key not in ("previous_models", "request_retry_count", "attempted_retries", "max_retries")
-                    }
-            metadata_var = get_metadata_variable_name_from_kwargs(kwargs)
-            if not isinstance(kwargs.get(metadata_var), dict):
-                kwargs[metadata_var] = {}
-            kwargs[metadata_var]["request_retry_count"] = -1
+        initialize_request_retry_state(kwargs)
         model_group: Final[str | None] = kwargs.get("model")
         clear_pre_routing_selection(kwargs)  # pyright: ignore[reportUnknownArgumentType]  # **kwargs is untyped at this boundary
         if not isinstance(kwargs.get("attempted_targets"), AttemptedFallbackTargets):
@@ -7550,6 +7525,7 @@ class Router:
 
     @tracer.wrap()
     async def async_function_with_retries(self, *args, **kwargs):
+        initialize_request_retry_state(kwargs)
         verbose_router_logger.debug("Inside async function with retries.")
         original_function: Final = kwargs.pop("original_function")
         fallbacks: Final = kwargs.pop("fallbacks", self.fallbacks)
@@ -7754,11 +7730,7 @@ class Router:
         """
         Handler for making a call to the .completion()/.embeddings()/etc. functions.
         """
-        metadata_var = get_metadata_variable_name_from_kwargs(kwargs)
-        metadata = kwargs.setdefault(metadata_var, {})
-        previous_count = metadata.get("request_retry_count")
-        next_count = previous_count + 1 if type(previous_count) is int and previous_count >= 0 else 0
-        metadata["request_retry_count"] = next_count
+        advance_request_retry_count(kwargs)
         if max_retries_per_request_hit(kwargs, litellm.num_retries_per_request):
             raise RequestRetryLimitError("Max retries per request hit!")
         model_group: Final = kwargs.get("model")
@@ -8294,13 +8266,19 @@ class Router:
                 "request_retry_count": get_request_retry_count(kwargs),
             }
         )
-        earlier = metadata.get("previous_models")
+        earlier = (
+            metadata._retry_state.history
+            if type(metadata) is _RouterRequestMetadata
+            else metadata.get("previous_models")
+        )
         kept = (
             tuple(self._retry_record(item) for item in earlier[-3:] if isinstance(item, Mapping))
             if isinstance(earlier, (list, tuple))
             else ()
         )
         metadata["previous_models"] = (*kept, record)
+        if type(metadata) is _RouterRequestMetadata:
+            metadata._retry_state.history = metadata["previous_models"]
         return kwargs
 
     def _update_usage(self, deployment_id: str, parent_otel_span: Span | None) -> int:

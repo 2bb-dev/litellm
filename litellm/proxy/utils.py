@@ -6902,18 +6902,6 @@ async def drain_spend_logs_queue(
         )
 
 
-async def _prepend_spend_logs(
-    prisma_client: PrismaClient,
-    logs_to_process: list[dict[str, Any]],
-) -> None:
-    """Return a failed batch to the front without blocking producers."""
-    async with prisma_client._spend_log_transactions_lock:
-        prisma_client.spend_log_transactions = [
-            *logs_to_process,
-            *prisma_client.spend_log_transactions,
-        ]
-
-
 def _is_transient_spend_log_write_error(
     error: Exception,
     db_writer_client: Optional[AsyncHTTPHandler] = None,

@@ -30,6 +30,7 @@ from litellm.constants import (
     SESSION_ID_OMITTED_METADATA_KEY,
     X_LITELLM_DISABLE_CALLBACKS,
 )
+from litellm.litellm_core_utils.core_helpers import initialize_request_retry_state
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
     TRUSTED_CALLBACK_VARS_FIELD,
@@ -3989,6 +3990,9 @@ async def add_litellm_data_to_request(
             parent_otel_span=user_api_key_dict.parent_otel_span,
         )
     )
+
+    # This ingress bucket is request-local; preserve its identity through post-call hooks.
+    initialize_request_retry_state(data, _metadata_variable_name)
 
     return data
 

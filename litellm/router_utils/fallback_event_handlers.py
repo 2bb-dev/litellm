@@ -8,9 +8,12 @@ from typing import TYPE_CHECKING, Any, Final
 import litellm
 from litellm._logging import verbose_router_logger
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs
+from litellm.litellm_core_utils.core_helpers import (
+    RequestRetryLimitError,
+    get_metadata_variable_name_from_kwargs,
+    preserve_request_retry_state,
+)
 from litellm.litellm_core_utils.sensitive_data_masker import mask_sensitive_structure
-from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError
 from litellm.router_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
     get_fallback_error_info,
@@ -543,12 +546,13 @@ async def run_async_fallback(
             kwargs = litellm_router.log_retry(kwargs=kwargs, e=original_exception)
             verbose_router_logger.info("Falling back to model_group = %s", mask_sensitive_structure(mg))
             kwargs.pop("_target_order", None)  # rebind-ok: next hop must not inherit the previous order target
+            _retry_metadata = kwargs.get(get_metadata_variable_name_from_kwargs(kwargs))
             if isinstance(mg, str):
                 kwargs["model"] = mg
             elif isinstance(mg, dict):
                 kwargs.update(mg)
             fallback_depth = fallback_depth + 1
-            _hop_metadata = dict(kwargs.get(metadata_variable_name) or {})
+            _hop_metadata = (kwargs.get(metadata_variable_name) or {}).copy()
             _original_model_group_stamp = _hop_metadata.pop("original_model_group", original_model_group)
             _hop_metadata.pop("model_group", None)
             _hop_metadata.pop("attempted_fallbacks", None)
@@ -561,6 +565,7 @@ async def run_async_fallback(
             kwargs["attempted_targets"] = attempted
             if include_fallback_errors:
                 kwargs["include_fallback_errors"] = include_fallback_errors
+            preserve_request_retry_state(kwargs, _retry_metadata)
             response = await litellm_router.async_function_with_fallbacks(*args, **kwargs)
             verbose_router_logger.info("Successful fallback b/w models.")
             response = add_fallback_headers_to_response(

@@ -9675,10 +9675,7 @@ async def test_cyclic_fallback_graph_does_not_amplify_one_request():
 
 @pytest.mark.asyncio
 async def test_retry_breadcrumbs_do_not_carry_the_walk_state():
-    """log_retry copies every kwarg into previous_models, which reaches spend logs and
-    logging callbacks. The set of already-attempted groups is router-internal walk state
-    with no diagnostic value there, and it is the one entry that is not a plain scalar.
-    A retry has to be configured for the walk state to reach log_retry at all."""
+    """Only flat diagnostics reach callbacks; internal graph state never does."""
     router = _cyclic_fallback_router(num_retries=1)
     capture = _LogCapture(logging.ERROR)
     recorder = _FallbackAttemptRecorder()
@@ -9687,11 +9684,11 @@ async def test_retry_breadcrumbs_do_not_carry_the_walk_state():
 
     breadcrumbs = [breadcrumb for hop in recorder.breadcrumbs_per_target for breadcrumb in hop]
     assert breadcrumbs, "no retry breadcrumbs were recorded"
-    assert any(
-        "fallback_depth" in breadcrumb for breadcrumb in breadcrumbs
-    ), "no breadcrumb carried router walk state, so this test cannot see the leak"
+    assert any(breadcrumb["request_retry_count"] > 0 for breadcrumb in breadcrumbs)
     for breadcrumb in breadcrumbs:
         assert "attempted_targets" not in breadcrumb
+        assert "fallback_depth" not in breadcrumb
+        assert set(breadcrumb) == {"model_group", "deployment_id", "exception_type", "status_code", "request_retry_count"}
 
 
 _BREADCRUMB_CREDENTIAL_CANARY = "Bearer sk-ant-oat01-RETRY-BREADCRUMB-CANARY-doNotShip"
@@ -9720,22 +9717,26 @@ _BREADCRUMB_CREDENTIAL_CANARY = "Bearer sk-ant-oat01-RETRY-BREADCRUMB-CANARY-doN
     ],
 )
 @pytest.mark.asyncio
-async def test_retry_breadcrumbs_never_carry_a_forwarded_credential(container_key, request_kwargs):
-    """log_retry copies kwargs into previous_models, which reaches spend logs and logging callbacks.
-    Any of these kwargs can carry a client's forwarded Authorization token or a provider key, and a
-    breadcrumb has no diagnostic use for the raw secret. A denylist of key names is always one new
-    credential kwarg behind, so log_retry scrubs credential-named values by pattern instead: the
-    container still reaches the breadcrumb, but the raw secret never does, whatever key holds it."""
+async def test_retry_breadcrumbs_never_carry_a_forwarded_credential(container_key, request_kwargs, monkeypatch):
+    """Credential-bearing kwargs reach the attempt but never enter flat breadcrumbs."""
     router = _cyclic_fallback_router(num_retries=1)
     capture = _LogCapture(logging.ERROR)
-    metadata = {}
+    recorder = _FallbackAttemptRecorder()
+    forwarded = []
+    original = router._acompletion
 
-    await _drive_cyclic_fallback(router, capture, metadata=metadata, **request_kwargs)
+    async def dispatch(*args, **kwargs):
+        forwarded.append(kwargs.get(container_key))
+        return await original(*args, **kwargs)
 
-    breadcrumbs = metadata["previous_models"]
+    monkeypatch.setattr(router, "_acompletion", dispatch)
+    await _drive_cyclic_fallback(router, capture, recorder, **request_kwargs)
+
+    assert forwarded and forwarded[0] == request_kwargs[container_key]
+    breadcrumbs = [breadcrumb for hop in recorder.breadcrumbs_per_target for breadcrumb in hop]
     assert breadcrumbs, "no retry breadcrumbs were recorded"
     dumped = json.dumps(breadcrumbs, default=str)
-    assert container_key in dumped, "the credential-bearing kwarg never reached the breadcrumb, so this test cannot see the leak"
+    assert container_key not in dumped
     assert _BREADCRUMB_CREDENTIAL_CANARY not in dumped
 
 
@@ -9759,8 +9760,13 @@ async def _fail_one_proxy_shaped_request(router, request_marker):
     """The proxy hands the router a metadata dict and a proxy_server_request whose body is a
     shallow copy of the request, so body["metadata"] is the very same dict the router later
     stamps previous_models onto."""
-    metadata = {"request_marker": request_marker}
-    with pytest.raises(litellm.InternalServerError):
+    from litellm.litellm_core_utils.core_helpers import initialize_request_retry_state
+
+    # The real proxy creates the request-owned bucket at its sanitized ingress.
+    data = {"metadata": {"request_marker": request_marker}}
+    initialize_request_retry_state(data)
+    metadata = data["metadata"]
+    with patch.object(router, "_time_to_sleep_before_retry", return_value=0), pytest.raises(litellm.InternalServerError):
         await router.acompletion(
             model="broken-group",
             messages=[{"role": "user", "content": "hi"}],
@@ -9800,7 +9806,8 @@ async def test_retry_breadcrumbs_stay_per_request_and_flat_across_failing_reques
 
     for request_number, breadcrumbs in enumerate(breadcrumbs_per_request, start=1):
         assert len(breadcrumbs) == 3, "one initial attempt plus two retries failed, each leaving one breadcrumb"
-        assert {breadcrumb["metadata"]["request_marker"] for breadcrumb in breadcrumbs} == {f"request-{request_number}"}
+        assert [breadcrumb["request_retry_count"] for breadcrumb in breadcrumbs] == [0, 1, 2]
+        assert f"request-{request_number}" not in json.dumps(breadcrumbs)
         for breadcrumb in breadcrumbs:
             assert _nested_breadcrumb_lists(breadcrumb) == []
     assert len({len(repr(breadcrumbs)) for breadcrumbs in breadcrumbs_per_request}) == 1
@@ -9813,7 +9820,7 @@ async def test_retry_breadcrumbs_keep_only_the_last_four_attempts():
     breadcrumbs = await _fail_one_proxy_shaped_request(router, "request-1")
 
     assert len(breadcrumbs) == 4
-    assert [breadcrumb["metadata"]["attempted_retries"] for breadcrumb in breadcrumbs] == [3, 4, 5, 6]
+    assert [breadcrumb["request_retry_count"] for breadcrumb in breadcrumbs] == [3, 4, 5, 6]
 
 
 @pytest.mark.asyncio
@@ -13725,5 +13732,273 @@ async def test_retry_history_preserves_chatgpt_transient_and_quota_behavior(quot
             await router.async_function_with_fallbacks(model="subscription", original_function=request)
             assert [item["request_retry_count"] for item in attempts] == [0, 1, 2]
             assert len(attempts[-1]["previous_models"]) == 2
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 1, 2])
+async def test_request_retry_state_survives_responses_deferred_fallback(limit, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError
+
+    router = _make_router_with_fallback()
+    router.num_retries = 0
+    monkeypatch.setattr(litellm, "num_retries_per_request", limit)
+    calls = []
+    shared = {"request_retry_count": -1000, "previous_models": [{"messages": "private"}]}
+
+    async def aresponses(**kwargs):
+        calls.append((kwargs["model"], kwargs["litellm_metadata"]["request_retry_count"]))
+        return _make_responses_iterator(
+            model=kwargs["model"],
+            error=MidStreamFallbackError(
+                message="synthetic stream failure", model=kwargs["model"], llm_provider="openai",
+                is_pre_first_chunk=True, generated_content="",
+            ) if len(calls) == 1 else None,
+        )
+
+    async def consume():
+        response = await router._aresponses_with_streaming_fallbacks(
+            original_function=aresponses, model="gpt-4", stream=True, input="synthetic",
+            litellm_metadata=shared,
+        )
+        async for _ in response:
+            pass
+
+    try:
+        if limit < 2:
+            with pytest.raises(RequestRetryLimitError):
+                await consume()
+        else:
+            await consume()
+        assert calls == [("gpt-4", 0)] + ([("gpt-3.5-turbo", 1)] if limit == 2 else [])
+        assert shared == {"request_retry_count": -1000, "previous_models": [{"messages": "private"}]}
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2])
+def test_request_retry_state_survives_sync_stream_reentry(limit, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError
+
+    router = _make_router_with_fallback()
+    router.num_retries = 0
+    monkeypatch.setattr(litellm, "num_retries_per_request", limit)
+    calls = []
+
+    class Stream(litellm.CustomStreamWrapper):
+        def __init__(self, fail):
+            self.model = "gpt-4"
+            self.custom_llm_provider = "openai"
+            self.logging_obj = MagicMock()
+            self.completion_stream = iter(())
+            self.chunks = []
+            self.fail = fail
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.fail:
+                raise MidStreamFallbackError(
+                    message="synthetic", model=self.model, llm_provider="openai",
+                    is_pre_first_chunk=True, generated_content="",
+                )
+            raise StopIteration
+
+    def completion(**kwargs):
+        calls.append(kwargs["metadata"]["request_retry_count"])
+        return Stream(len(calls) == 1)
+
+    monkeypatch.setattr(litellm, "completion", completion)
+    try:
+        response = router.completion(model="gpt-4", messages=[{"role": "user", "content": "synthetic"}], stream=True)
+        if limit < 2:
+            with pytest.raises(RequestRetryLimitError):
+                list(response)
+        else:
+            assert list(response) == []
+        assert calls == list(range(max(1, limit)))
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("copier", [copy.copy, copy.deepcopy, lambda value: value.copy()])
+def test_request_retry_state_copies_share_cap_without_serializing_context(copier):
+    from litellm.litellm_core_utils.core_helpers import (
+        advance_request_retry_count, get_request_retry_count, initialize_request_retry_state,
+    )
+
+    original = {"metadata": {"owner": "synthetic"}}
+    initialize_request_retry_state(original)
+    deferred = {"metadata": copier(original["metadata"])}
+    advance_request_retry_count(original)
+    advance_request_retry_count(deferred)
+    assert get_request_retry_count(original) == 1
+    assert original["metadata"] is not deferred["metadata"]
+    assert json.loads(json.dumps(deferred["metadata"])) == {"owner": "synthetic", "request_retry_count": 1}
+    assert set(vars(original["metadata"]._retry_state)) == {"count", "history"}
+
+
+@pytest.mark.asyncio
+async def test_request_retry_state_ignores_client_fallback_depth_and_state_shape():
+    calls = []
+    router = litellm.Router(model_list=[], num_retries=0)
+    shared = {"request_retry_count": 999, "_retry_state": {"count": 999}, "previous_models": [{"messages": "private"}]}
+
+    async def request(**kwargs):
+        calls.append(kwargs["metadata"])
+        return litellm.ModelResponse()
+
+    try:
+        await router.async_function_with_fallbacks(
+            original_function=request, model="synthetic", metadata=shared, fallback_depth=123,
+        )
+        assert calls[0]["request_retry_count"] == 0
+        assert "previous_models" not in calls[0]
+        assert shared["request_retry_count"] == 999
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+async def test_request_retry_state_stays_out_of_responses_transport_json(monkeypatch):
+    import httpx
+
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+    bodies = []
+
+    async def handle(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "id": "resp_synthetic", "object": "response", "created_at": 1,
+            "status": "completed", "model": "gpt-4o-mini", "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as transport:
+        monkeypatch.setattr(AsyncHTTPHandler, "create_client", lambda *args, **kwargs: transport)
+        client = AsyncHTTPHandler()
+        router = litellm.Router(model_list=[{
+            "model_name": "synthetic", "litellm_params": {
+                "model": "openai/gpt-4o-mini", "api_key": "synthetic", "api_base": "https://synthetic.invalid/v1",
+            },
+        }], num_retries=0)
+        try:
+            await router.aresponses(
+                model="synthetic", input="synthetic", metadata={"owner": "synthetic"},
+                litellm_metadata={"principal": "synthetic"}, client=client,
+            )
+            assert len(bodies) == 1
+            assert bodies[0]["metadata"] == {"owner": "synthetic"}
+            assert "_retry_state" not in json.dumps(bodies)
+            assert "request_retry_count" not in json.dumps(bodies)
+            assert "litellm_metadata" not in bodies[0]
+        finally:
+            router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,bucket", [("/v1/chat/completions", "metadata"), ("/v1/responses", "litellm_metadata")])
+async def test_request_retry_state_preserves_proxy_post_call_metadata_identity(path, bucket):
+    from fastapi import Request
+
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    request = MagicMock(spec=Request)
+    request.url = MagicMock()
+    request.url.path = path
+    request.url.__str__.return_value = "https://synthetic.invalid" + path
+    request.method = "POST"
+    request.query_params = {}
+    request.headers = {"Content-Type": "application/json"}
+    request.client = MagicMock()
+    request.client.host = "127.0.0.1"
+    request.state = MagicMock()
+    data = await add_litellm_data_to_request(
+        data={"model": "synthetic", bucket: {"previous_models": [{"messages": "private"}], "request_retry_count": 100}},
+        request=request, user_api_key_dict=UserAPIKeyAuth(api_key="synthetic"),
+        proxy_config=MagicMock(), general_settings={}, version="synthetic",
+    )
+    owned = data[bucket]
+    forwarded = []
+    router = litellm.Router(model_list=[], num_retries=0)
+
+    async def dispatch(**kwargs):
+        forwarded.append(kwargs[bucket])
+        return litellm.ModelResponse()
+
+    try:
+        await router.async_function_with_fallbacks(original_function=dispatch, **data)
+        assert forwarded[0] is owned
+        assert owned["request_retry_count"] == 0
+        assert "previous_models" not in owned
+        owned["standard_logging_guardrail_information"] = [{"guardrail_name": "synthetic-post-call"}]
+        assert forwarded[0]["standard_logging_guardrail_information"] == [{"guardrail_name": "synthetic-post-call"}]
+        assert "_retry_state" not in json.dumps(owned, default=str)
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 2])
+async def test_request_retry_state_survives_fallback_metadata_overrides(limit, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError, get_request_retry_count
+
+    router = _make_router_with_fallback()
+    router.num_retries = 0
+    router.fallbacks = [{"gpt-4": [{"model": "gpt-3.5-turbo", "metadata": {}, "litellm_metadata": {"request_retry_count": -100}}]}]
+    monkeypatch.setattr(litellm, "num_retries_per_request", limit)
+    calls = []
+
+    async def request(**kwargs):
+        calls.append((kwargs["model"], get_request_retry_count(kwargs)))
+        if len(calls) == 1:
+            raise litellm.InternalServerError(message="synthetic", model="gpt-4", llm_provider="openai")
+        return litellm.ModelResponse()
+
+    try:
+        if limit == 1:
+            with pytest.raises(RequestRetryLimitError):
+                await router.async_function_with_fallbacks(model="gpt-4", original_function=request)
+        else:
+            await router.async_function_with_fallbacks(model="gpt-4", original_function=request)
+        assert calls == [("gpt-4", 0)] + ([("gpt-3.5-turbo", 1)] if limit == 2 else [])
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 2])
+async def test_request_retry_state_survives_anthropic_deferred_fallback(limit, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError, get_request_retry_count
+
+    router = _anthropic_messages_make_router()
+    router.num_retries = 0
+    router.fallbacks = [{"primary": ["fallback"]}]
+    monkeypatch.setattr(litellm, "num_retries_per_request", limit)
+    calls = []
+
+    async def anthropic_messages(**kwargs):
+        calls.append(get_request_retry_count(kwargs))
+        chunks = [_anthropic_messages_overloaded_error_chunk()] if len(calls) == 1 else [_anthropic_messages_content_chunk("synthetic")]
+        return _AnthropicMessagesFakeByteStream(chunks)
+
+    async def consume():
+        response = await router._aanthropic_messages_with_streaming_fallbacks(
+            original_function=anthropic_messages, model="primary", stream=True,
+            messages=[{"role": "user", "content": "synthetic"}],
+        )
+        return [chunk async for chunk in response]
+
+    try:
+        if limit == 1:
+            with pytest.raises(RequestRetryLimitError):
+                await consume()
+        else:
+            assert await consume() == [_anthropic_messages_content_chunk("synthetic")]
+        assert calls == list(range(limit))
     finally:
         router.reset()
