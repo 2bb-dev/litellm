@@ -243,6 +243,7 @@ class TestBaseResponsesAPIStreamingIterator:
         mock_response.headers = {}
         mock_logging_obj = Mock(spec=LiteLLMLoggingObj)
         mock_logging_obj.model_call_details = {"litellm_params": {}}
+        mock_logging_obj.completion_start_time = None
         mock_config = Mock(spec=BaseResponsesAPIConfig)
 
         completed_response = Mock(spec=ResponsesAPIResponse)
@@ -363,6 +364,7 @@ class TestBaseResponsesAPIStreamingIterator:
         mock_response.headers = {}
         mock_logging_obj = Mock(spec=LiteLLMLoggingObj)
         mock_logging_obj.model_call_details = {"litellm_params": {}}
+        mock_logging_obj.completion_start_time = None
         mock_config = Mock(spec=BaseResponsesAPIConfig)
 
         completed_response = Mock(spec=ResponsesAPIResponse)
