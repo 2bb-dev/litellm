@@ -5555,7 +5555,8 @@ class TestRouterRequestTimeoutPropagation:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [0, 1, 2])
-async def test_request_retry_state_survives_responses_deferred_fallback(limit, monkeypatch):
+@pytest.mark.parametrize("both_buckets", [False, True])
+async def test_request_retry_state_survives_responses_deferred_fallback(limit, both_buckets, monkeypatch):
     from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError
 
     router = _make_router_with_fallback()
@@ -5577,7 +5578,7 @@ async def test_request_retry_state_survives_responses_deferred_fallback(limit, m
     async def consume():
         response = await router._aresponses_with_streaming_fallbacks(
             original_function=aresponses, model="gpt-4", stream=True, input="synthetic",
-            litellm_metadata=shared,
+            litellm_metadata=shared, **({"metadata": {"owner": "synthetic"}} if both_buckets else {}),
         )
         async for _ in response:
             pass
@@ -5595,8 +5596,9 @@ async def test_request_retry_state_survives_responses_deferred_fallback(limit, m
 
 
 @pytest.mark.parametrize("limit", [0, 1, 2])
-def test_request_retry_state_survives_sync_stream_reentry(limit, monkeypatch):
-    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError
+@pytest.mark.parametrize("both_buckets", [False, True])
+def test_request_retry_state_survives_sync_stream_reentry(limit, both_buckets, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError, get_request_retry_count
 
     router = _make_router_with_fallback()
     router.num_retries = 0
@@ -5624,12 +5626,15 @@ def test_request_retry_state_survives_sync_stream_reentry(limit, monkeypatch):
             raise StopIteration
 
     def completion(**kwargs):
-        calls.append(kwargs["metadata"]["request_retry_count"])
+        calls.append(get_request_retry_count(kwargs))
         return Stream(len(calls) == 1)
 
     monkeypatch.setattr(litellm, "completion", completion)
     try:
-        response = router.completion(model="gpt-4", messages=[{"role": "user", "content": "synthetic"}], stream=True)
+        response = router.completion(
+            model="gpt-4", messages=[{"role": "user", "content": "synthetic"}], stream=True,
+            **({"litellm_metadata": {}} if both_buckets else {}),
+        )
         if limit < 2:
             with pytest.raises(RequestRetryLimitError):
                 list(response)
@@ -5658,18 +5663,20 @@ def test_request_retry_state_copies_share_cap_without_serializing_context(copier
 
 
 @pytest.mark.asyncio
-async def test_request_retry_state_ignores_client_fallback_depth_and_state_shape():
+@pytest.mark.parametrize("both_buckets", [False, True])
+async def test_request_retry_state_ignores_client_fallback_depth_and_state_shape(both_buckets):
     calls = []
     router = litellm.Router(model_list=[], num_retries=0)
     shared = {"request_retry_count": 999, "_retry_state": {"count": 999}, "previous_models": [{"messages": "private"}]}
 
     async def request(**kwargs):
-        calls.append(kwargs["metadata"])
+        calls.append(kwargs["litellm_metadata" if both_buckets else "metadata"])
         return litellm.ModelResponse()
 
     try:
         await router.async_function_with_fallbacks(
             original_function=request, model="synthetic", metadata=shared, fallback_depth=123,
+            **({"litellm_metadata": shared} if both_buckets else {}),
         )
         assert calls[0]["request_retry_count"] == 0
         assert "previous_models" not in calls[0]
@@ -5761,7 +5768,8 @@ async def test_request_retry_state_preserves_proxy_post_call_metadata_identity(p
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [1, 2])
-async def test_request_retry_state_survives_fallback_metadata_overrides(limit, monkeypatch):
+@pytest.mark.parametrize("both_buckets", [False, True])
+async def test_request_retry_state_survives_fallback_metadata_overrides(limit, both_buckets, monkeypatch):
     from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError, get_request_retry_count
 
     router = _make_router_with_fallback()
@@ -5779,9 +5787,91 @@ async def test_request_retry_state_survives_fallback_metadata_overrides(limit, m
     try:
         if limit == 1:
             with pytest.raises(RequestRetryLimitError):
-                await router.async_function_with_fallbacks(model="gpt-4", original_function=request)
+                await router.async_function_with_fallbacks(
+                    model="gpt-4", original_function=request,
+                    **({"metadata": {}, "litellm_metadata": {}} if both_buckets else {}),
+                )
         else:
-            await router.async_function_with_fallbacks(model="gpt-4", original_function=request)
+            await router.async_function_with_fallbacks(
+                    model="gpt-4", original_function=request,
+                    **({"metadata": {}, "litellm_metadata": {}} if both_buckets else {}),
+                )
         assert calls == [("gpt-4", 0)] + ([("gpt-3.5-turbo", 1)] if limit == 2 else [])
     finally:
         router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 1, 2])
+@pytest.mark.parametrize("both_buckets", [False, True])
+async def test_request_retry_state_survives_async_chat_stream_reentry(limit, both_buckets, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError, get_request_retry_count
+
+    router = _make_router_with_fallback()
+    router.num_retries = 0
+    monkeypatch.setattr(litellm, "num_retries_per_request", limit)
+    calls = []
+
+    class Stream(litellm.CustomStreamWrapper):
+        def __init__(self, fail):
+            self.model = "gpt-4"
+            self.custom_llm_provider = "openai"
+            self.logging_obj = MagicMock()
+            self.completion_stream = iter(())
+            self.chunks = []
+            self.fail = fail
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.fail:
+                raise MidStreamFallbackError(
+                    message="synthetic", model=self.model, llm_provider="openai",
+                    is_pre_first_chunk=True, generated_content="",
+                )
+            raise StopAsyncIteration
+
+    async def acompletion(**kwargs):
+        calls.append(get_request_retry_count(kwargs))
+        return Stream(len(calls) == 1)
+
+    monkeypatch.setattr(litellm, "acompletion", acompletion)
+
+    async def consume():
+        response = await router.acompletion(
+            model="gpt-4", messages=[{"role": "user", "content": "synthetic"}], stream=True,
+            **({"litellm_metadata": {}} if both_buckets else {}),
+        )
+        return [chunk async for chunk in response]
+
+    try:
+        if limit < 2:
+            with pytest.raises(RequestRetryLimitError):
+                await consume()
+        else:
+            assert await consume() == []
+        assert calls == list(range(max(1, limit)))
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("first_bucket", ["metadata", "litellm_metadata"])
+def test_request_retry_state_is_shared_when_internal_bucket_selection_changes(first_bucket):
+    from litellm.litellm_core_utils.core_helpers import (
+        advance_request_retry_count, get_request_retry_count, initialize_request_retry_state,
+    )
+
+    caller = {"metadata": {"owner": "synthetic"}, "litellm_metadata": {"owner": "synthetic"}}
+    request = caller.copy()
+    second_bucket = "metadata" if first_bucket == "litellm_metadata" else "litellm_metadata"
+    initialize_request_retry_state(request, first_bucket)
+    first_owned = request[first_bucket]
+    advance_request_retry_count(request)
+    initialize_request_retry_state(request, second_bucket)
+    advance_request_retry_count(request)
+    initialize_request_retry_state(request, first_bucket)
+    assert request[first_bucket] is first_owned
+    assert get_request_retry_count(request) == 1
+    assert request["metadata"]._retry_state is request["litellm_metadata"]._retry_state
+    assert caller == {"metadata": {"owner": "synthetic"}, "litellm_metadata": {"owner": "synthetic"}}

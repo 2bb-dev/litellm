@@ -200,25 +200,36 @@ def initialize_request_retry_state(kwargs: dict, metadata_variable_name: Optiona
     bucket = metadata_variable_name or get_metadata_variable_name_from_kwargs(kwargs)
     if type(kwargs.get(bucket)) is _RouterRequestMetadata:
         return
+    # Chat, Responses and deferred stream helpers can select different buckets.
+    # A trusted sibling means this is still the same request, not a new allowance.
+    state = next(
+        (value._retry_state for name in ("metadata", "litellm_metadata")
+         if type(value := kwargs.get(name)) is _RouterRequestMetadata),
+        None,
+    )
     for name in ("metadata", "litellm_metadata"):
         values = kwargs.get(name)
-        if isinstance(values, Mapping):
+        if isinstance(values, Mapping) and type(values) is not _RouterRequestMetadata:
             kwargs[name] = {
                 key: value
                 for key, value in values.items()
                 if key not in ("previous_models", "request_retry_count", "attempted_retries", "max_retries")
             }
     values = kwargs.get(bucket)
-    kwargs[bucket] = _RouterRequestMetadata(values if isinstance(values, Mapping) else {})
+    kwargs[bucket] = _RouterRequestMetadata(values if isinstance(values, Mapping) else {}, state)
 
 
 def preserve_request_retry_state(kwargs: dict, previous_metadata: object) -> None:
     """Fallback parameter overrides cannot create a new request-wide allowance."""
     if type(previous_metadata) is not _RouterRequestMetadata:
         return
+    for name in ("metadata", "litellm_metadata"):
+        metadata = kwargs.get(name)
+        if type(metadata) is _RouterRequestMetadata:
+            metadata._retry_state = previous_metadata._retry_state
     bucket = get_metadata_variable_name_from_kwargs(kwargs)
     metadata = kwargs.get(bucket)
-    if type(metadata) is _RouterRequestMetadata and metadata._retry_state is previous_metadata._retry_state:
+    if type(metadata) is _RouterRequestMetadata:
         return
     kwargs[bucket] = _RouterRequestMetadata(
         metadata if isinstance(metadata, Mapping) else {}, previous_metadata._retry_state
