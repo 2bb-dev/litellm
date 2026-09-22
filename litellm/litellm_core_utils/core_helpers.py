@@ -212,6 +212,19 @@ def initialize_request_retry_state(kwargs: dict, metadata_variable_name: Optiona
     kwargs[bucket] = _RouterRequestMetadata(values if isinstance(values, Mapping) else {})
 
 
+def preserve_request_retry_state(kwargs: dict, previous_metadata: object) -> None:
+    """Fallback parameter overrides cannot create a new request-wide allowance."""
+    if type(previous_metadata) is not _RouterRequestMetadata:
+        return
+    bucket = get_metadata_variable_name_from_kwargs(kwargs)
+    metadata = kwargs.get(bucket)
+    if type(metadata) is _RouterRequestMetadata and metadata._retry_state is previous_metadata._retry_state:
+        return
+    kwargs[bucket] = _RouterRequestMetadata(
+        metadata if isinstance(metadata, Mapping) else {}, previous_metadata._retry_state
+    )
+
+
 def advance_request_retry_count(kwargs: dict) -> None:
     initialize_request_retry_state(kwargs)
     metadata = kwargs[get_metadata_variable_name_from_kwargs(kwargs)]

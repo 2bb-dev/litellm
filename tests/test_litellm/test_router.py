@@ -5608,6 +5608,7 @@ def test_request_retry_state_survives_sync_stream_reentry(limit, monkeypatch):
             self.model = "gpt-4"
             self.custom_llm_provider = "openai"
             self.logging_obj = MagicMock()
+            self.completion_stream = iter(())
             self.chunks = []
             self.fail = fail
 
@@ -5754,5 +5755,33 @@ async def test_request_retry_state_preserves_proxy_post_call_metadata_identity(p
         owned["standard_logging_guardrail_information"] = [{"guardrail_name": "synthetic-post-call"}]
         assert forwarded[0]["standard_logging_guardrail_information"] == [{"guardrail_name": "synthetic-post-call"}]
         assert "_retry_state" not in json.dumps(owned, default=str)
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 2])
+async def test_request_retry_state_survives_fallback_metadata_overrides(limit, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError, get_request_retry_count
+
+    router = _make_router_with_fallback()
+    router.num_retries = 0
+    router.fallbacks = [{"gpt-4": [{"model": "gpt-3.5-turbo", "metadata": {}, "litellm_metadata": {"request_retry_count": -100}}]}]
+    monkeypatch.setattr(litellm, "num_retries_per_request", limit)
+    calls = []
+
+    async def request(**kwargs):
+        calls.append((kwargs["model"], get_request_retry_count(kwargs)))
+        if len(calls) == 1:
+            raise litellm.InternalServerError(message="synthetic", model="gpt-4", llm_provider="openai")
+        return litellm.ModelResponse()
+
+    try:
+        if limit == 1:
+            with pytest.raises(RequestRetryLimitError):
+                await router.async_function_with_fallbacks(model="gpt-4", original_function=request)
+        else:
+            await router.async_function_with_fallbacks(model="gpt-4", original_function=request)
+        assert calls == [("gpt-4", 0)] + ([("gpt-3.5-turbo", 1)] if limit == 2 else [])
     finally:
         router.reset()

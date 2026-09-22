@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import litellm
 from litellm._logging import verbose_router_logger
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError
+from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError, get_metadata_variable_name_from_kwargs, preserve_request_retry_state
 from litellm.router_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
     get_fallback_error_info,
@@ -137,6 +137,7 @@ async def run_async_fallback(
             # LOGGING
             kwargs = litellm_router.log_retry(kwargs=kwargs, e=original_exception)
             verbose_router_logger.info(f"Falling back to model_group = {mg}")
+            _retry_metadata = kwargs.get(get_metadata_variable_name_from_kwargs(kwargs))
             if isinstance(mg, str):
                 kwargs["model"] = mg
             elif isinstance(mg, dict):
@@ -149,6 +150,7 @@ async def run_async_fallback(
             kwargs["max_fallbacks"] = max_fallbacks
             if include_fallback_errors:
                 kwargs["include_fallback_errors"] = include_fallback_errors
+            preserve_request_retry_state(kwargs, _retry_metadata)
             response = await litellm_router.async_function_with_fallbacks(*args, **kwargs)
             verbose_router_logger.info("Successful fallback b/w models.")
             response = add_fallback_headers_to_response(
