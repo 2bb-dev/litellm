@@ -376,6 +376,12 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
             if isinstance(v, BaseModel):
                 v = v.model_dump()
             additional_usage_values.update({k: v})
+    # Standard logging captures these quantities before message redaction.
+    audio_usage = clean_metadata.get("usage_object") or {}
+    if call_type in ("transcription", "atranscription", "speech", "aspeech"):
+        for field in ("audio_seconds", "characters"):
+            if field in audio_usage:
+                additional_usage_values[field] = audio_usage[field]
     clean_metadata["additional_usage_values"] = additional_usage_values
 
     if litellm.cache is not None:

@@ -20,6 +20,7 @@ _VALUES = TypeAdapter(dict[str, object])
 _OPAQUE = TypeAdapter(object)
 _QUANTITY: TypeAdapter[int] = TypeAdapter(Quantity)
 _CHOICES = TypeAdapter(list[object])
+_FINISH_REASONS = {"stop", "length", "tool_calls", "content_filter", "function_call"}
 
 
 class UsageSnapshot(Closed):
@@ -134,7 +135,9 @@ def observe_sdk_usage(details: dict[str, object], response: object) -> None:
     local = _local_usage(details)
     try:
         local.usage_snapshot = snapshot(response.usage.model_dump(exclude_unset=True))
-        local.native_usage_final = isinstance(response, ChatCompletion) or response.choices == []
+        local.native_usage_final = isinstance(response, ChatCompletion) or all(
+            choice.finish_reason in _FINISH_REASONS for choice in response.choices
+        )
     except (ValidationError, ValueError):
         local.usage_invalid = True
     session = details.get(STAMP)
@@ -245,6 +248,17 @@ def _chatgpt_native(body: dict[str, object], streamed: bool) -> tuple[dict[str, 
     return normalized, not streamed or body.get("type") == "response.completed"
 
 
+def _chat_usage_final(body: dict[str, object], streamed: bool) -> bool:
+    choices = body.get("choices")
+    return not streamed or (
+        isinstance(choices, list)
+        and all(
+            isinstance(choice, dict) and _VALUES.validate_python(choice).get("finish_reason") in _FINISH_REASONS
+            for choice in _CHOICES.validate_python(choices)
+        )
+    )
+
+
 def _deepseek_native(body: dict[str, object], streamed: bool) -> tuple[dict[str, object], bool] | None:
     usage = body.get("usage")
     if usage is None:
@@ -263,17 +277,7 @@ def _deepseek_native(body: dict[str, object], streamed: bool) -> tuple[dict[str,
         "total_tokens": fields.get("total_tokens"),
         "cache_read_input_tokens": read,
     }
-    choices = body.get("choices")
-    final = not streamed or (
-        isinstance(choices, list)
-        and all(
-            isinstance(choice, dict)
-            and _VALUES.validate_python(choice).get("finish_reason")
-            in {"stop", "length", "tool_calls", "content_filter", "function_call"}
-            for choice in _CHOICES.validate_python(choices)
-        )
-    )
-    return normalized, final
+    return normalized, _chat_usage_final(body, streamed)
 
 
 def observe_native_usage(details: dict[str, object], raw: object, *, streamed: bool = False) -> None:
@@ -298,7 +302,7 @@ def observe_native_usage(details: dict[str, object], raw: object, *, streamed: b
         elif provider == "deepseek":
             captured = _deepseek_native(body, streamed)
         elif body.get("usage") is not None:
-            captured = (_VALUES.validate_python(body["usage"]), not streamed or body.get("choices") == [])
+            captured = (_VALUES.validate_python(body["usage"]), _chat_usage_final(body, streamed))
         else:
             captured = None
         if captured is not None:

@@ -394,3 +394,40 @@ def test_native_responses_canonical_write_measurement_preserves_actual_value(wri
     assert session.usage_snapshot.cache_write_tokens == write
     assert session.usage_snapshot.cache_write_5m_tokens is None
     assert session.usage_snapshot.cache_write_1h_tokens is None
+
+
+@pytest.mark.parametrize("sdk", [False, True])
+@pytest.mark.parametrize(
+    "reason,expected", [("stop", "observed"), ("length", "observed"), ("tool_calls", "observed"), (None, "partial")]
+)
+def test_proxy_final_usage_may_arrive_with_the_last_choice(sdk, reason, expected):
+    from litellm.litellm_core_utils.terminal_receipt_hooks import finish
+
+    body = {
+        "id": "chatcmpl-final",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "provider/model",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 3,
+            "total_tokens": 103,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        },
+    }
+    details = {"custom_llm_provider": "litellm_proxy"}
+    if sdk:
+        observe_sdk_usage(details, ChatCompletionChunk.model_validate(body))
+    else:
+        observe_native_usage(details, body, streamed=True)
+    finish(details, None, "success")
+    fact = usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id="chatcmpl-final")[FIELD]
+    assert fact["state"] == expected
+    assert fact["cache_read_tokens"] == 0
+    assert fact["cache_write_tokens"] is None
+    finish(details, None, "failure")
+    assert (
+        usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id="chatcmpl-final")[FIELD]["state"]
+        == "partial"
+    )

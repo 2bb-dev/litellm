@@ -72,3 +72,65 @@ def test_caller_dict_cannot_forge_private_local_usage():
     metadata = json.loads(get_logging_payload(details, response, now, now)["metadata"])
     assert FIELD not in metadata
     assert LOCAL_STAMP not in metadata
+
+
+@pytest.mark.parametrize("call_type", ["transcription", "atranscription", "speech", "aspeech"])
+def test_audio_metering_survives_message_redaction(call_type):
+    from litellm import TranscriptionResponse
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.litellm_core_utils.redact_messages import perform_redaction
+
+    now = datetime.now(timezone.utc)
+    logging = Logging(
+        model="synthetic-audio",
+        messages="a b\nc",
+        stream=False,
+        call_type=call_type,
+        start_time=now,
+        litellm_call_id="metered-audio",
+        function_id="audio",
+    )
+    logging.update_environment_variables(litellm_params={}, optional_params={})
+    response = TranscriptionResponse(text="private transcription")
+    response._hidden_params["audio_transcription_duration"] = 12.5
+    standard = logging._build_standard_logging_payload(response, now, now)
+    assert standard is not None
+    logging.model_call_details["standard_logging_object"] = standard
+    redacted = perform_redaction(logging.model_call_details, response)
+    payload = get_logging_payload(logging.model_call_details, redacted, now, now)
+    usage = json.loads(payload["metadata"])["additional_usage_values"]
+    if call_type in ("transcription", "atranscription"):
+        assert usage["audio_seconds"] == 12.5
+    else:
+        # Match LiteLLM's existing cost calculator, including whitespace handling.
+        assert usage["characters"] == 3
+    assert logging.model_call_details["input"] == ""
+    assert "private transcription" not in json.dumps(usage)
+
+
+@pytest.mark.parametrize("duration", [None, 0, 7.25, -1, float("inf"), True])
+def test_transcription_duration_is_measured_not_defaulted(duration):
+    from litellm import TranscriptionResponse
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    now = datetime.now(timezone.utc)
+    logging = Logging(
+        model="synthetic-audio",
+        messages=None,
+        stream=False,
+        call_type="atranscription",
+        start_time=now,
+        litellm_call_id="audio-duration",
+        function_id="audio",
+    )
+    logging.update_environment_variables(litellm_params={}, optional_params={})
+    response = TranscriptionResponse(text="synthetic")
+    if duration is not None:
+        response._hidden_params["audio_transcription_duration"] = duration
+    standard = logging._build_standard_logging_payload(response, now, now)
+    assert standard is not None
+    usage = standard["metadata"]["usage_object"]
+    if type(duration) in (int, float) and duration in (0, 7.25):
+        assert usage["audio_seconds"] == duration
+    else:
+        assert "audio_seconds" not in usage

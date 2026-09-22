@@ -4,6 +4,7 @@
 import copy
 import datetime
 import json
+import math
 import os
 import re
 import subprocess
@@ -5216,6 +5217,14 @@ def get_standard_logging_object_payload(
             response_obj=response_obj,
             combined_usage_object=cast(Optional[Usage], kwargs.get("combined_usage_object")),
         )
+        # Retain the same audio quantities used by cost calculation before
+        # message redaction removes the speech input. Absence is not zero.
+        if status == "success" and call_type in ("transcription", "atranscription"):
+            audio_seconds = hidden_params.get("audio_transcription_duration", response_obj.get("duration"))
+            if type(audio_seconds) in (int, float) and math.isfinite(audio_seconds) and audio_seconds >= 0:
+                usage_dict = {**usage_dict, "audio_seconds": audio_seconds}
+        elif status == "success" and call_type in ("speech", "aspeech") and isinstance(kwargs.get("input"), str):
+            usage_dict = {**usage_dict, "characters": litellm.utils._count_characters(text=kwargs["input"])}
 
         id = response_obj.get("id", kwargs.get("litellm_call_id"))
 
