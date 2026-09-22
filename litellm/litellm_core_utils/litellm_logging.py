@@ -4,6 +4,7 @@
 import copy
 import datetime
 import json
+import math
 import os
 import re
 import subprocess
@@ -6204,11 +6205,26 @@ def get_standard_logging_object_payload(
             response_obj=None if is_unbilled_non_inference_call(call_type, metadata, response_obj) else response_obj,
             combined_usage_object=cast(Usage | None, kwargs.get("combined_usage_object")),
         )
-        usage_dict: Final = (
+        native_usage_dict: Final = (
             {**raw_usage_dict, "output_image_count": len(init_response_obj.data)}
             if isinstance(init_response_obj, ImageResponse) and init_response_obj.data
             else raw_usage_dict
         )
+        # Retain the same audio quantities used by cost calculation before
+        # message redaction removes the speech input. Absence is not zero.
+        audio_seconds: Final = hidden_params.get("audio_transcription_duration", response_obj.get("duration"))
+        audio_usage: Final = (
+            {"audio_seconds": audio_seconds}
+            if status == "success"
+            and call_type in ("transcription", "atranscription")
+            and type(audio_seconds) in (int, float)
+            and math.isfinite(audio_seconds)
+            and audio_seconds >= 0
+            else {"characters": litellm.utils._count_characters(text=kwargs["input"])}
+            if status == "success" and call_type in ("speech", "aspeech") and isinstance(kwargs.get("input"), str)
+            else {}
+        )
+        usage_dict: Final = {**native_usage_dict, **audio_usage}
 
         id = response_obj.get("id", kwargs.get("litellm_call_id"))
 

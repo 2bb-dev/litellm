@@ -565,6 +565,12 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
             )
             if isinstance(cache_write_tokens, int) and cache_write_tokens > 0:
                 additional_usage_values["cache_creation_input_tokens"] = cache_write_tokens
+    # Standard logging captures these quantities before message redaction.
+    audio_usage = clean_metadata.get("usage_object") or {}
+    if call_type in ("transcription", "atranscription", "speech", "aspeech"):
+        for field in ("audio_seconds", "characters"):
+            if field in audio_usage:
+                additional_usage_values[field] = audio_usage[field]
     clean_metadata["additional_usage_values"] = additional_usage_values
 
     if litellm.cache is None:
