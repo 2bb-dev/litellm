@@ -803,6 +803,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                                 "api_base": openai_client._base_url._uri_reference,
                                 "acompletion": acompletion,
                                 "complete_input_dict": data,
+                                "openai_sdk": True,
                             },
                         )
 
@@ -944,6 +945,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                         "api_base": openai_aclient._base_url._uri_reference,
                         "acompletion": True,
                         "complete_input_dict": data,
+                        "openai_sdk": True,
                     },
                 )
 

@@ -5,6 +5,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final
 
 import tomllib
@@ -20,6 +21,7 @@ TARGETS: Final = (
 )
 PERMISSIVE_IDENTIFIERS: Final = frozenset(
     {
+        "0BSD",
         "MIT",
         "MIT-0",
         "Apache-2.0",
@@ -32,10 +34,29 @@ PERMISSIVE_IDENTIFIERS: Final = frozenset(
         "Unlicense",
         "Unicode-3.0",
         "CDLA-Permissive-2.0",
+        "Zlib",
     }
 )
 SIMD_SOURCE: Final = "https://github.com/Nugine/simd/blob/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE"
 SIMD_SHA256: Final = "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+AZURE_COMMITS: Final = MappingProxyType(
+    {
+        ("azure_core", "1.1.0"): "9a8a5f7bdb986e4c3ba230ad26b99996aae467d9",
+        ("azure_core_macros", "1.0.0"): "c3c92ed4349125e25d176f13faa9ef016b790b3e",
+        ("azure_identity", "1.0.0"): "c3c92ed4349125e25d176f13faa9ef016b790b3e",
+        ("typespec", "1.1.0"): "9a8a5f7bdb986e4c3ba230ad26b99996aae467d9",
+        ("typespec_client_core", "1.1.0"): "9a8a5f7bdb986e4c3ba230ad26b99996aae467d9",
+        ("typespec_macros", "1.0.0"): "c3c92ed4349125e25d176f13faa9ef016b790b3e",
+    }
+)
+AZURE_SHA256: Final = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+VEIL_SOURCE: Final = "https://github.com/primait/veil/blob/0c61ddcb825abacdd95541b52658878f71b46f3b"
+VEIL_SHA256: Final = MappingProxyType(
+    {
+        "MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+        "APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+    }
+)
 
 
 class CargoPackage(BaseModel):
@@ -88,6 +109,12 @@ def selected_names() -> frozenset[str]:
     )
 
 
+def supplemental_notice(identity: str, filename: str, source: str, sha256: str) -> Notice:
+    supplemental: Final = ROOT / "litellm-rust/notices" / filename
+    assert hashlib.sha256(supplemental.read_bytes()).hexdigest() == sha256
+    return Notice(identity, source, supplemental.read_text())
+
+
 def package_notices(package: CargoPackage) -> tuple[Notice, ...]:
     identifiers: Final = frozenset(re.split(r"\s+(?:AND|OR|WITH)\s+|[()/]", package.license or ""))
     assert {identifier.strip() for identifier in identifiers if identifier.strip()} <= PERMISSIVE_IDENTIFIERS, (
@@ -97,9 +124,21 @@ def package_notices(package: CargoPackage) -> tuple[Notice, ...]:
     directory: Final = Path(package.manifest_path).parent
     identity: Final = f"{package.name} {package.version} ({package.license})"
     if package.name in {"base64-simd", "vsimd"} and package.version == "0.8.0":
-        supplemental: Final = ROOT / "litellm-rust/notices/simd-0.8.0-LICENSE"
-        assert hashlib.sha256(supplemental.read_bytes()).hexdigest() == SIMD_SHA256
-        return (Notice(identity, SIMD_SOURCE, supplemental.read_text()),)
+        return (supplemental_notice(identity, "simd-0.8.0-LICENSE", SIMD_SOURCE, SIMD_SHA256),)
+    if azure_commit := AZURE_COMMITS.get((package.name, package.version)):
+        return (
+            supplemental_notice(
+                identity,
+                "azure-sdk-for-rust-LICENSE.txt",
+                f"https://github.com/azure/azure-sdk-for-rust/blob/{azure_commit}/LICENSE.txt",
+                AZURE_SHA256,
+            ),
+        )
+    if package.name == "veil-macros" and package.version == "0.3.0":
+        return tuple(
+            supplemental_notice(identity, f"veil-0.3.0-LICENSE-{name}", f"{VEIL_SOURCE}/LICENSE-{name}", sha256)
+            for name, sha256 in VEIL_SHA256.items()
+        )
     files: Final = tuple(
         sorted(
             path

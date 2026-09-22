@@ -3,6 +3,7 @@
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from datetime import datetime
 from functools import wraps
+from types import MappingProxyType
 from typing import Any, Final, Protocol
 
 from fastapi import HTTPException, Request
@@ -180,6 +181,7 @@ async def handle_budget_for_entity(
     user_api_key_dict: UserAPIKeyAuth,
     prisma_client: PrismaClient,
     litellm_proxy_admin_name: str,
+    budget_duration_cleared: bool = False,
 ) -> str | None:
     """
     Common helper to handle budget creation/updates for entities (organizations, tags, etc).
@@ -208,7 +210,14 @@ async def handle_budget_for_entity(
 
     # Extract budget fields from data
     _json_data: Final = data.model_dump(exclude_none=True) if hasattr(data, "model_dump") else data
-    _budget_data: Final = {k: v for k, v in _json_data.items() if k in budget_params}
+    _budget_data: Final = MappingProxyType(
+        {
+            k: _json_data.get(k)
+            for k in budget_params
+            if k in _json_data
+            or (k == "budget_duration" and existing_budget_id is not None and budget_duration_cleared)
+        }
+    )
 
     # Check if budget_id is explicitly provided in the data
     data_budget_id: Final[str | None] = getattr(data, "budget_id", None)
@@ -282,9 +291,9 @@ async def _clone_team_default_budget_for_member(
     member budget. Returns the new budget_id, or None if the default budget
     no longer exists in the DB.
 
-    Used when adding a new team member without an explicit per-member budget,
-    so the member starts with the team default's values but gets their own
-    private budget row (which can be edited independently).
+    Used when adding a new team member with a per-member ``budget_duration``
+    but no other per-member limit, so the member keeps the team default's
+    values in their own private budget row while the reset window differs.
 
     ``budget_duration_override`` replaces the default's reset window for this
     member while keeping the default's other limits, so an admin can set a
@@ -335,13 +344,20 @@ async def _resolve_member_budget_id(
     """
     Resolve the budget a new team member should be linked to.
 
-    Explicit per-member limits create a fresh budget. Otherwise the team's
-    default member budget is cloned (with ``budget_duration`` overriding its
-    reset window while keeping its other limits). A lone ``budget_duration``
-    with no team default creates a window-only budget. With nothing set the
-    member gets no budget.
+    Explicit per-member limits create a fresh budget. Otherwise the member is
+    linked to the team's shared default member budget, so later ``/team/update``
+    changes reach them; ``/team/member_update`` clones that row on first write.
+    A lone ``budget_duration`` clones the default with the reset window
+    overridden, or creates a window-only budget when there is no team default.
+    With nothing set the member gets no budget.
     """
     has_explicit_limit: Final = max_budget_in_team is not None or allowed_models is not None
+
+    if not has_explicit_limit and default_team_budget_id is not None and budget_duration is None:
+        default_budget: Final = await _budget_table(prisma_client, tx).find_unique(
+            where={"budget_id": default_team_budget_id}
+        )
+        return default_team_budget_id if default_budget is not None else None
 
     if not has_explicit_limit and default_team_budget_id is not None:
         return await _clone_team_default_budget_for_member(

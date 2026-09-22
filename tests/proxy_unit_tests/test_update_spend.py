@@ -27,7 +27,9 @@ from litellm.proxy.utils import (
 from litellm.proxy.db.spend_log_queue import (
     SQLiteSpendLogSpool,
     enqueue_spend_log,
+    release_spend_log_batch,
     spend_log_queue_stats,
+    take_spend_log_batch,
 )
 import math
 from litellm.constants import SPEND_LOG_WRITE_BATCH_MAX_ROWS
@@ -35,6 +37,38 @@ from litellm.constants import SPEND_LOG_WRITE_BATCH_MAX_ROWS
 # The flush chunks the queue by BATCH_SIZE and then splits each chunk by the row
 # budget, so statement counts below are derived from both rather than hardcoded.
 _OUTER_BATCH_SIZE = 1000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spool_failure", [False, True])
+async def test_memory_fallback_and_failed_batch_requeue_share_upstream_byte_budget(monkeypatch, caplog, spool_failure):
+    from functools import partial
+
+    from litellm.proxy import utils
+    from litellm.proxy.db.spend_log_batching import spend_log_row_bytes
+
+    client = MockPrismaClient()
+    if spool_failure:
+        client._spend_log_spool = MagicMock()
+        client._spend_log_spool.enqueue = AsyncMock(side_effect=OSError("synthetic disk full"))
+    rows = [{"request_id": f"row-{index}", "content": "PRIVATE-CONTENT" * 8} for index in range(4)]
+    cap = 2 * spend_log_row_bytes(rows[0])
+    monkeypatch.setattr(utils.PrismaClient, "spend_log_queue_bytes", 0)
+    monkeypatch.setattr(utils, "enqueue_spend_logs", partial(utils.enqueue_spend_logs, max_bytes=cap))
+
+    assert await enqueue_spend_log(client, rows[0]) is False
+    assert await enqueue_spend_log(client, rows[1]) is False
+    batch = await take_spend_log_batch(client, max_count=1, max_bytes=cap)
+    assert not batch.is_durable
+    assert utils.PrismaClient.spend_log_queue_bytes == spend_log_row_bytes(rows[1])
+    assert await enqueue_spend_log(client, rows[2]) is False
+    assert await enqueue_spend_log(client, rows[3]) is False
+    await release_spend_log_batch(client, batch)
+
+    assert client.spend_log_transactions == rows[2:]
+    assert utils.PrismaClient.spend_log_queue_bytes <= cap
+    assert caplog.text.count("dropped the 1 oldest spend logs") == 2
+    assert "PRIVATE-CONTENT" not in caplog.text
 
 
 def _statements_for(rows: int) -> int:

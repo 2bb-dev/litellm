@@ -16,11 +16,13 @@ import inspect
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final, Protocol, TypeVar, cast
+
+from pydantic import TypeAdapter
 
 import litellm
 from litellm._logging import print_verbose, verbose_logger
@@ -82,10 +84,28 @@ class _AsyncRedisCommands(Protocol):
 
     def pipeline(self, transaction: bool = True) -> "Pipeline[bytes]": ...
 
+    def eval(self, script: str, numkeys: int, *keys_and_args: str | bytes | float) -> Awaitable[object]: ...
+
 
 _BREAKER_GUARD_FRAME_NAMES: Final = frozenset(
     {"<lambda>", "wrapper", "_run_under_circuit_breaker", "_run_under_circuit_breaker_sync"}
 )
+
+_INCREMENT_WITH_FLOOR_LUA: Final = (
+    "local count = redis.call('INCRBY', KEYS[1], ARGV[1]) "
+    "if count < 0 then count = redis.call('INCRBY', KEYS[1], -count) end "
+    "if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end "
+    "return count"
+)
+
+_LUA_COUNT: Final = TypeAdapter(int)
+_OPTIONAL_COUNTS: Final = TypeAdapter(tuple[int | None, ...])
+
+
+def _decoded_counts(values: Sequence[bytes | str | None]) -> tuple[int | None, ...]:
+    return _OPTIONAL_COUNTS.validate_python(
+        tuple(value.decode("utf-8") if isinstance(value, bytes) else value for value in values)
+    )
 
 
 def _get_call_stack_info(num_frames: int = 2) -> str:
@@ -297,19 +317,37 @@ def _is_redis_health_failure(exc: BaseException) -> bool:
 def _redis_timeout_error_types() -> tuple[type, ...]:
     """Health failures that are timeouts rather than unambiguous connectivity errors.
 
-    ``builtins.TimeoutError`` covers ``asyncio.TimeoutError`` and ``socket.timeout``
-    (aliases since py3.11 / py3.10). ``redis.exceptions.TimeoutError`` does not subclass
-    either, so it is listed explicitly.
+    ``builtins.TimeoutError`` covers ``socket.timeout`` (an alias since py3.10) and, from
+    py3.11, ``asyncio.TimeoutError``; on py3.10 ``asyncio.TimeoutError`` is still its own
+    class, so it is listed explicitly. ``redis.exceptions.TimeoutError`` subclasses neither.
     """
     try:
         from redis.exceptions import TimeoutError as RedisTimeoutError
     except ImportError:
-        return (TimeoutError,)
-    return (RedisTimeoutError, TimeoutError)
+        return (TimeoutError, asyncio.TimeoutError)
+    return (RedisTimeoutError, TimeoutError, asyncio.TimeoutError)
+
+
+_MAX_EXCEPTION_CAUSE_DEPTH: Final = 20
+
+
+def _explicit_causes(exc: BaseException) -> Iterator[BaseException]:
+    current = exc  # rebind-ok: advances one link per iteration of the bounded walk
+    for _ in range(_MAX_EXCEPTION_CAUSE_DEPTH):
+        yield current
+        if current.__cause__ is None:
+            return
+        current = current.__cause__
 
 
 def _is_redis_timeout_failure(exc: BaseException) -> bool:
-    return isinstance(exc, _redis_timeout_error_types())
+    """True when ``exc`` or any exception it was explicitly raised ``from`` is a timeout.
+
+    redis-py's blocking pool reports a pool wait timeout as ``ConnectionError`` chained from
+    ``asyncio.TimeoutError``, which is a busy pool rather than an unreachable Redis.
+    """
+    timeout_types: Final = _redis_timeout_error_types()
+    return any(isinstance(link, timeout_types) for link in _explicit_causes(exc))
 
 
 class _BreakerMetrics:
@@ -770,6 +808,43 @@ class RedisCache(BaseCache):
             )
             raise e
 
+    @_redis_circuit_breaker_guard_sync
+    def increment_with_floor(self, key: str, value: int, ttl: int) -> int:
+        """Add ``value`` to ``key``, clamp the result at zero, and give a new key ``ttl``, in one Lua call.
+
+        A counter whose key expired while a request was still in flight would otherwise be
+        recreated negative by that request's decrement. Clamping inside the same call is what
+        keeps it safe: a separate corrective write could land after another pod's increment and
+        erase it.
+
+        The TTL is set only on a key that has none, so a counter expires ``ttl`` after it was
+        created rather than ``ttl`` after it was last touched. Refreshing it on every touch
+        would keep a count a dead worker never decremented alive for as long as the group
+        takes traffic. Returns the resulting count.
+        """
+        namespaced_key: Final = self.check_and_fix_namespace(key=key)
+        count: Final[object] = self.redis_client.eval(  # pyright: ignore[reportAttributeAccessIssue]  # stubs omit eval
+            _INCREMENT_WITH_FLOOR_LUA, 1, namespaced_key, value, ttl
+        )
+        return _LUA_COUNT.validate_python(count)
+
+    @_redis_circuit_breaker_guard_sync
+    def batch_get_counts(self, key_list: list[str]) -> tuple[int | None, ...]:
+        """Read integer counters for ``key_list``, in order, raising when Redis cannot answer.
+
+        ``batch_get_cache`` swallows every failure and returns an empty dict, which the caller
+        cannot tell apart from "every counter is unset". A caller that has to fall back to its
+        own numbers when Redis is unreachable needs the failure, not a dict of zeros.
+        """
+        namespaced_keys: Final = [self.check_and_fix_namespace(key=key) for key in key_list]
+        return _decoded_counts(self._run_redis_mget_operation(keys=namespaced_keys))
+
+    @_redis_circuit_breaker_guard
+    async def async_batch_get_counts(self, key_list: list[str]) -> tuple[int | None, ...]:
+        """Async twin of ``batch_get_counts``, raising on failure the same way."""
+        namespaced_keys: Final = [self.check_and_fix_namespace(key=key) for key in key_list]
+        return _decoded_counts(await self._async_run_redis_mget_operation(keys=namespaced_keys))
+
     @_redis_circuit_breaker_guard
     async def async_scan_iter(self, pattern: str, count: int = 100) -> list:
         start_time: Final = time.time()
@@ -1081,6 +1156,46 @@ class RedisCache(BaseCache):
             )
             _record_swallowed_redis_failure(self._circuit_breaker, e)
 
+    @_redis_circuit_breaker_guard
+    async def async_set_cache_pipeline_with_ttls(self, cache_list: Sequence[tuple[str, object, float | None]]) -> None:
+        """One round trip for writes whose TTLs differ; a ``None`` TTL falls back to the default TTL."""
+        if len(cache_list) == 0:
+            return
+        commands: Final = tuple(
+            (self.check_and_fix_namespace(key=cache_key), json.dumps(cache_value), self.get_ttl(ttl=ttl))
+            for cache_key, cache_value, ttl in cache_list
+        )
+        start_time: Final = time.time()
+        try:
+            async with self.init_async_client().pipeline(transaction=False) as pipe:
+                for cache_key, json_cache_value, ttl in commands:
+                    pipe.set(name=cache_key, value=json_cache_value, ex=None if ttl is None else timedelta(seconds=ttl))
+                await pipe.execute()
+            asyncio.create_task(
+                self.service_logger_obj.async_service_success_hook(
+                    service=ServiceTypes.REDIS,
+                    duration=time.time() - start_time,
+                    call_type=f"async_set_cache_pipeline_with_ttls <- {_get_call_stack_info()}",
+                    start_time=start_time,
+                    end_time=time.time(),
+                )
+            )
+        except Exception as e:
+            asyncio.create_task(
+                self.service_logger_obj.async_service_failure_hook(
+                    service=ServiceTypes.REDIS,
+                    duration=time.time() - start_time,
+                    error=e,
+                    call_type=f"async_set_cache_pipeline_with_ttls <- {_get_call_stack_info()}",
+                    start_time=start_time,
+                    end_time=time.time(),
+                )
+            )
+            verbose_logger.error(
+                "LiteLLM Redis Caching: async_set_cache_pipeline_with_ttls() - Got exception from REDIS %s", str(e)
+            )
+            _record_swallowed_redis_failure(self._circuit_breaker, e)
+
     async def _set_cache_sadd_helper(
         self,
         redis_client: async_redis_client,
@@ -1176,6 +1291,24 @@ class RedisCache(BaseCache):
         if len(self.redis_batch_writing_buffer) >= self.redis_flush_size:
             await self.flush_cache_buffer()  # logging done in here
 
+    @staticmethod
+    async def _incrbyfloat_with_ttl(
+        _redis_client: "Redis", key: str, value: float, ttl: int | None, refresh_ttl: bool
+    ) -> float:
+        """INCRBYFLOAT plus its TTL command in one round trip; a third only when an unexpiring key needs an EXPIRE."""
+        if ttl is None:
+            return await _redis_client.incrbyfloat(name=key, amount=value)
+        async with _redis_client.pipeline(transaction=False) as pipe:
+            pipe.incrbyfloat(name=key, amount=value)
+            if refresh_ttl:
+                pipe.expire(key, ttl)
+            else:
+                pipe.ttl(key)
+            result, ttl_or_expire = await pipe.execute()
+        if not refresh_ttl and ttl_or_expire == -1:
+            await _redis_client.expire(key, ttl)
+        return float(result)
+
     @_redis_circuit_breaker_guard
     async def async_increment(
         self,
@@ -1192,14 +1325,9 @@ class RedisCache(BaseCache):
         _used_ttl: Final = self.get_ttl(ttl=ttl)
         key = self.check_and_fix_namespace(key=key)
         try:
-            result: Final = await _redis_client.incrbyfloat(name=key, amount=value)
-            if _used_ttl is not None:
-                if refresh_ttl:
-                    await _redis_client.expire(key, _used_ttl)
-                else:
-                    current_ttl: Final = await _redis_client.ttl(key)
-                    if current_ttl == -1:
-                        await _redis_client.expire(key, _used_ttl)
+            result: Final = await self._incrbyfloat_with_ttl(
+                _redis_client, key=key, value=value, ttl=_used_ttl, refresh_ttl=refresh_ttl
+            )
 
             ## LOGGING ##
             end_time = time.time()
@@ -1274,6 +1402,14 @@ class RedisCache(BaseCache):
         if isinstance(result, bytes):
             result = result.decode()
         return float(result)
+
+    @_redis_circuit_breaker_guard
+    async def async_increment_with_floor(self, key: str, value: int, ttl: int) -> int:
+        """Async twin of ``increment_with_floor``, sharing its Lua script and its guarantees."""
+        _redis_client: Final = self._async_commands()
+        namespaced_key: Final = self.check_and_fix_namespace(key=key)
+        count: Final = await _redis_client.eval(_INCREMENT_WITH_FLOOR_LUA, 1, namespaced_key, value, ttl)
+        return _LUA_COUNT.validate_python(count)
 
     async def flush_cache_buffer(self):
         print_verbose(f"flushing to redis....reached size of buffer {len(self.redis_batch_writing_buffer)}")

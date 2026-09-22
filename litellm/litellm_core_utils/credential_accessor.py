@@ -18,15 +18,18 @@ class CredentialAccessor:
         return matches[0].credential_values.copy(), matches[0].credential_info.copy(), len(matches) != 1
 
     @staticmethod
+    def find_credential(credential_name: str) -> CredentialItem | None:
+        return next(
+            (credential for credential in litellm.credential_list if credential.credential_name == credential_name),
+            None,
+        )
+
+    @staticmethod
     def get_credential_values(credential_name: str) -> dict:
         """Safe accessor for credentials."""
 
-        if not litellm.credential_list:
-            return {}
-        for credential in litellm.credential_list:
-            if credential.credential_name == credential_name:
-                return credential.credential_values.copy()
-        return {}
+        credential: Final = CredentialAccessor.find_credential(credential_name)
+        return {} if credential is None else credential.credential_values.copy()
 
     @staticmethod
     def upsert_credentials(credentials: list[CredentialItem]):
