@@ -6212,7 +6212,7 @@ def get_standard_logging_object_payload(
         )
         # Retain the same audio quantities used by cost calculation before
         # message redaction removes the speech input. Absence is not zero.
-        audio_seconds: Final = hidden_params.get("audio_transcription_duration", response_obj.get("duration"))
+        audio_seconds: Final = (hidden_params or {}).get("audio_transcription_duration", response_obj.get("duration"))
         audio_usage: Final = (
             {"audio_seconds": audio_seconds}
             if status == "success"
