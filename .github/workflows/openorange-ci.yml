@@ -62,6 +62,7 @@ jobs:
             tests/test_litellm/proxy/test_litellm_pre_call_utils.py \
             tests/test_litellm/router_utils/pre_call_checks/test_encrypted_content_affinity_check.py \
             tests/test_litellm/router_utils/test_fallback_event_handlers.py \
+            tests/test_litellm/router_utils/test_chatgpt_rate_limit.py \
             tests/test_litellm/litellm_core_utils/test_credential_ownership.py \
             tests/test_litellm/litellm_core_utils/test_native_credential_ownership.py \
             tests/test_litellm/proxy/spend_tracking/test_spend_tracking_utils.py \

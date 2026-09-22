@@ -25,6 +25,11 @@ Upstream syncs must preserve these behaviors:
 - **OpenClaw attribution:** trusted runtime context and supported OpenClaw
   payload markers continue to populate actor, parent, session, channel,
   execution, and Langfuse metadata without persisting raw credentials.
+- **ChatGPT rate limits:** transient subscription 429 responses remain eligible
+  for bounded backoff retries. Only structured `usage_limit_reached` or
+  `insufficient_quota` codes trigger quota cooldown and skip retries, including
+  through a `litellm_proxy/chatgpt/` sidecar. Native-provider and non-429 error
+  policies are unchanged.
 - **Responses logging:** streamed terminal responses retain reconstructed
   output, annotations, refusals, and ordering for request-detail views.
 - **Spend-log resilience:** database writes use byte-bounded adaptive batches,
@@ -84,6 +89,7 @@ Without the flag, existing exclusive thresholds are unchanged.
 
 ## Focused Regression Suites
 
+- `tests/test_litellm/router_utils/test_chatgpt_rate_limit.py`
 - `tests/litellm/test_effective_token_pricing.py`
 - `tests/test_litellm/llms/chatgpt/chat/test_chatgpt_transformation.py`
 - `tests/test_litellm/llms/chatgpt/responses/test_chatgpt_responses_transformation.py`
