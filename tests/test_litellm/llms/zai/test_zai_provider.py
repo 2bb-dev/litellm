@@ -17,6 +17,12 @@ from litellm.llms.zai.chat.transformation import ZAIChatConfig
 
 
 @pytest.fixture
+def local_model_cost_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    monkeypatch.setattr(litellm, "model_cost", litellm.get_model_cost_map(url=""))
+
+
+@pytest.fixture
 def zai_response():
     """Mock response from Z.AI API"""
     return {
@@ -67,7 +73,7 @@ def test_glm52_native_metadata_and_routing():
     assert info["litellm_provider"] == "zai"
     assert info["mode"] == "chat"
     assert info["max_input_tokens"] == 1000000
-    assert info["max_output_tokens"] == 131072
+    assert info["max_output_tokens"] == 128000
     assert info["input_cost_per_token"] == pytest.approx(1.4e-06)
     assert info["cache_read_input_token_cost"] == pytest.approx(2.6e-07)
     assert info["output_cost_per_token"] == pytest.approx(4.4e-06)
@@ -101,12 +107,8 @@ def test_glm52_supports_reasoning_effort_without_changing_other_glm_models():
     assert mapped["thinking"] == {"type": "enabled"}
 
 
-def test_zai_models_in_model_cost():
+def test_zai_models_in_model_cost(local_model_cost_map):
     """Test that ZAI models are in the model cost map"""
-    import os
-
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
-    litellm.model_cost = litellm.get_model_cost_map(url="")
 
     zai_models = [
         "zai/glm-5.2",
@@ -126,12 +128,8 @@ def test_zai_models_in_model_cost():
         assert litellm.model_cost[model]["litellm_provider"] == "zai"
 
 
-def test_zai_glm46_cost_calculation():
+def test_zai_glm46_cost_calculation(local_model_cost_map):
     """Test the cost calculation for glm-4.6"""
-    import os
-
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
-    litellm.model_cost = litellm.get_model_cost_map(url="")
 
     key = "zai/glm-4.6"
     info = litellm.model_cost[key]
@@ -147,12 +145,8 @@ def test_zai_glm46_cost_calculation():
     assert math.isclose(completion_cost, 2.2, rel_tol=1e-6)
 
 
-def test_zai_flash_model_is_free():
+def test_zai_flash_model_is_free(local_model_cost_map):
     """Test that glm-4.5-flash has zero cost"""
-    import os
-
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
-    litellm.model_cost = litellm.get_model_cost_map(url="")
 
     key = "zai/glm-4.5-flash"
     info = litellm.model_cost[key]
@@ -161,12 +155,8 @@ def test_zai_flash_model_is_free():
     assert info["output_cost_per_token"] == 0
 
 
-def test_glm47_supports_reasoning():
+def test_glm47_supports_reasoning(local_model_cost_map):
     """Test that GLM-4.7 supports reasoning"""
-    import os
-
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
-    litellm.model_cost = litellm.get_model_cost_map(url="")
 
     key = "zai/glm-4.7"
     assert key in litellm.model_cost, f"Model {key} not found in model_cost"
@@ -175,12 +165,8 @@ def test_glm47_supports_reasoning():
     assert info["supports_reasoning"] is True
 
 
-def test_glm47_cost_calculation():
+def test_glm47_cost_calculation(local_model_cost_map):
     """Test cost calculation for GLM-4.7"""
-    import os
-
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
-    litellm.model_cost = litellm.get_model_cost_map(url="")
 
     prompt_cost, completion_cost = cost_per_token(
         model="zai/glm-4.7",
@@ -197,7 +183,7 @@ def test_glm47_cost_calculation():
 async def test_zai_completion_call(respx_mock, zai_response, monkeypatch):
     """Test completion call with zai provider using mocked response"""
     monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
-    litellm.disable_aiohttp_transport = True
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
 
     respx_mock.post("https://api.z.ai/api/paas/v4/chat/completions").respond(json=zai_response)
 
@@ -221,7 +207,7 @@ async def test_zai_completion_call(respx_mock, zai_response, monkeypatch):
 def test_zai_sync_completion(respx_mock, zai_response, monkeypatch):
     """Test synchronous completion call"""
     monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
-    litellm.disable_aiohttp_transport = True
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
 
     respx_mock.post("https://api.z.ai/api/paas/v4/chat/completions").respond(json=zai_response)
 

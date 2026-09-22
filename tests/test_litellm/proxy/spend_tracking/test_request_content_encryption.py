@@ -624,6 +624,7 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
 
     writer._batch_database_updates = capture_batch
     writer._enqueue_tool_registry_upsert = AsyncMock()
+    writer._enqueue_tool_usage_transaction = AsyncMock()
     encryptor = configured_encryptor()
     assert isinstance(encryptor, RequestContentEncryptor)
     with (
@@ -674,13 +675,13 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
         assert len(rows) == 1
         row = rows[0]
         assert CANARY not in json.dumps(row)
-        assert CANARY not in json.dumps(batch["payload_copy"], default=str)
+        assert CANARY not in json.dumps(batch["payload"], default=str)
         assert batch["response_cost"] == 0.25
         assert batch["hashed_token"] == "a" * 64
         assert batch["user_id"] == "user-1"
         assert batch["team_id"] == "team-1"
         assert batch["org_id"] == "org-1"
-        assert batch["request_tags"] == "[]"
+        assert batch["payload"]["request_tags"] == "[]"
         daily = await writer._common_add_spend_log_transaction_to_daily_transaction(row, client)
         assert daily["spend"] == 0.25
         assert daily["prompt_tokens"] == 9
@@ -690,7 +691,7 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
         assert daily["failed_requests"] == int(provider_failed)
         assert daily["successful_requests"] == int(not provider_failed)
         marker = json.loads(row["metadata"])["openorange_request_log"]
-        for persisted in (row, batch["payload_copy"]):
+        for persisted in (row, batch["payload"]):
             persisted_metadata = json.loads(persisted["metadata"])
             assert persisted["request_id"] == terminal_session.attempt_id
             assert persisted_metadata[TERMINAL_FIELD] == terminal_session.envelope.model_dump(mode="json")
@@ -734,6 +735,7 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
             assert content["response"]["choices"][0]["message"]["content"] == CANARY
             assert content["request_tags"] == [CANARY]
         writer._enqueue_tool_registry_upsert.assert_not_called()
+        writer._enqueue_tool_usage_transaction.assert_not_called()
         increments = writer.spend_update_queue.get_aggregated_db_spend_update_transactions(
             await writer.spend_update_queue.flush_all_updates_from_in_memory_queue()
         )
@@ -855,6 +857,7 @@ async def test_receipt_failure_recovery_uses_private_context_and_durable_ack(
     batches = AsyncMock()
     writer._batch_database_updates = batches
     writer._enqueue_tool_registry_upsert = AsyncMock()
+    writer._enqueue_tool_usage_transaction = AsyncMock()
     proxy_logging = proxy_server.proxy_logging_obj
     monkeypatch.setattr(proxy_logging, "db_spend_update_writer", writer)
     monkeypatch.setattr(proxy_logging, "update_request_status", AsyncMock())
