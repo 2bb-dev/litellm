@@ -431,3 +431,44 @@ def test_proxy_final_usage_may_arrive_with_the_last_choice(sdk, reason, expected
         usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id="chatcmpl-final")[FIELD]["state"]
         == "partial"
     )
+
+
+@pytest.mark.parametrize("sdk", [False, True])
+@pytest.mark.parametrize(
+    "started,finished,usage_first,expected",
+    [
+        ((0,), (0,), False, "observed"),
+        ((0, 1), (0,), False, "partial"),
+        ((0, 1), (0, 1), False, "observed"),
+        ((0,), (0,), True, "partial"),
+    ],
+)
+def test_proxy_usage_after_separate_finish_markers(sdk, started, finished, usage_first, expected):
+    from litellm.litellm_core_utils.terminal_receipt_hooks import finish
+
+    details = {"custom_llm_provider": "litellm_proxy"}
+    base = {"id": "chatcmpl-trailing", "object": "chat.completion.chunk", "created": 1, "model": "provider/model"}
+    usage = {
+        "prompt_tokens": 16,
+        "completion_tokens": 16,
+        "total_tokens": 32,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
+    start = {**base, "choices": [{"index": index, "delta": {}, "finish_reason": None} for index in started]}
+    terminal = {**base, "choices": [{"index": index, "delta": {}, "finish_reason": "length"} for index in finished]}
+    measured = {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": None}], "usage": usage}
+    for body in (start, measured, terminal) if usage_first else (start, terminal, measured):
+        if sdk:
+            observe_sdk_usage(details, ChatCompletionChunk.model_validate(body))
+        else:
+            observe_native_usage(details, body, streamed=True)
+    finish(details, None, "success")
+    fact = usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id=base["id"])[FIELD]
+    assert fact["state"] == expected
+    assert fact["cache_read_tokens"] == 0
+    assert fact["cache_write_tokens"] is None
+    finish(details, None, "failure")
+    assert (
+        usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id=base["id"])[FIELD]["state"]
+        == "partial"
+    )

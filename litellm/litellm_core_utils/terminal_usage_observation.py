@@ -56,6 +56,8 @@ class LocalUsage:
     native_usage_final: bool = False
     usage_final: bool = False
     usage_invalid: bool = False
+    chat_choices_seen: frozenset[int] = frozenset()
+    chat_choices_finished: frozenset[int] = frozenset()
 
 
 def _local_usage(details: dict[str, object]) -> LocalUsage:
@@ -130,13 +132,25 @@ def observe_sdk_usage(details: dict[str, object], response: object) -> None:
 
     if not isinstance(response, (ChatCompletion, ChatCompletionChunk)):
         return
-    if "usage" not in response.model_fields_set or response.usage is None:
+    has_usage = "usage" in response.model_fields_set and response.usage is not None
+    if not has_usage and not isinstance(response, ChatCompletionChunk):
         return
     local = _local_usage(details)
     try:
+        trailing_final = (
+            _chat_choices_finished(
+                local, [{"index": choice.index, "finish_reason": choice.finish_reason} for choice in response.choices]
+            )
+            if isinstance(response, ChatCompletionChunk)
+            else False
+        )
+        if not has_usage or response.usage is None:
+            return
         local.usage_snapshot = snapshot(response.usage.model_dump(exclude_unset=True))
-        local.native_usage_final = isinstance(response, ChatCompletion) or all(
-            choice.finish_reason in _FINISH_REASONS for choice in response.choices
+        local.native_usage_final = (
+            isinstance(response, ChatCompletion)
+            or trailing_final
+            or all(choice.finish_reason in _FINISH_REASONS for choice in response.choices)
         )
     except (ValidationError, ValueError):
         local.usage_invalid = True
@@ -248,6 +262,21 @@ def _chatgpt_native(body: dict[str, object], streamed: bool) -> tuple[dict[str, 
     return normalized, not streamed or body.get("type") == "response.completed"
 
 
+def _chat_choices_finished(local: LocalUsage, choices: object) -> bool:
+    if not isinstance(choices, list):
+        return False
+    rows = tuple(_VALUES.validate_python(choice) for choice in _CHOICES.validate_python(choices))
+    local.chat_choices_seen = local.chat_choices_seen | frozenset(
+        _QUANTITY.validate_python(row["index"]) for row in rows if "index" in row
+    )
+    local.chat_choices_finished = local.chat_choices_finished | frozenset(
+        _QUANTITY.validate_python(row["index"])
+        for row in rows
+        if "index" in row and row.get("finish_reason") in _FINISH_REASONS
+    )
+    return bool(local.chat_choices_seen) and local.chat_choices_seen <= local.chat_choices_finished
+
+
 def _chat_usage_final(body: dict[str, object], streamed: bool) -> bool:
     choices = body.get("choices")
     return not streamed or (
@@ -291,6 +320,7 @@ def observe_native_usage(details: dict[str, object], raw: object, *, streamed: b
     local = _local_usage(details)
     try:
         body = _VALUES.validate_python(raw)
+        trailing_final = _chat_choices_finished(local, body.get("choices")) if streamed else False
         if provider == "anthropic":
             captured = _anthropic_native(local, body, streamed)
         elif (
@@ -308,7 +338,7 @@ def observe_native_usage(details: dict[str, object], raw: object, *, streamed: b
         if captured is not None:
             normalized, final = captured
             local.usage_snapshot = snapshot(normalized)
-            local.native_usage_final = final
+            local.native_usage_final = final or trailing_final
     except (ValidationError, ValueError, TypeError):
         local.usage_invalid = True
     if type(session) is not Session or session.root.authority.settings.role != "producer" or session.relay:
