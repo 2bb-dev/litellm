@@ -18,6 +18,7 @@ from litellm.constants import (
     DEFAULT_FAILURE_THRESHOLD_PERCENT,
     SINGLE_DEPLOYMENT_TRAFFIC_FAILURE_THRESHOLD,
 )
+from litellm.router_utils.chatgpt_rate_limit import is_chatgpt_quota_error, is_chatgpt_rate_limit
 from litellm.router_utils.cooldown_callbacks import router_cooldown_event_callback
 
 from .router_callbacks.track_deployment_metrics import (
@@ -172,6 +173,9 @@ def _should_cooldown_deployment(
 
     - v1 logic (Legacy): if allowed fails or allowed fail policy set, coolsdown if num fails in this minute > allowed fails
     """
+    if is_chatgpt_rate_limit(original_exception) and not is_chatgpt_quota_error(original_exception):
+        return False
+
     ## BASE CASE - single deployment
     model_group = litellm_router_instance.get_model_group(id=deployment)
     is_single_deployment_model_group = False

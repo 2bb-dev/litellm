@@ -105,6 +105,7 @@ from litellm.router_utils.batch_utils import (
     replace_model_in_jsonl,
     should_replace_model_in_jsonl,
 )
+from litellm.router_utils.chatgpt_rate_limit import is_chatgpt_quota_error, is_chatgpt_rate_limit
 from litellm.router_utils.client_initalization_utils import InitalizeCachedClient
 from litellm.router_utils.clientside_credential_handler import (
     get_dynamic_litellm_params,
@@ -6386,7 +6387,7 @@ class Router:
             response = add_retry_headers_to_response(response=response, attempted_retries=0, max_retries=None)
             return response
         except Exception as e:
-            if is_invalid_encrypted_content_error(e):
+            if is_invalid_encrypted_content_error(e) or is_chatgpt_quota_error(e):
                 raise
             current_attempt = None
             original_exception = e
@@ -6474,7 +6475,9 @@ class Router:
                     return response
 
                 except Exception as e:
-                    if is_invalid_encrypted_content_error(e):
+                    if is_invalid_encrypted_content_error(e) or is_chatgpt_quota_error(e):
+                        raise
+                    if is_chatgpt_rate_limit(original_exception) and not is_chatgpt_rate_limit(e):
                         raise
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
