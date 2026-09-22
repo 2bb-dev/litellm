@@ -16,6 +16,211 @@ import litellm
 from litellm.exceptions import MidStreamFallbackError
 
 
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+def test_retry_history_is_flat_bounded_and_drops_untrusted_payload(bucket):
+    router = litellm.Router(model_list=[])
+    metadata = {
+        "model_info": {"id": "deployment-a", "api_key": "synthetic-credential"},
+        "previous_models": [{"exception_string": "private history", "messages": ["private prompt"]}],
+        "request_retry_count": 12,
+        "api_key": "synthetic-credential",
+    }
+    kwargs = {
+        "model": "group-a",
+        bucket: metadata,
+        "messages": [{"role": "user", "content": "private prompt"}],
+        "input": "private Responses input",
+        "api_key": "synthetic-credential",
+        "headers": {"Authorization": "Bearer synthetic-credential"},
+    }
+    kwargs["proxy_server_request"] = {"body": kwargs}
+    other_bucket = "metadata" if bucket == "litellm_metadata" else "litellm_metadata"
+    metadata[other_bucket] = {"previous_models": metadata["previous_models"]}
+
+    class UnprintableError(Exception):
+        def __str__(self):
+            raise AssertionError("Retry logging must not stringify provider errors")
+
+    try:
+        for _ in range(20):
+            router.log_retry(kwargs=kwargs, e=UnprintableError("private unstructured error"))
+        records = metadata["previous_models"]
+        assert len(records) == 4
+        assert metadata["request_retry_count"] == 12
+        assert set(records[0]) == {
+            "model_group",
+            "deployment_id",
+            "exception_type",
+            "status_code",
+            "request_retry_count",
+        }
+        assert records[-1]["deployment_id"] == "deployment-a"
+        serialized = json.dumps(records)
+        assert len(serialized) < 1500
+        assert "private" not in serialized
+        assert "synthetic-credential" not in serialized
+        assert "previous_models" not in serialized
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+def test_retry_history_bounds_fields_and_sanitizes_existing_records(bucket):
+    router = litellm.Router(model_list=[])
+    kwargs = {
+        "model": "group-a",
+        bucket: {
+            "previous_models": [
+                {
+                    "model_group": "a" * 10000,
+                    "exception_type": "Bearer " + "x" * 30,
+                    "messages": "synthetic-private",
+                    "request_retry_count": True,
+                },
+                "synthetic-private",
+            ],
+            "model_info": {"id": ["synthetic-private"]},
+        },
+    }
+    try:
+        router.log_retry(kwargs, ValueError("synthetic-private"))
+        earlier, current = kwargs[bucket]["previous_models"]
+        assert earlier["model_group"] is None
+        assert earlier["exception_type"] == "REDACTED"
+        assert earlier["request_retry_count"] is None
+        assert current["deployment_id"] is None
+        assert "synthetic-private" not in json.dumps(kwargs[bucket]["previous_models"])
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+async def test_retry_history_isolates_concurrent_requests_with_shared_metadata(bucket):
+    router = litellm.Router(model_list=[], num_retries=0)
+    shared = {"principal": "synthetic-owner", "previous_models": [{"messages": "private-old-request"}]}
+    untouched = copy.deepcopy(shared)
+    ready = asyncio.Event()
+    received = []
+
+    async def request(**kwargs):
+        received.append(kwargs)
+        if len(received) == 2:
+            ready.set()
+        await ready.wait()
+        router.log_retry(kwargs, ValueError("private-provider-error"))
+        await asyncio.sleep(0)
+        return litellm.ModelResponse()
+
+    try:
+        await asyncio.gather(
+            *(
+                router.async_function_with_fallbacks(
+                    model=principal,
+                    original_function=request,
+                    metadata=shared,
+                    **({"litellm_metadata": shared} if bucket == "litellm_metadata" else {}),
+                )
+                for principal in ("principal-a", "principal-b")
+            )
+        )
+        assert shared == untouched
+        assert received[0][bucket] is not received[1][bucket]
+        for kwargs in received:
+            records = kwargs[bucket]["previous_models"]
+            assert len(records) == 1
+            assert records[0]["model_group"] == kwargs["model"]
+            assert "private" not in json.dumps(records)
+            if bucket == "litellm_metadata":
+                assert "previous_models" not in kwargs["metadata"]
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+@pytest.mark.parametrize("limit,expected_calls", [(0, 1), (1, 1), (6, 6)])
+@pytest.mark.parametrize("per_group_retries", [0, 2])
+async def test_request_retry_cap_survives_fallback_hops_and_history_truncation(
+    bucket, limit, expected_calls, per_group_retries
+):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError
+
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": f"group-{group}",
+                "model_info": {"id": f"group-{group}-slot-{slot}"},
+                "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "synthetic"},
+            }
+            for group in range(7)
+            for slot in range(2)
+        ],
+        num_retries=per_group_retries,
+        max_fallbacks=20,
+        fallbacks=[{f"group-{n}": [f"group-{n + 1}"]} for n in range(20)],
+    )
+    previous_limit = litellm.num_retries_per_request
+    litellm.num_retries_per_request = limit
+    attempts = []
+
+    async def request(**kwargs):
+        attempts.append(copy.deepcopy(kwargs[bucket]))
+        raise litellm.InternalServerError(message="synthetic failure", model=kwargs["model"], llm_provider="openai")
+
+    try:
+        with pytest.raises(RequestRetryLimitError, match="Max retries per request hit"):
+            await router.async_function_with_fallbacks(model="group-0", original_function=request, **{bucket: {}})
+        assert len(attempts) == expected_calls
+        assert [item["request_retry_count"] for item in attempts] == list(range(expected_calls))
+        assert all(len(item.get("previous_models", ())) <= 4 for item in attempts)
+        if limit == 6:
+            assert attempts[-1]["request_retry_count"] > len(attempts[-1]["previous_models"])
+    finally:
+        litellm.num_retries_per_request = previous_limit
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quota", [False, True])
+async def test_retry_history_preserves_chatgpt_transient_and_quota_behavior(quota):
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "subscription",
+                "model_info": {"id": f"slot-{n}"},
+                "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "synthetic"},
+            }
+            for n in range(2)
+        ],
+        num_retries=2,
+        retry_after=0,
+    )
+    attempts = []
+
+    async def request(**kwargs):
+        attempts.append(copy.deepcopy(kwargs["metadata"]))
+        if len(attempts) < 3:
+            raise litellm.RateLimitError(
+                message=json.dumps({"error": {"type": "usage_limit_reached" if quota else "rate_limit_exceeded"}}),
+                model="chatgpt/gpt-5.6-sol",
+                llm_provider="chatgpt",
+            )
+        return litellm.ModelResponse()
+
+    try:
+        if quota:
+            with pytest.raises(litellm.RateLimitError):
+                await router.async_function_with_fallbacks(model="subscription", original_function=request)
+            assert len(attempts) == 1
+        else:
+            await router.async_function_with_fallbacks(model="subscription", original_function=request)
+            assert [item["request_retry_count"] for item in attempts] == [0, 1, 2]
+            assert len(attempts[-1]["previous_models"]) == 2
+    finally:
+        router.reset()
+
+
 def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():
     # initialize a real Router (env‑vars can be empty)
     router = litellm.Router(

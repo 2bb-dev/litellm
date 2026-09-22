@@ -7,7 +7,24 @@ from litellm.litellm_core_utils.core_helpers import (
     map_finish_reason,
     reconstruct_model_name,
     redact_nested_match_and_regex_keys,
+    max_retries_per_request_hit,
 )
+
+
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        {},
+        {"request_retry_count": True},
+        {"request_retry_count": "10"},
+        {"request_retry_count": -1},
+        {"previous_models": ["old"] * 10},
+    ],
+)
+def test_request_retry_cap_ignores_untyped_counters_and_breadcrumb_length(bucket, metadata):
+    assert not max_retries_per_request_hit({bucket: metadata}, 5)
 
 
 def test_reconstruct_model_name_prefers_deployment_value():

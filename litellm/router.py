@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 from collections import defaultdict
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -77,13 +78,17 @@ from litellm.litellm_core_utils.request_timeout_resolver import (
     get_configured_request_timeout,
 )
 from litellm.litellm_core_utils.core_helpers import (
+    RequestRetryLimitError,
     _get_parent_otel_span_from_kwargs,
     get_metadata_variable_name_from_kwargs,
+    get_request_retry_count,
+    max_retries_per_request_hit,
 )
 from litellm.litellm_core_utils.coroutine_checker import coroutine_checker
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.dd_tracing import tracer
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
+from litellm.litellm_core_utils.secret_redaction import redact_string
 from litellm.litellm_core_utils.sensitive_data_masker import SensitiveDataMasker
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
 from litellm.router_strategy.budget_limiter import RouterBudgetLimiting
@@ -578,7 +583,6 @@ class Router:
         self.total_calls: defaultdict = defaultdict(int)  # dict to store total calls made to each model
         self.fail_calls: defaultdict = defaultdict(int)  # dict to store fail_calls made to each model
         self.success_calls: defaultdict = defaultdict(int)  # dict to store success_calls  made to each model
-        self.previous_models: List = []  # list to store failed calls (passed in as metadata to next call)
 
         # make Router.chat.completions.create compatible for openai.chat.completions.create
         default_litellm_params = default_litellm_params or {}
@@ -6018,7 +6022,12 @@ class Router:
         original_model_group: Optional[str] = kwargs.get("model")  # type: ignore
         fallback_failure_exception_str = ""
 
-        if is_invalid_encrypted_content_error(e) or disable_fallbacks is True or original_model_group is None:
+        if (
+            isinstance(e, RequestRetryLimitError)
+            or is_invalid_encrypted_content_error(e)
+            or disable_fallbacks is True
+            or original_model_group is None
+        ):
             raise e
 
         input_kwargs = {
@@ -6227,7 +6236,7 @@ class Router:
 
                 return response
         except Exception as new_exception:
-            if is_invalid_encrypted_content_error(new_exception):
+            if isinstance(new_exception, RequestRetryLimitError) or is_invalid_encrypted_content_error(new_exception):
                 raise
             parent_otel_span = _get_parent_otel_span_from_kwargs(kwargs)
             verbose_router_logger.error(
@@ -6261,6 +6270,19 @@ class Router:
         Try calling the function_with_retries
         If it fails after num_retries, fall back to another model group
         """
+        if kwargs.get("fallback_depth", 0) == 0:
+            for bucket in ("metadata", "litellm_metadata"):
+                metadata = kwargs.get(bucket)
+                if isinstance(metadata, Mapping):
+                    kwargs[bucket] = {
+                        key: value
+                        for key, value in metadata.items()
+                        if key not in ("previous_models", "request_retry_count", "attempted_retries", "max_retries")
+                    }
+            metadata_var = get_metadata_variable_name_from_kwargs(kwargs)
+            if not isinstance(kwargs.get(metadata_var), dict):
+                kwargs[metadata_var] = {}
+            kwargs[metadata_var]["request_retry_count"] = -1
         model_group: Optional[str] = kwargs.get("model")
         include_fallback_errors = kwargs.get("include_fallback_errors", False) is True
         disable_fallbacks: Optional[bool] = kwargs.pop("disable_fallbacks", False)
@@ -6368,7 +6390,10 @@ class Router:
             num_retries = self.num_retries if self.num_retries is not None else 0
 
         ## ADD MODEL GROUP SIZE TO METADATA - used for model_group_rate_limit_error tracking
-        _metadata: dict = kwargs.get("litellm_metadata", kwargs.get("metadata")) or {}
+        metadata_var = get_metadata_variable_name_from_kwargs(kwargs)
+        if not isinstance(kwargs.get(metadata_var), dict):
+            kwargs[metadata_var] = {}
+        _metadata: dict = kwargs[metadata_var]
         if "model_group" in _metadata and isinstance(_metadata["model_group"], str):
             model_list = self.get_model_list(model_name=_metadata["model_group"])
             if model_list is not None:
@@ -6387,7 +6412,11 @@ class Router:
             response = add_retry_headers_to_response(response=response, attempted_retries=0, max_retries=None)
             return response
         except Exception as e:
-            if is_invalid_encrypted_content_error(e) or is_chatgpt_quota_error(e):
+            if (
+                isinstance(e, RequestRetryLimitError)
+                or is_invalid_encrypted_content_error(e)
+                or is_chatgpt_quota_error(e)
+            ):
                 raise
             current_attempt = None
             original_exception = e
@@ -6475,7 +6504,11 @@ class Router:
                     return response
 
                 except Exception as e:
-                    if is_invalid_encrypted_content_error(e) or is_chatgpt_quota_error(e):
+                    if (
+                        isinstance(e, RequestRetryLimitError)
+                        or is_invalid_encrypted_content_error(e)
+                        or is_chatgpt_quota_error(e)
+                    ):
                         raise
                     if is_chatgpt_rate_limit(original_exception) and not is_chatgpt_rate_limit(e):
                         raise
@@ -6540,6 +6573,13 @@ class Router:
         """
         Handler for making a call to the .completion()/.embeddings()/etc. functions.
         """
+        metadata_var = get_metadata_variable_name_from_kwargs(kwargs)
+        metadata = kwargs.setdefault(metadata_var, {})
+        previous_count = metadata.get("request_retry_count")
+        next_count = previous_count + 1 if type(previous_count) is int and previous_count >= 0 else 0
+        metadata["request_retry_count"] = next_count
+        if max_retries_per_request_hit(kwargs, litellm.num_retries_per_request):
+            raise RequestRetryLimitError("Max retries per request hit!")
         model_group = kwargs.get("model")
         response = original_function(*args, **kwargs)
         if coroutine_checker.is_async_callable(response) or inspect.isawaitable(response):
@@ -7008,38 +7048,44 @@ class Router:
         """
         return get_metadata_variable_name_from_kwargs(kwargs)
 
+    @staticmethod
+    def _retry_record(record: Mapping[str, object]) -> dict[str, Union[str, int, None]]:
+        return {
+            **{
+                key: redact_string(value) if isinstance(value, str) and len(value) <= 256 else None
+                for key in ("model_group", "deployment_id", "exception_type")
+                for value in (record.get(key),)
+            },
+            **{
+                key: value if type(value) is int and 0 <= value <= 2**31 - 1 else None
+                for key in ("status_code", "request_retry_count")
+                for value in (record.get(key),)
+            },
+        }
+
     def log_retry(self, kwargs: dict, e: Exception) -> dict:
-        """
-        When a retry or fallback happens, log the details of the just failed model call - similar to Sentry breadcrumbing
-        """
-        try:
-            _metadata_var = "litellm_metadata" if "litellm_metadata" in kwargs else "metadata"
-            # Log failed model as the previous model
-            previous_model = {
+        metadata_var = get_metadata_variable_name_from_kwargs(kwargs)
+        if not isinstance(kwargs.get(metadata_var), dict):
+            kwargs[metadata_var] = {}
+        metadata = kwargs[metadata_var]
+        model_info = metadata.get("model_info")
+        record = self._retry_record(
+            {
+                "model_group": kwargs.get("model"),
+                "deployment_id": model_info.get("id") if isinstance(model_info, Mapping) else None,
                 "exception_type": type(e).__name__,
-                "exception_string": str(e),
+                "status_code": getattr(e, "status_code", None),
+                "request_retry_count": get_request_retry_count(kwargs),
             }
-            for (
-                k,
-                v,
-            ) in kwargs.items():  # log everything in kwargs except the old previous_models value - prevent nesting
-                if k not in [_metadata_var, "messages", "original_function"]:
-                    previous_model[k] = v
-                elif k == _metadata_var and isinstance(v, dict):
-                    previous_model[_metadata_var] = {}  # type: ignore
-                    for metadata_k, metadata_v in kwargs[_metadata_var].items():
-                        if metadata_k != "previous_models":
-                            previous_model[k][metadata_k] = metadata_v  # type: ignore
-
-            # check current size of self.previous_models, if it's larger than 3, remove the first element
-            if len(self.previous_models) > 3:
-                self.previous_models.pop(0)
-
-            self.previous_models.append(previous_model)
-            kwargs[_metadata_var]["previous_models"] = self.previous_models
-            return kwargs
-        except Exception as e:
-            raise e
+        )
+        earlier = metadata.get("previous_models")
+        kept = (
+            tuple(self._retry_record(item) for item in earlier[-3:] if isinstance(item, Mapping))
+            if isinstance(earlier, (list, tuple))
+            else ()
+        )
+        metadata["previous_models"] = (*kept, record)
+        return kwargs
 
     def _update_usage(self, deployment_id: str, parent_otel_span: Optional[Span]) -> int:
         """

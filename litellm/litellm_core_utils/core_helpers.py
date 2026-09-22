@@ -1,6 +1,7 @@
 # What is this?
 ## Helper utilities
 import copy
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Union
 
 import httpx
@@ -164,6 +165,21 @@ def get_metadata_variable_name_from_kwargs(
     - LiteLLM is now moving to using `litellm_metadata` for our metadata
     """
     return "litellm_metadata" if "litellm_metadata" in kwargs else "metadata"
+
+
+class RequestRetryLimitError(RuntimeError):
+    pass
+
+
+def get_request_retry_count(kwargs: Mapping[str, object]) -> int:
+    metadata = kwargs.get("litellm_metadata" if "litellm_metadata" in kwargs else "metadata")
+    count = metadata.get("request_retry_count") if isinstance(metadata, Mapping) else None
+    return count if type(count) is int and count >= 0 else 0
+
+
+def max_retries_per_request_hit(kwargs: Mapping[str, object], limit: Optional[int]) -> bool:
+    count = get_request_retry_count(kwargs)
+    return limit is not None and count > 0 and count >= limit
 
 
 def get_litellm_metadata_from_kwargs(kwargs: dict):
