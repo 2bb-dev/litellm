@@ -82,6 +82,9 @@ from litellm.litellm_core_utils.core_helpers import (
     _get_parent_otel_span_from_kwargs,
     get_metadata_variable_name_from_kwargs,
     get_request_retry_count,
+    initialize_request_retry_state,
+    advance_request_retry_count,
+    _RouterRequestMetadata,
     max_retries_per_request_hit,
 )
 from litellm.litellm_core_utils.coroutine_checker import coroutine_checker
@@ -2799,6 +2802,7 @@ class Router:
         - litellm_trace_id
         - metadata
         """
+        initialize_request_retry_state(kwargs, metadata_variable_name)
         # Normalise an explicit num_retries=None to the router default here (dict.get()
         # only falls back when the key is absent, not when its value is None), then to 0
         # if the router default is itself None - mirroring the guard in
@@ -4493,6 +4497,7 @@ class Router:
         # fallback to the original reference for any non-picklable value.
         # The original_generic_function is preserved so the per-attempt
         # helper knows which underlying API to call on fallback.
+        initialize_request_retry_state(kwargs, "litellm_metadata")
         fallback_kwargs: Dict[str, Any] = kwargs.copy()
         if isinstance(fallback_kwargs.get("litellm_metadata"), dict):
             fallback_kwargs["litellm_metadata"] = safe_deep_copy(fallback_kwargs["litellm_metadata"])
@@ -6270,19 +6275,7 @@ class Router:
         Try calling the function_with_retries
         If it fails after num_retries, fall back to another model group
         """
-        if kwargs.get("fallback_depth", 0) == 0:
-            for bucket in ("metadata", "litellm_metadata"):
-                metadata = kwargs.get(bucket)
-                if isinstance(metadata, Mapping):
-                    kwargs[bucket] = {
-                        key: value
-                        for key, value in metadata.items()
-                        if key not in ("previous_models", "request_retry_count", "attempted_retries", "max_retries")
-                    }
-            metadata_var = get_metadata_variable_name_from_kwargs(kwargs)
-            if not isinstance(kwargs.get(metadata_var), dict):
-                kwargs[metadata_var] = {}
-            kwargs[metadata_var]["request_retry_count"] = -1
+        initialize_request_retry_state(kwargs)
         model_group: Optional[str] = kwargs.get("model")
         include_fallback_errors = kwargs.get("include_fallback_errors", False) is True
         disable_fallbacks: Optional[bool] = kwargs.pop("disable_fallbacks", False)
@@ -6374,6 +6367,7 @@ class Router:
 
     @tracer.wrap()
     async def async_function_with_retries(self, *args, **kwargs):
+        initialize_request_retry_state(kwargs)
         verbose_router_logger.debug("Inside async function with retries.")
         original_function = kwargs.pop("original_function")
         fallbacks = kwargs.pop("fallbacks", self.fallbacks)
@@ -6573,11 +6567,7 @@ class Router:
         """
         Handler for making a call to the .completion()/.embeddings()/etc. functions.
         """
-        metadata_var = get_metadata_variable_name_from_kwargs(kwargs)
-        metadata = kwargs.setdefault(metadata_var, {})
-        previous_count = metadata.get("request_retry_count")
-        next_count = previous_count + 1 if type(previous_count) is int and previous_count >= 0 else 0
-        metadata["request_retry_count"] = next_count
+        advance_request_retry_count(kwargs)
         if max_retries_per_request_hit(kwargs, litellm.num_retries_per_request):
             raise RequestRetryLimitError("Max retries per request hit!")
         model_group = kwargs.get("model")
@@ -7078,13 +7068,19 @@ class Router:
                 "request_retry_count": get_request_retry_count(kwargs),
             }
         )
-        earlier = metadata.get("previous_models")
+        earlier = (
+            metadata._retry_state.history
+            if type(metadata) is _RouterRequestMetadata
+            else metadata.get("previous_models")
+        )
         kept = (
             tuple(self._retry_record(item) for item in earlier[-3:] if isinstance(item, Mapping))
             if isinstance(earlier, (list, tuple))
             else ()
         )
         metadata["previous_models"] = (*kept, record)
+        if type(metadata) is _RouterRequestMetadata:
+            metadata._retry_state.history = metadata["previous_models"]
         return kwargs
 
     def _update_usage(self, deployment_id: str, parent_otel_span: Optional[Span]) -> int:
