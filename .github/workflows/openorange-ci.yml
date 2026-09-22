@@ -79,7 +79,7 @@ jobs:
             tests/test_litellm/test_router.py \
             tests/test_litellm/test_utils.py \
             tests/test_litellm/litellm_core_utils/test_core_helpers.py \
-            -k 'retry_history or request_retry_cap'
+            -k 'retry_history or request_retry_cap or request_retry_state'
 
       - name: Verify OSS dependency graph and imports
         run: |
