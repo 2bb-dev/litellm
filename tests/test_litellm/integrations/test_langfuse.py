@@ -739,9 +739,14 @@ class TestLangfuseUsageDetails(unittest.TestCase):
         redaction has to run on the assembled payload or the flag silently stops working.
         """
         with patch.object(litellm, "redact_user_api_key_info", True):
-            generation_metadata = self._drive_with_canary()
+            generation_metadata = self._drive_with_canary(extra_metadata={"debug_langfuse": True})
 
         assert not [key for key in generation_metadata if key.startswith("user_api_key")]
+        assert not [key for key in self.last_trace_kwargs["metadata"] if key.startswith("user_api_key")]
+        assert not [
+            key for key in self.last_trace_kwargs["metadata"]["metadata_passed_to_litellm"]
+            if key.startswith("user_api_key")
+        ]
 
     def test_steering_keys_still_read_from_raw_metadata(self):
         """

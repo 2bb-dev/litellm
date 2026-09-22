@@ -5,10 +5,10 @@ import base64
 import hashlib
 import json
 import os
-from contextlib import contextmanager
-from pathlib import Path
 import subprocess
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
 from uuid import uuid4
@@ -22,14 +22,17 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.terminal_receipt_client import Authority, Settings
-from litellm.litellm_core_utils.terminal_receipt_evidence import Envelope, FIELD, parse_jws, verify_set
+from litellm.litellm_core_utils.terminal_receipt_evidence import FIELD, Envelope, parse_jws, verify_set
 from litellm.litellm_core_utils.terminal_usage_evidence import (
     FIELD as USAGE_EVIDENCE_FIELD,
+)
+from litellm.litellm_core_utils.terminal_usage_evidence import (
     UsageEnvelope,
     parse_usage,
     verify_usage_set,
 )
-from litellm.litellm_core_utils.terminal_usage_observation import FIELD as USAGE_FIELD, UsageSnapshot
+from litellm.litellm_core_utils.terminal_usage_observation import FIELD as USAGE_FIELD
+from litellm.litellm_core_utils.terminal_usage_observation import UsageSnapshot
 from litellm.proxy.spend_tracking.request_content_metadata import protect_spend_payload
 from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
 from tests.test_litellm.litellm_core_utils.test_native_credential_ownership import response_body, route
@@ -143,12 +146,18 @@ def authority_server(tmp_path):
 class SpendCapture(CustomLogger):
     def __init__(self):
         self.rows = []
+        self.recovered_usage = {}
 
     def capture(self, kwargs, response, start, end):
         row = protect_spend_payload(get_logging_payload(kwargs, response, start, end))
         metadata = json.loads(row["metadata"])
         if FIELD in metadata:
             self.rows.append(row)
+            recovered = kwargs.get("combined_usage_object")
+            if isinstance(recovered, litellm.Usage):
+                self.recovered_usage[row["request_id"]] = {
+                    "usage": recovered.model_dump(), "cost": kwargs.get("response_cost"),
+                }
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         self.capture(kwargs, response_obj, start_time, end_time)
@@ -162,6 +171,7 @@ class SpendCapture(CustomLogger):
 @contextmanager
 def router_server(event_loop):
     routers = []
+    wire_usages = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -178,8 +188,15 @@ def router_server(event_loop):
                 if body.get("stream"):
                     chunks = [chunk async for chunk in response]
                     data = "".join("data: " + chunk.model_dump_json() + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+                    wire_chunks = [json.loads(chunk.model_dump_json()) for chunk in chunks]
+                    wire_usages.append(next(
+                        ({"usage": chunk["usage"], "final": chunk.get("choices") == []}
+                         for chunk in reversed(wire_chunks) if chunk.get("usage") is not None),
+                        None,
+                    ))
                 else:
                     data = response.model_dump_json()
+                    wire_usages.append({"usage": json.loads(data).get("usage"), "final": True})
                 return data.encode()
 
             try:
@@ -202,7 +219,7 @@ def router_server(event_loop):
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}", routers
+        yield f"http://127.0.0.1:{server.server_port}", routers, wire_usages
     finally:
         server.shutdown()
         server.server_close()
@@ -262,7 +279,7 @@ async def run_router_platform_case(
     supplier_partial=False,
 ):
     upstream, calls, replies = native_server
-    central, routers = central_server
+    central, routers, wire_usages = central_server
     capture = SpendCapture()
     from litellm.proxy.proxy_server import proxy_logging_obj
 
@@ -389,7 +406,7 @@ async def run_router_platform_case(
         terminal_receipt_authority=terminal_authority,
     )
     if delegated_server:
-        sidecar_base, sidecar_routers = delegated_server
+        sidecar_base, sidecar_routers, _ = delegated_server
         sidecar_routers.append(terminal_router)
         relay_authority = Authority(
             authority_server["terminal"].settings.model_copy(
@@ -501,9 +518,11 @@ async def run_router_platform_case(
         },
     )
     if client_disconnect:
+        delivered_text = ""
         for _ in range(8):
             chunk = await response.__anext__()
-            if any(choice.delta.content for choice in chunk.choices):
+            delivered_text += "".join(choice.delta.content or "" for choice in chunk.choices)
+            if delivered_text:
                 break
         if cancelled_scope:
             import anyio
@@ -643,17 +662,63 @@ async def run_router_platform_case(
         assert observations[0].cache_write_tokens == (0 if usage_case == "responses_write_zero" else 7)
         assert observations[0].cache_write_5m_tokens is None
         assert observations[0].cache_write_1h_tokens is None
+    # Signed supplier measurements and the local proxy response are separate facts.
+    # The local-observation contract added in 1b54966512 keeps actual proxy wire
+    # counts even when supplier cache operands are absent or a fallback occurred.
     if len(finished) > 1:
-        assert scalar["state"] == "unobserved"
-        assert all(scalar[name] is None for name in UsageSnapshot.model_fields)
         assert observations[0].state == "unobserved"
+        assert all(getattr(observations[0], name) is None for name in UsageSnapshot.model_fields)
+        assert observations[-1].state == "observed"
     elif usage_case == "missing":
-        assert observations[0].state == scalar["state"] == "unobserved"
-        assert all(scalar[name] is None for name in UsageSnapshot.model_fields)
+        assert observations[0].state == "unobserved"
+        assert all(getattr(observations[0], name) is None for name in UsageSnapshot.model_fields)
     else:
         assert observations[0].state == "observed", observations
-        assert scalar["state"] == ("partial" if client_disconnect else "observed"), scalar
+    if usage_case not in {"missing", "zero"}:
+        terminal = observations[-1]
+        assert terminal.prompt_tokens == (None if provider == "anthropic" and usage_case != "explicit_cache" else 9)
+        assert terminal.completion_tokens == 3
+        assert terminal.total_tokens == (None if provider == "anthropic" else 12)
+        assert terminal.cache_read_tokens == (
+            0 if provider == "chatgpt" or usage_case in {"explicit_cache", "unestablished_writes"} else None
+        )
+        expected_write = (
+            0 if usage_case in {"explicit_cache", "responses_write_zero"}
+            else 7 if usage_case == "responses_write_nonzero" else None
+        )
+        assert terminal.cache_write_tokens == expected_write
+        assert terminal.cache_write_5m_tokens is None
+        assert terminal.cache_write_1h_tokens is None
+    assert scalar["local_attempt_id"] == row["request_id"]
+    if client_disconnect:
+        assert scalar["state"] == "partial", scalar
         assert all(scalar[name] == getattr(observations[0], name) for name in UsageSnapshot.model_fields)
+    else:
+        assert wire_usages and wire_usages[-1] is not None
+        wire = wire_usages[-1]["usage"]
+        assert wire is not None
+        details = wire.get("prompt_tokens_details") or {}
+        creation = wire.get("cache_creation") or details.get("cache_creation_token_details") or {}
+
+        def present(*values):
+            return next((value for value in values if value is not None), None)
+
+        expected_local = {
+            "prompt_tokens": wire.get("prompt_tokens"),
+            "completion_tokens": wire.get("completion_tokens"),
+            "total_tokens": wire.get("total_tokens"),
+            "cache_read_tokens": present(wire.get("cache_read_input_tokens"), details.get("cached_tokens")),
+            "cache_write_tokens": present(
+                wire.get("cache_creation_input_tokens"), details.get("cache_write_tokens"),
+                details.get("cache_creation_tokens"),
+            ),
+            "cache_write_5m_tokens": creation.get("ephemeral_5m_input_tokens"),
+            "cache_write_1h_tokens": creation.get("ephemeral_1h_input_tokens"),
+        }
+        # A usage-bearing chunk with choices is an interim meter; the local
+        # transport requires the empty-choices usage frame for finality.
+        assert scalar["state"] == ("observed" if wire_usages[-1]["final"] else "partial"), scalar
+        assert {name: scalar[name] for name in UsageSnapshot.model_fields} == expected_local
     expected_source = (
         "unknown"
         if oauth_fault in {"missing_registration", "account_change", "late_auth", "late_account"}
@@ -672,17 +737,30 @@ async def run_router_platform_case(
     if client_disconnect:
         assert row["status"] == "failure"
         assert envelope.receipts
-        assert row["completion_tokens"] == 0  # Provider usage has not arrived before this early close.
+        # Stable upstream retains delivered-chunk estimates on interrupted rows.
+        # These counters and cost are not the separately signed supplier usage.
+        assert delivered_text == "synthetic"
+        recovered = capture.recovered_usage[row["request_id"]]
+        for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            assert row[name] == recovered["usage"][name]
+        assert row["completion_tokens"] == 2
+        assert row["spend"] == recovered["cost"]
+        assert row["spend"] >= 0
+        assert scalar["state"] == "partial"
+        assert scalar["completion_tokens"] == observations[0].completion_tokens == 3
     elif usage_case == "zero":
         assert response.usage.total_tokens == 0
         assert scalar["prompt_tokens"] == scalar["completion_tokens"] == scalar["total_tokens"] == 0
         assert scalar["cache_write_tokens"] is None
+        assert observations[0].prompt_tokens == observations[0].completion_tokens == observations[0].total_tokens == 0
+        assert observations[0].cache_write_tokens is None
     elif usage_case != "missing":
         assert response.usage.total_tokens == 12
     if usage_case == "explicit_cache":
         assert scalar["prompt_tokens"] == 9
         assert scalar["cache_read_tokens"] == scalar["cache_write_tokens"] == 0
-        assert scalar["total_tokens"] is None
+        assert observations[0].total_tokens is None
+        assert scalar["total_tokens"] == 12
     assert all(
         not {"x-openorange-terminal-ingress", "x-openorange-terminal-central-request"}.intersection(
             key.lower() for key in call["headers"]

@@ -710,7 +710,9 @@ class LangFuseLogger:
 
             if debug is True or (isinstance(debug, str) and debug.lower() == "true"):
                 debug_metadata: Final = {
-                    key: value for key, value in allowlisted_metadata.items() if isinstance(value, (str, int, float, bool))
+                    key: value
+                    for key, value in redact_user_api_key_info(metadata=allowlisted_metadata).items()
+                    if isinstance(value, (str, int, float, bool))
                 }
                 trace_params["metadata"] = {
                     **(trace_params.get("metadata") or _NO_METADATA),
