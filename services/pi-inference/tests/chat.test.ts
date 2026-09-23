@@ -164,3 +164,20 @@ test("tool streaming emits complete arguments once despite advanced mutable part
   assert(JSON.stringify(final).includes("tool_calls"));
   assert.equal(final.at(-1)?.data, "[DONE]");
 });
+
+test("chat rejects what Claude Opus 5.5 rejects instead of dropping it", () => {
+  const opus = getBuiltinModel("anthropic", "claude-opus-5-5");
+  const base = { model: "opus", messages: [{ role: "user", content: "hi" }] };
+  for (const body of [
+    { ...base, temperature: 0.2 },
+    { ...base, reasoning_effort: "none" },
+    { ...base, tool_choice: "required" },
+  ]) {
+    const prepared = prepareChat(body, opus);
+    assert.equal(prepared.ok, false, JSON.stringify(body));
+    if (!prepared.ok) assert.equal(prepared.error.status, 400);
+  }
+  const accepted = prepareChat({ ...base, reasoning_effort: "xhigh" }, opus);
+  assert.equal(accepted.ok, true);
+  if (accepted.ok) assert.equal(accepted.value.options.reasoning, "xhigh");
+});

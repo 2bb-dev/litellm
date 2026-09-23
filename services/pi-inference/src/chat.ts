@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   getSupportedThinkingLevels,
+  hasApi,
   Type,
   type Api,
   type AssistantMessage,
@@ -135,6 +136,12 @@ export function prepareChat(
     input.reasoning_effort === "none" ? "off" : input.reasoning_effort;
   if (effort && !getSupportedThinkingLevels(model).includes(effort))
     return invalid("Unsupported reasoning effort for this model");
+  if (
+    input.temperature !== undefined &&
+    hasApi(model, "anthropic-messages") &&
+    model.compat?.supportsTemperature === false
+  )
+    return invalid("Temperature is unsupported with this model");
   if (input.max_tokens && input.max_completion_tokens)
     return invalid("Use only one output token limit");
   const maxTokens = input.max_completion_tokens ?? input.max_tokens;
