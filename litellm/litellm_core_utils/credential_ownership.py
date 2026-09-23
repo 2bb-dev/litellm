@@ -305,9 +305,12 @@ def resolve_ownership(
         selection.shared_session is not None and not _proxy_shared_session(shared_session)
     ):
         return _stamp(selection, None, "credential_override")
+    if request.get("custom_llm_provider") not in (None, (selection.model or "").partition("/")[0]):
+        return _stamp(selection, None, "credential_override")
     if any(
         request.get(key) is not None
-        for key in _auth_fields() - {"api_key", "api_base", "litellm_credential_name", "client", "shared_session"}
+        for key in _auth_fields()
+        - {"api_key", "api_base", "litellm_credential_name", "client", "shared_session", "custom_llm_provider"}
     ):
         return _stamp(selection, None, "credential_override")
     if named and any(key not in {"api_key", "api_base"} for key in credential_values):
