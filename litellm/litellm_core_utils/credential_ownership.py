@@ -288,8 +288,11 @@ def resolve_ownership(
     # connection to a configured upstream proxy: a registration there attests
     # the connection credential and the local deployment, never the terminal
     # supplier credential behind that proxy.
-    if request.get("model") != selection.model or not (selection.model or "").startswith(
-        ("openai/", "veniceai/", "anthropic/", "deepseek/", "litellm_proxy/")
+    if not (selection.model or "").startswith(("openai/", "veniceai/", "anthropic/", "deepseek/", "litellm_proxy/")):
+        return _stamp(selection, None, "ambiguous")
+    selected_provider, _, provider_model = (selection.model or "").partition("/")
+    if request.get("model") != selection.model and (
+        request.get("model") != provider_model or request.get("custom_llm_provider") != selected_provider
     ):
         return _stamp(selection, None, "ambiguous")
     if request.get("litellm_credential_name") != selection.credential_name:
@@ -305,12 +308,22 @@ def resolve_ownership(
         selection.shared_session is not None and not _proxy_shared_session(shared_session)
     ):
         return _stamp(selection, None, "credential_override")
-    if request.get("custom_llm_provider") not in (None, (selection.model or "").partition("/")[0]):
+    if request.get("custom_llm_provider") not in (None, selected_provider):
+        return _stamp(selection, None, "credential_override")
+    if request.get("extra_headers") not in (None, {}):
         return _stamp(selection, None, "credential_override")
     if any(
         request.get(key) is not None
         for key in _auth_fields()
-        - {"api_key", "api_base", "litellm_credential_name", "client", "shared_session", "custom_llm_provider"}
+        - {
+            "api_key",
+            "api_base",
+            "litellm_credential_name",
+            "client",
+            "shared_session",
+            "custom_llm_provider",
+            "extra_headers",
+        }
     ):
         return _stamp(selection, None, "credential_override")
     if named and any(key not in {"api_key", "api_base"} for key in credential_values):
