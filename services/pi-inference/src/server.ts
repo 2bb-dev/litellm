@@ -51,13 +51,19 @@ const timeoutFailure: ApiError = {
   message: "Inference deadline exceeded",
 };
 const modelRequest = z.object({ model: z.string().min(1) });
+// Anthropic SDK clients (Claude Code, pi-ai >= 0.85) call `/v1/messages?beta=true`,
+// so routing matches the path and ignores the query string.
+const pathOf = (req: IncomingMessage): string =>
+  URL.canParse(req.url ?? "", "http://backend.invalid")
+    ? new URL(req.url ?? "", "http://backend.invalid").pathname
+    : "";
 
 export function createInferenceServer(options: ServerOptions) {
   const active = new Set<AbortController>();
   const server = createServer((req, res) => {
     void handle(req, res).catch(() => {
       if (!res.headersSent)
-        sendError(res, genericFailure, req.url === "/v1/messages");
+        sendError(res, genericFailure, pathOf(req) === "/v1/messages");
       else res.destroy();
     });
   });
@@ -69,10 +75,11 @@ export function createInferenceServer(options: ServerOptions) {
     req: IncomingMessage,
     res: ServerResponse,
   ): Promise<void> {
-    const native = req.url === "/v1/messages";
+    const path = pathOf(req);
+    const native = path === "/v1/messages";
     if (
       req.method === "GET" &&
-      ["/health/liveliness", "/health/readiness"].includes(req.url ?? "")
+      ["/health/liveliness", "/health/readiness"].includes(path)
     ) {
       sendJson(res, 200, { status: "ok" });
       return;
@@ -89,7 +96,7 @@ export function createInferenceServer(options: ServerOptions) {
       );
       return;
     }
-    if (req.method === "GET" && req.url === "/v1/models") {
+    if (req.method === "GET" && path === "/v1/models") {
       sendJson(res, 200, {
         object: "list",
         data: [...options.runtime.routes].map(([alias, model]) => ({
@@ -109,7 +116,7 @@ export function createInferenceServer(options: ServerOptions) {
       });
       return;
     }
-    if (req.method === "GET" && req.url === "/v1/providers") {
+    if (req.method === "GET" && path === "/v1/providers") {
       sendJson(res, 200, {
         data: options.runtime.models.getProviders().map((provider) => ({
           id: provider.id,
@@ -122,12 +129,12 @@ export function createInferenceServer(options: ServerOptions) {
     }
     if (
       req.method !== "POST" ||
-      !["/v1/chat/completions", "/v1/messages"].includes(req.url ?? "")
+      !["/v1/chat/completions", "/v1/messages"].includes(path)
     ) {
       sendError(
         res,
         {
-          status: req.url === "/v1/responses" ? 501 : 404,
+          status: path === "/v1/responses" ? 501 : 404,
           type: "invalid_request_error",
           message:
             "Endpoint not supported; use Chat Completions or native Messages",
