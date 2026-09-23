@@ -8,11 +8,13 @@ import {
   type AssistantMessage,
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
-  type Context,
   type Model,
   type Provider,
+  type SimpleStreamOptions,
   type StreamOptions,
+  type TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { withClaudeOAuthCompatibility } from "../src/claude-oauth.js";
 
 const model: Model<"anthropic-messages"> = {
@@ -97,7 +99,7 @@ function fixture(
   const calls: {
     method: Method;
     model: Model<Api>;
-    context: Context;
+    context: TranscriptContext;
     options?: StreamOptions;
   }[] = [];
   const provider: Provider = {
@@ -143,7 +145,7 @@ async function collect(stream: AssistantMessageEventStream) {
 
 test("full stream aliases forced custom tool choice without changing other provider inputs", async () => {
   const f = fixture();
-  const context: Context = {
+  const context = normalizeContext({
     systemPrompt:
       "pi itself belongs to payload rewriting, not context rewriting",
     tools: [
@@ -154,7 +156,7 @@ test("full stream aliases forced custom tool choice without changing other provi
       },
     ],
     messages: [message()],
-  };
+  });
   const before = structuredClone(context);
   const controller = new AbortController();
   const choice = {
@@ -182,10 +184,13 @@ test("full stream aliases forced custom tool choice without changing other provi
   assert.equal(call.method, "stream");
   assert.equal(call.model, model);
   assert.notEqual(call.context, context);
+  const system = before.messages[0]!;
+  assert(system.role === "system");
   assert.deepEqual(call.context, {
-    ...before,
-    tools: [{ ...before.tools![0]!, name: alias }],
-    messages: [message([alias])],
+    messages: [
+      { ...system, toolsAdded: [{ ...system.toolsAdded![0]!, name: alias }] },
+      message([alias]),
+    ],
   });
   assert.deepEqual(call.options, {
     ...options,
@@ -266,7 +271,11 @@ test("payload callback is awaited once before system-only rewriting, distinguish
         return mode === "null" ? null : replacement;
       },
     };
-    const output = f.wrapped.streamSimple(model, { messages: [] }, options);
+    const output = f.wrapped.streamSimple(
+      model,
+      normalizeContext({ messages: [] }),
+      options,
+    );
     const forwarded = f.calls[0]!.options!;
     assert.notEqual(forwarded.onPayload, options.onPayload);
     const pending = forwarded.onPayload!(payload, resolved);
@@ -308,7 +317,7 @@ test("payload callback is awaited once before system-only rewriting, distinguish
   }
 });
 
-test("history-only assistant, result, and addedToolNames aliases round-trip without active tools", async () => {
+test("history-only assistant, result, and mid-conversation tool aliases round-trip without active tools", async () => {
   const f = fixture();
   const names = [
     "history.only",
@@ -324,7 +333,12 @@ test("history-only assistant, result, and addedToolNames aliases round-trip with
     "Bash",
     "mcp__foreign__tool",
   ];
-  const context: Context = {
+  const added = (name: string) => ({
+    name,
+    description: "fixture",
+    parameters: Type.Object({}),
+  });
+  const context: TranscriptContext = normalizeContext({
     messages: [
       { role: "user", content: "pi itself", timestamp: 1 },
       message([names[0]!]),
@@ -332,28 +346,37 @@ test("history-only assistant, result, and addedToolNames aliases round-trip with
         role: "toolResult",
         toolCallId: "earlier_call",
         toolName: names[1]!,
-        addedToolNames: names.slice(2),
         content: [{ type: "text", text: "pi packages" }],
         details: { name: "added.only" },
         isError: false,
         timestamp: 124,
       },
+      {
+        role: "system",
+        content: "",
+        toolsAdded: names.slice(2).map(added),
+        timestamp: 125,
+      },
     ],
-  };
+  });
   const before = structuredClone(context);
   const output = f.wrapped.streamSimple(model, context, {
     apiKey,
     reasoning: "high",
   });
   const forwarded = f.calls[0]!.context;
-  assert.equal(forwarded.tools, undefined);
+  const later = before.messages[3]!;
+  assert(later.role === "system");
   assert.deepEqual(forwarded.messages, [
     before.messages[0],
     message([aliases[0]!]),
+    { ...before.messages[2], toolName: aliases[1] },
     {
-      ...before.messages[2],
-      toolName: aliases[1],
-      addedToolNames: aliases.slice(2),
+      ...later,
+      toolsAdded: later.toolsAdded!.map((tool, index) => ({
+        ...tool,
+        name: aliases[index + 2]!,
+      })),
     },
   ]);
   assert.deepEqual(context, before);
@@ -370,7 +393,7 @@ for (const method of ["stream", "streamSimple"] as const) {
     const f = fixture();
     const output = f.wrapped[method](
       model,
-      {
+      normalizeContext({
         messages: [],
         tools: [
           {
@@ -379,7 +402,7 @@ for (const method of ["stream", "streamSimple"] as const) {
             parameters: Type.Object({}),
           },
         ],
-      },
+      }),
       { apiKey },
     );
     assert.equal(f.calls[0]!.method, method);
@@ -488,7 +511,7 @@ test("result-only SDK streams finish with restored tool names even without a ter
   const f = fixture();
   const output = f.wrapped.streamSimple(
     model,
-    { messages: [message()] },
+    normalizeContext({ messages: [message()] }),
     { apiKey },
   );
   const final = message([alias]);
@@ -516,7 +539,7 @@ test("provider iteration failures terminate the wrapper and honor the forwarded 
     const controller = new AbortController();
     const output = f.wrapped.streamSimple(
       model,
-      { messages: [message()] },
+      normalizeContext({ messages: [message()] }),
       { apiKey, signal: controller.signal },
     );
     assert.equal(f.calls[0]!.options?.signal, controller.signal);
@@ -567,12 +590,20 @@ test("explicit clients and ineligible provider/API/keys bypass both methods by i
   for (const entry of cases) {
     for (const method of ["stream", "streamSimple"] as const) {
       const f = fixture(undefined, entry.id);
-      const context: Context = {
+      const context = normalizeContext({
         systemPrompt: "pi itself",
         messages: [message()],
-      };
+      });
       const selectedModel = entry.model ?? model;
-      const output = f.wrapped[method](selectedModel, context, entry.options);
+      const output =
+        method === "stream"
+          ? f.wrapped.stream(selectedModel, context, entry.options)
+          : f.wrapped.streamSimple(
+              selectedModel,
+              context,
+              // Bypass cases carry no tool choice.
+              entry.options as SimpleStreamOptions | undefined,
+            );
       assert.equal(output, f.source);
       assert.equal(f.calls.length, 1);
       assert.equal(f.calls[0]!.method, method);

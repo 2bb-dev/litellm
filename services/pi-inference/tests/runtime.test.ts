@@ -49,7 +49,7 @@ test("registers every builtin runtime provider, exposes only explicit aliases, a
       },
     ),
   );
-  assert.equal(loaded.models.getProviders().length, 39);
+  assert.equal(loaded.models.getProviders().length, 41);
   assert.ok(loaded.models.getProvider("radius"));
   assert.ok(loaded.models.getProvider("amazon-bedrock"));
   assert.deepEqual([...loaded.routes.keys()], ["chat"]);
@@ -193,7 +193,7 @@ test("custom provider resolves configured alias to upstream model and uses provi
       },
     ),
   );
-  assert.equal(loaded.models.getProviders().length, 40);
+  assert.equal(loaded.models.getProviders().length, 42);
   assert.equal(
     (await loaded.models.getAuth("internal-proxy"))?.auth.apiKey,
     "stub-test-key",
@@ -320,7 +320,7 @@ test("Radius accepts explicit pi-messages metadata without refreshing its empty 
       },
     ),
   );
-  assert.equal(loaded.models.getProviders().length, 39);
+  assert.equal(loaded.models.getProviders().length, 41);
   assert.equal(loaded.routes.get("radius-chat")?.api, "pi-messages");
   assert.equal(loaded.routes.get("radius-chat")?.id, configured.model);
   assert.ok(loaded.models.getModel("radius", configured.model));

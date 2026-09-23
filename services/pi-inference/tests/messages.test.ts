@@ -179,7 +179,11 @@ test("real Pi native HTTP preserves cache, signed thinking, schema and OAuth tra
       received.push(
         JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>,
       );
-      assert.equal(req.url, "/v1/messages");
+      // The Anthropic SDK's beta client adds `?beta=true`.
+      assert.equal(
+        new URL(req.url ?? "", "http://fixture.invalid").pathname,
+        "/v1/messages",
+      );
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.end(fixtureResponse);
     });
@@ -1173,13 +1177,13 @@ test("actual Pi client payload passes the LiteLLM cache callback and native adap
   try {
     const parameters = {
       type: "object",
-      properties: { command: { type: "string", not: { const: "forbidden" } } },
+      // pi-ai >= 0.85 refuses `not` and `patternProperties` for strict tools
+      // client-side, so the fixture keeps only keywords a real client can send.
+      properties: { command: { type: "string", enum: ["ls", "pwd"] } },
       required: ["command"],
       additionalProperties: false,
       $comment: "Retain schema annotations",
-      not: { required: ["forbidden"] },
       dependentRequired: { command: ["cwd"] },
-      patternProperties: { "^extra_": { type: "string" } },
     };
     for (const adaptive of [false, true])
       for (const _cacheVariant of [false, true]) {

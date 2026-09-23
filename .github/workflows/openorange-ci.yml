@@ -166,8 +166,9 @@ jobs:
           import assert from 'node:assert/strict';
           import { readFileSync } from 'node:fs';
           const lock = JSON.parse(readFileSync('package-lock.json'));
-          const allowed = new Set(['MIT', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'ISC', 'MPL-2.0', '0BSD']);
-          assert.equal(lock.packages[''].dependencies['@earendil-works/pi-ai'], '0.84.0');
+          // Unlicense: fast-sha256, via @anthropic-ai/sdk -> standardwebhooks (OSI-approved public-domain dedication).
+          const allowed = new Set(['MIT', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'ISC', 'MPL-2.0', '0BSD', 'Unlicense']);
+          assert.equal(lock.packages[''].dependencies['@earendil-works/pi-ai'], '0.87.1');
           assert.equal(lock.packages[''].dependencies.zod, '4.4.3');
           for (const [path, entry] of Object.entries(lock.packages)) {
             if (!path || entry.dev) continue;

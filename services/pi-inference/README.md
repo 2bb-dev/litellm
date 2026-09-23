@@ -1,7 +1,7 @@
 # Private Pi inference
 
 An inference-only sidecar for this LiteLLM fork, using locked
-`@earendil-works/pi-ai@0.84.0` and `zod@4.4.3`. LiteLLM owns client keys,
+`@earendil-works/pi-ai@0.87.1` and `zod@4.4.3`. LiteLLM owns client keys,
 routing, and spend accounting. This service has no agent loop, executable tools,
 workspace access, shell endpoint, public login flow, or separate spend ledger
 

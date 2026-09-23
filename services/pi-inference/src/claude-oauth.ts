@@ -8,10 +8,10 @@ import {
   type AssistantMessage,
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
-  type Context,
   type Model,
   type Provider,
   type StreamOptions,
+  type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { emptyUsage } from "./protocol.js";
 
@@ -35,19 +35,22 @@ const coreTools = new Set([
   "websearch",
 ]);
 
-function toolAliases(context: Context): ReadonlyMap<string, string> {
-  const names = new Set([
-    ...(context.tools?.map((tool) => tool.name) ?? []),
-    ...context.messages.flatMap((message) => {
+function toolAliases(context: TranscriptContext): ReadonlyMap<string, string> {
+  const names = new Set(
+    context.messages.flatMap((message) => {
+      if (message.role === "system")
+        return [
+          ...(message.toolsAdded?.map((tool) => tool.name) ?? []),
+          ...(message.toolsRemoved?.map((tool) => tool.name) ?? []),
+        ];
       if (message.role === "assistant")
         return message.content.flatMap((block) =>
           block.type === "toolCall" ? [block.name] : [],
         );
-      if (message.role === "toolResult")
-        return [message.toolName, ...(message.addedToolNames ?? [])];
+      if (message.role === "toolResult") return [message.toolName];
       return [];
     }),
-  ]);
+  );
   const reserved = new Set([...names].map((name) => name.toLowerCase()));
   const aliases = new Map<string, string>();
   const suffixes = new Map<string, number>();
@@ -85,23 +88,36 @@ function renameMessage(
 }
 
 function renameContext(
-  context: Context,
+  context: TranscriptContext,
   aliases: ReadonlyMap<string, string>,
-): Context {
+): TranscriptContext {
   const name = (value: string) => aliases.get(value) ?? value;
   return {
     ...context,
-    tools: context.tools?.map((tool) => ({ ...tool, name: name(tool.name) })),
     messages: context.messages.map((message) => {
-      if (message.role === "assistant") return renameMessage(message, aliases);
-      if (message.role === "toolResult")
+      if (message.role === "system")
         return {
           ...message,
-          toolName: name(message.toolName),
-          ...(message.addedToolNames
-            ? { addedToolNames: message.addedToolNames.map(name) }
+          ...(message.toolsAdded
+            ? {
+                toolsAdded: message.toolsAdded.map((tool) => ({
+                  ...tool,
+                  name: name(tool.name),
+                })),
+              }
+            : {}),
+          ...(message.toolsRemoved
+            ? {
+                toolsRemoved: message.toolsRemoved.map((tool) => ({
+                  ...tool,
+                  name: name(tool.name),
+                })),
+              }
             : {}),
         };
+      if (message.role === "assistant") return renameMessage(message, aliases);
+      if (message.role === "toolResult")
+        return { ...message, toolName: name(message.toolName) };
       return message;
     }),
   };
@@ -158,9 +174,12 @@ function renameEvent(
 
 function compatibleStream<T extends StreamOptions>(
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options: T | undefined,
-  invoke: (context: Context, options?: T) => AssistantMessageEventStream,
+  invoke: (
+    context: TranscriptContext,
+    options?: T,
+  ) => AssistantMessageEventStream,
 ): AssistantMessageEventStream {
   if (
     model.api !== "anthropic-messages" ||

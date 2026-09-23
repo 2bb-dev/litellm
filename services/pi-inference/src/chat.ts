@@ -5,6 +5,7 @@ import {
   type Api,
   type AssistantMessage,
   type ImageContent,
+  type JsonObject,
   type Message,
   type Model,
   type TextContent,
@@ -262,11 +263,9 @@ export function prepareChat(
   };
 }
 
-function parseArguments(value: string): Result<Record<string, unknown>> {
+function parseArguments(value: string): Result<JsonObject> {
   try {
-    const parsed = z
-      .record(z.string(), z.unknown())
-      .safeParse(JSON.parse(value));
+    const parsed = z.record(z.string(), z.json()).safeParse(JSON.parse(value));
     return parsed.success
       ? { ok: true, value: parsed.data }
       : invalid("Tool arguments must be a JSON object");
