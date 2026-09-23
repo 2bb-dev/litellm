@@ -3668,6 +3668,75 @@ def test_last_assistant_with_tool_calls_has_no_thinking_blocks_issue_18926():
     assert should_drop_thinking is False
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.asyncio
+async def test_json_provider_extras_reach_openai_sdk_http_body(stream: bool) -> None:
+    import httpx
+    from openai import AsyncOpenAI
+
+    policy = {"enable_web_search": "off", "include_venice_system_prompt": False}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["model"] == "google-gemma-3-27b-it"
+        assert body["max_tokens"] == 8
+        assert body["venice_parameters"] == policy
+        assert body["other_vendor_field"] == "kept"
+        assert "extra_body" not in body
+        assert "drop_this_field" not in body
+        if stream:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text='data: {"id":"test","object":"chat.completion.chunk","created":1,"model":"google-gemma-3-27b-it","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}\n\ndata: [DONE]\n\n',
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "test",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "google-gemma-3-27b-it",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http_client:
+        async with AsyncOpenAI(
+            api_key="test-only", base_url="https://venice.example.test/v1", http_client=http_client
+        ) as client:
+            result = await litellm.acompletion(
+                model="veniceai/google-gemma-3-27b-it",
+                messages=[{"role": "user", "content": "Say OK"}],
+                max_tokens=8,
+                stream=stream,
+                venice_parameters=policy,
+                extra_body={"other_vendor_field": "kept"},
+                drop_this_field="discarded",
+                additional_drop_params=["drop_this_field"],
+                client=client,
+                api_key="test-only",
+                num_retries=0,
+            )
+            if stream:
+                assert "".join([chunk.choices[0].delta.content or "" async for chunk in result]) == "OK"
+            else:
+                assert result.choices[0].message.content == "OK"
+
+
+def test_json_provider_can_explicitly_drop_extra_body() -> None:
+    from litellm.utils import add_provider_specific_params_to_optional_params
+
+    assert add_provider_specific_params_to_optional_params(
+        optional_params={"max_tokens": 8},
+        passed_params={"venice_parameters": {"enable_web_search": "off"}},
+        custom_llm_provider="veniceai",
+        openai_params=["max_tokens"],
+        additional_drop_params=["extra_body"],
+    ) == {"max_tokens": 8}
+
+
 class TestAdditionalDropParamsForNonOpenAIProviders:
     """
     Test additional_drop_params functionality for non-OpenAI providers.

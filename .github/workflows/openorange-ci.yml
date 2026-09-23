@@ -85,6 +85,16 @@ jobs:
             tests/test_litellm/litellm_core_utils/test_core_helpers.py \
             -k 'retry_history or request_retry_cap or request_retry_state or retry_breadcrumbs'
 
+      - name: Run JSON-provider SDK regressions
+        env:
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+        run: |
+          uv run --no-sync pytest -q \
+            tests/test_litellm/test_utils.py::test_json_provider_extras_reach_openai_sdk_http_body \
+            tests/test_litellm/test_utils.py::test_json_provider_can_explicitly_drop_extra_body \
+            tests/test_litellm/litellm_core_utils/test_exception_mapping_utils.py::test_json_provider_sdk_error_status \
+            tests/test_litellm/llms/openai_like/test_json_providers.py
+
       - name: Verify OSS dependency graph and imports
         run: |
           ! grep -q 'name = "litellm-enterprise"' uv.lock
