@@ -492,7 +492,7 @@ async def test_arealtime_transcription_intent_defaults_to_ga(monkeypatch):
         api_key="test-key",
         api_version="2025-04-01-preview",
         query_params={"intent": "transcription"},
-        litellm_logging_obj=MagicMock(),
+        litellm_logging_obj=MagicMock(model_call_details={}),
     )
 
     called_kwargs = mock_async_realtime.call_args.kwargs
@@ -661,7 +661,7 @@ async def test_arealtime_resolves_azure_ad_token_when_no_api_key(monkeypatch):
         model="azure/gpt-realtime-whisper",
         websocket=MagicMock(),
         api_version="2024-10-01-preview",
-        litellm_logging_obj=MagicMock(),
+        litellm_logging_obj=MagicMock(model_call_details={}),
         tenant_id="my-tenant",
         client_id="my-client",
         client_secret="my-secret",
@@ -698,7 +698,7 @@ async def test_arealtime_does_not_resolve_azure_ad_token_when_api_key_present(mo
         websocket=MagicMock(),
         api_key="test-key",
         api_version="2024-10-01-preview",
-        litellm_logging_obj=MagicMock(),
+        litellm_logging_obj=MagicMock(model_call_details={}),
     )
 
     assert mock_async_realtime.call_args.kwargs["azure_ad_token"] is None
@@ -771,7 +771,7 @@ async def test_arealtime_forwards_deployment_azure_ad_token(monkeypatch):
         websocket=MagicMock(),
         api_version="2024-10-01-preview",
         azure_ad_token="deployment-entra-token",
-        litellm_logging_obj=MagicMock(),
+        litellm_logging_obj=MagicMock(model_call_details={}),
     )
 
     assert mock_async_realtime.call_args.kwargs["azure_ad_token"] == "deployment-entra-token"
