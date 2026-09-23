@@ -26,8 +26,11 @@ The catalog command needs neither credentials nor configuration and makes no
 inference calls. It lists all built-in provider/model metadata, not enabled
 routes or an authoritative price list. Only aliases in `config.example.json`
 are callable; having a provider credential does not enable its models. The
-example enables alias `claude-haiku-4-5` as Anthropic's built-in model of the same
-name
+example enables aliases `claude-haiku-4-5` and `claude-opus-5-5` as Anthropic's
+built-in models of the same names. Opus 5.5 always thinks: send adaptive thinking
+or omit `thinking`, pick depth with `output_config.effort` (the API default is
+`medium`), and expect a 400 for `thinking.type: disabled`, `budget_tokens`, forced
+`tool_choice` and sampling parameters, as on the Anthropic API
 
 Load `ANTHROPIC_API_KEY` from your secret manager into the host environment.
 Use an Anthropic **API key**, not a Claude subscription/session token, for this
