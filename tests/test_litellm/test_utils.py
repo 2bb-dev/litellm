@@ -32,6 +32,36 @@ from litellm.utils import (
 # Adds the parent directory to the system path
 
 
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("count,refused", [(0, False), (4, False), (5, True), (12, True)])
+@pytest.mark.asyncio
+async def test_request_retry_cap_uses_counter_in_sync_and_async_wrappers(bucket, asynchronous, count, refused):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError
+
+    original_limit = litellm.num_retries_per_request
+    litellm.num_retries_per_request = 5
+    kwargs = {
+        "model": "openai/gpt-4o-mini",
+        "api_key": "synthetic",
+        "messages": [{"role": "user", "content": "synthetic"}],
+        "mock_response": "ok",
+        bucket: {"request_retry_count": count, "previous_models": ()},
+    }
+
+    async def completion():
+        return await litellm.acompletion(**kwargs) if asynchronous else litellm.completion(**kwargs)
+
+    try:
+        if refused:
+            with pytest.raises((RequestRetryLimitError, litellm.APIConnectionError), match="Max retries per request hit"):
+                await completion()
+        else:
+            assert (await completion()).choices[0].message.content == "ok"
+    finally:
+        litellm.num_retries_per_request = original_limit
+
+
 @pytest.fixture
 def local_model_cost_map(monkeypatch):
     original_model_cost = litellm.model_cost

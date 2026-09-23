@@ -30,6 +30,12 @@ Upstream syncs must preserve these behaviors:
   `insufficient_quota` codes trigger quota cooldown and skip retries, including
   through a `litellm_proxy/chatgpt/` sidecar. Native-provider and non-429 error
   policies are unchanged.
+- **Retry privacy and limits:** retry breadcrumbs contain only bounded, flat
+  attempt fields and never request payloads, credentials, or provider exception
+  text. Each request owns its metadata and retains at most four records. The
+  overall attempt counter spans retries and fallback hops independently of the
+  retained history. The existing positive `num_retries_per_request` limit caps
+  total calls; zero permits the initial call only.
 - **Responses logging:** streamed terminal responses retain reconstructed
   output, annotations, refusals, and ordering for request-detail views.
 - **Spend-log resilience:** database writes use byte-bounded adaptive batches,

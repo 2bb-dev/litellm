@@ -1,6 +1,7 @@
 # What is this?
 ## Helper utilities
 import copy
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Union
 
 import httpx
@@ -166,6 +167,103 @@ def get_metadata_variable_name_from_kwargs(
     return "litellm_metadata" if "litellm_metadata" in kwargs else "metadata"
 
 
+class _RouterRetryState:
+    """Only bounded diagnostics and a call counter, never request payloads."""
+
+    def __init__(self) -> None:
+        self.count = -1
+        self.history: tuple[dict[str, Union[str, int, None]], ...] = ()
+
+
+class _RouterRequestMetadata(dict):
+    """Request ownership is in-process state, absent from JSON and provider params."""
+
+    def __init__(self, values: Mapping, state: Optional[_RouterRetryState] = None) -> None:
+        super().__init__(values)
+        self._retry_state = state if state is not None else _RouterRetryState()
+
+    def __copy__(self):
+        return type(self)(self, self._retry_state)
+
+    def copy(self):
+        return self.__copy__()
+
+    def __deepcopy__(self, memo):
+        # Deferred stream fallbacks need fresh deployment metadata but the same cap.
+        result = type(self)({}, self._retry_state)
+        memo[id(self)] = result
+        result.update(copy.deepcopy(dict(self), memo))
+        return result
+
+
+def initialize_request_retry_state(kwargs: dict, metadata_variable_name: Optional[str] = None) -> None:
+    bucket = metadata_variable_name or get_metadata_variable_name_from_kwargs(kwargs)
+    if type(kwargs.get(bucket)) is _RouterRequestMetadata:
+        return
+    # Chat, Responses and deferred stream helpers can select different buckets.
+    # A trusted sibling means this is still the same request, not a new allowance.
+    state = next(
+        (value._retry_state for name in ("metadata", "litellm_metadata")
+         if type(value := kwargs.get(name)) is _RouterRequestMetadata),
+        None,
+    )
+    for name in ("metadata", "litellm_metadata"):
+        values = kwargs.get(name)
+        if isinstance(values, Mapping) and type(values) is not _RouterRequestMetadata:
+            kwargs[name] = {
+                key: value
+                for key, value in values.items()
+                if key not in ("previous_models", "request_retry_count", "attempted_retries", "max_retries")
+            }
+    values = kwargs.get(bucket)
+    kwargs[bucket] = _RouterRequestMetadata(values if isinstance(values, Mapping) else {}, state)
+
+
+def preserve_request_retry_state(kwargs: dict, previous_metadata: object) -> None:
+    """Fallback parameter overrides cannot create a new request-wide allowance."""
+    if type(previous_metadata) is not _RouterRequestMetadata:
+        return
+    for name in ("metadata", "litellm_metadata"):
+        metadata = kwargs.get(name)
+        if type(metadata) is _RouterRequestMetadata:
+            metadata._retry_state = previous_metadata._retry_state
+    bucket = get_metadata_variable_name_from_kwargs(kwargs)
+    metadata = kwargs.get(bucket)
+    if type(metadata) is _RouterRequestMetadata:
+        return
+    kwargs[bucket] = _RouterRequestMetadata(
+        metadata if isinstance(metadata, Mapping) else {}, previous_metadata._retry_state
+    )
+
+
+def advance_request_retry_count(kwargs: dict) -> None:
+    initialize_request_retry_state(kwargs)
+    metadata = kwargs[get_metadata_variable_name_from_kwargs(kwargs)]
+    metadata._retry_state.count += 1
+    metadata["request_retry_count"] = metadata._retry_state.count
+    if metadata._retry_state.history:
+        metadata["previous_models"] = metadata._retry_state.history
+
+
+class RequestRetryLimitError(RuntimeError):
+    pass
+
+
+def get_request_retry_count(kwargs: Mapping[str, object]) -> int:
+    metadata = kwargs.get("litellm_metadata" if "litellm_metadata" in kwargs else "metadata")
+    count = (
+        metadata._retry_state.count
+        if type(metadata) is _RouterRequestMetadata
+        else metadata.get("request_retry_count") if isinstance(metadata, Mapping) else None
+    )
+    return count if type(count) is int and count >= 0 else 0
+
+
+def max_retries_per_request_hit(kwargs: Mapping[str, object], limit: Optional[int]) -> bool:
+    count = get_request_retry_count(kwargs)
+    return limit is not None and count > 0 and count >= limit
+
+
 def get_litellm_metadata_from_kwargs(kwargs: dict):
     """
     Helper to get litellm metadata from all litellm request kwargs
@@ -322,7 +420,7 @@ def safe_deep_copy(data):
 
     # Step 2: Per-key deepcopy with fallback
     if isinstance(data, dict):
-        new_data = {}
+        new_data = _RouterRequestMetadata({}, data._retry_state) if type(data) is _RouterRequestMetadata else {}
         for k, v in data.items():
             try:
                 new_data[k] = copy.deepcopy(v)

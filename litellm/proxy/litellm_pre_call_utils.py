@@ -16,6 +16,7 @@ from litellm._uuid import uuid
 from litellm._logging import verbose_logger, verbose_proxy_logger
 from litellm._service_logger import ServiceLogging
 from litellm.constants import PRE_CALL_EXECUTED_GUARDRAILS_KEY
+from litellm.litellm_core_utils.core_helpers import initialize_request_retry_state
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.url_utils import is_url_destination_allowed_by_host
@@ -3242,6 +3243,9 @@ async def add_litellm_data_to_request(
             parent_otel_span=user_api_key_dict.parent_otel_span,
         )
     )
+
+    # This ingress bucket is request-local; preserve its identity through post-call hooks.
+    initialize_request_retry_state(data, _metadata_variable_name)
 
     return data
 

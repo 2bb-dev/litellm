@@ -75,6 +75,11 @@ jobs:
           uv run --no-sync pytest -q \
             tests/test_litellm/litellm_core_utils/test_litellm_logging.py \
             -k test_responses_usage_callback_survives_redacted_transport_state
+          uv run --no-sync pytest -q \
+            tests/test_litellm/test_router.py \
+            tests/test_litellm/test_utils.py \
+            tests/test_litellm/litellm_core_utils/test_core_helpers.py \
+            -k 'retry_history or request_retry_cap or request_retry_state'
 
       - name: Verify OSS dependency graph and imports
         run: |

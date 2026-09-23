@@ -16,6 +16,211 @@ import litellm
 from litellm.exceptions import MidStreamFallbackError
 
 
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+def test_retry_history_is_flat_bounded_and_drops_untrusted_payload(bucket):
+    router = litellm.Router(model_list=[])
+    metadata = {
+        "model_info": {"id": "deployment-a", "api_key": "synthetic-credential"},
+        "previous_models": [{"exception_string": "private history", "messages": ["private prompt"]}],
+        "request_retry_count": 12,
+        "api_key": "synthetic-credential",
+    }
+    kwargs = {
+        "model": "group-a",
+        bucket: metadata,
+        "messages": [{"role": "user", "content": "private prompt"}],
+        "input": "private Responses input",
+        "api_key": "synthetic-credential",
+        "headers": {"Authorization": "Bearer synthetic-credential"},
+    }
+    kwargs["proxy_server_request"] = {"body": kwargs}
+    other_bucket = "metadata" if bucket == "litellm_metadata" else "litellm_metadata"
+    metadata[other_bucket] = {"previous_models": metadata["previous_models"]}
+
+    class UnprintableError(Exception):
+        def __str__(self):
+            raise AssertionError("Retry logging must not stringify provider errors")
+
+    try:
+        for _ in range(20):
+            router.log_retry(kwargs=kwargs, e=UnprintableError("private unstructured error"))
+        records = metadata["previous_models"]
+        assert len(records) == 4
+        assert metadata["request_retry_count"] == 12
+        assert set(records[0]) == {
+            "model_group",
+            "deployment_id",
+            "exception_type",
+            "status_code",
+            "request_retry_count",
+        }
+        assert records[-1]["deployment_id"] == "deployment-a"
+        serialized = json.dumps(records)
+        assert len(serialized) < 1500
+        assert "private" not in serialized
+        assert "synthetic-credential" not in serialized
+        assert "previous_models" not in serialized
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+def test_retry_history_bounds_fields_and_sanitizes_existing_records(bucket):
+    router = litellm.Router(model_list=[])
+    kwargs = {
+        "model": "group-a",
+        bucket: {
+            "previous_models": [
+                {
+                    "model_group": "a" * 10000,
+                    "exception_type": "Bearer " + "x" * 30,
+                    "messages": "synthetic-private",
+                    "request_retry_count": True,
+                },
+                "synthetic-private",
+            ],
+            "model_info": {"id": ["synthetic-private"]},
+        },
+    }
+    try:
+        router.log_retry(kwargs, ValueError("synthetic-private"))
+        earlier, current = kwargs[bucket]["previous_models"]
+        assert earlier["model_group"] is None
+        assert earlier["exception_type"] == "REDACTED"
+        assert earlier["request_retry_count"] is None
+        assert current["deployment_id"] is None
+        assert "synthetic-private" not in json.dumps(kwargs[bucket]["previous_models"])
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+async def test_retry_history_isolates_concurrent_requests_with_shared_metadata(bucket):
+    router = litellm.Router(model_list=[], num_retries=0)
+    shared = {"principal": "synthetic-owner", "previous_models": [{"messages": "private-old-request"}]}
+    untouched = copy.deepcopy(shared)
+    ready = asyncio.Event()
+    received = []
+
+    async def request(**kwargs):
+        received.append(kwargs)
+        if len(received) == 2:
+            ready.set()
+        await ready.wait()
+        router.log_retry(kwargs, ValueError("private-provider-error"))
+        await asyncio.sleep(0)
+        return litellm.ModelResponse()
+
+    try:
+        await asyncio.gather(
+            *(
+                router.async_function_with_fallbacks(
+                    model=principal,
+                    original_function=request,
+                    metadata=shared,
+                    **({"litellm_metadata": shared} if bucket == "litellm_metadata" else {}),
+                )
+                for principal in ("principal-a", "principal-b")
+            )
+        )
+        assert shared == untouched
+        assert received[0][bucket] is not received[1][bucket]
+        for kwargs in received:
+            records = kwargs[bucket]["previous_models"]
+            assert len(records) == 1
+            assert records[0]["model_group"] == kwargs["model"]
+            assert "private" not in json.dumps(records)
+            if bucket == "litellm_metadata":
+                assert "previous_models" not in kwargs["metadata"]
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket", ["metadata", "litellm_metadata"])
+@pytest.mark.parametrize("limit,expected_calls", [(0, 1), (1, 1), (6, 6)])
+@pytest.mark.parametrize("per_group_retries", [0, 2])
+async def test_request_retry_cap_survives_fallback_hops_and_history_truncation(
+    bucket, limit, expected_calls, per_group_retries
+):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError
+
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": f"group-{group}",
+                "model_info": {"id": f"group-{group}-slot-{slot}"},
+                "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "synthetic"},
+            }
+            for group in range(7)
+            for slot in range(2)
+        ],
+        num_retries=per_group_retries,
+        max_fallbacks=20,
+        fallbacks=[{f"group-{n}": [f"group-{n + 1}"]} for n in range(20)],
+    )
+    previous_limit = litellm.num_retries_per_request
+    litellm.num_retries_per_request = limit
+    attempts = []
+
+    async def request(**kwargs):
+        attempts.append(copy.deepcopy(kwargs[bucket]))
+        raise litellm.InternalServerError(message="synthetic failure", model=kwargs["model"], llm_provider="openai")
+
+    try:
+        with pytest.raises(RequestRetryLimitError, match="Max retries per request hit"):
+            await router.async_function_with_fallbacks(model="group-0", original_function=request, **{bucket: {}})
+        assert len(attempts) == expected_calls
+        assert [item["request_retry_count"] for item in attempts] == list(range(expected_calls))
+        assert all(len(item.get("previous_models", ())) <= 4 for item in attempts)
+        if limit == 6:
+            assert attempts[-1]["request_retry_count"] > len(attempts[-1]["previous_models"])
+    finally:
+        litellm.num_retries_per_request = previous_limit
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quota", [False, True])
+async def test_retry_history_preserves_chatgpt_transient_and_quota_behavior(quota):
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "subscription",
+                "model_info": {"id": f"slot-{n}"},
+                "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "synthetic"},
+            }
+            for n in range(2)
+        ],
+        num_retries=2,
+        retry_after=0,
+    )
+    attempts = []
+
+    async def request(**kwargs):
+        attempts.append(copy.deepcopy(kwargs["metadata"]))
+        if len(attempts) < 3:
+            raise litellm.RateLimitError(
+                message=json.dumps({"error": {"type": "usage_limit_reached" if quota else "rate_limit_exceeded"}}),
+                model="chatgpt/gpt-5.6-sol",
+                llm_provider="chatgpt",
+            )
+        return litellm.ModelResponse()
+
+    try:
+        if quota:
+            with pytest.raises(litellm.RateLimitError):
+                await router.async_function_with_fallbacks(model="subscription", original_function=request)
+            assert len(attempts) == 1
+        else:
+            await router.async_function_with_fallbacks(model="subscription", original_function=request)
+            assert [item["request_retry_count"] for item in attempts] == [0, 1, 2]
+            assert len(attempts[-1]["previous_models"]) == 2
+    finally:
+        router.reset()
+
+
 def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():
     # initialize a real Router (env‑vars can be empty)
     router = litellm.Router(
@@ -5346,3 +5551,327 @@ class TestRouterRequestTimeoutPropagation:
             )
             == 60
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 1, 2])
+@pytest.mark.parametrize("both_buckets", [False, True])
+async def test_request_retry_state_survives_responses_deferred_fallback(limit, both_buckets, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError
+
+    router = _make_router_with_fallback()
+    router.num_retries = 0
+    monkeypatch.setattr(litellm, "num_retries_per_request", limit)
+    calls = []
+    shared = {"request_retry_count": -1000, "previous_models": [{"messages": "private"}]}
+
+    async def aresponses(**kwargs):
+        calls.append((kwargs["model"], kwargs["litellm_metadata"]["request_retry_count"]))
+        return _make_responses_iterator(
+            model=kwargs["model"],
+            error=MidStreamFallbackError(
+                message="synthetic stream failure", model=kwargs["model"], llm_provider="openai",
+                is_pre_first_chunk=True, generated_content="",
+            ) if len(calls) == 1 else None,
+        )
+
+    async def consume():
+        response = await router._aresponses_with_streaming_fallbacks(
+            original_function=aresponses, model="gpt-4", stream=True, input="synthetic",
+            litellm_metadata=shared, **({"metadata": {"owner": "synthetic"}} if both_buckets else {}),
+        )
+        async for _ in response:
+            pass
+
+    try:
+        if limit < 2:
+            with pytest.raises(RequestRetryLimitError):
+                await consume()
+        else:
+            await consume()
+        assert calls == [("gpt-4", 0)] + ([("gpt-3.5-turbo", 1)] if limit == 2 else [])
+        assert shared == {"request_retry_count": -1000, "previous_models": [{"messages": "private"}]}
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2])
+@pytest.mark.parametrize("both_buckets", [False, True])
+def test_request_retry_state_survives_sync_stream_reentry(limit, both_buckets, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError, get_request_retry_count
+
+    router = _make_router_with_fallback()
+    router.num_retries = 0
+    monkeypatch.setattr(litellm, "num_retries_per_request", limit)
+    calls = []
+
+    class Stream(litellm.CustomStreamWrapper):
+        def __init__(self, fail):
+            self.model = "gpt-4"
+            self.custom_llm_provider = "openai"
+            self.logging_obj = MagicMock()
+            self.completion_stream = iter(())
+            self.chunks = []
+            self.fail = fail
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.fail:
+                raise MidStreamFallbackError(
+                    message="synthetic", model=self.model, llm_provider="openai",
+                    is_pre_first_chunk=True, generated_content="",
+                )
+            raise StopIteration
+
+    def completion(**kwargs):
+        calls.append(get_request_retry_count(kwargs))
+        return Stream(len(calls) == 1)
+
+    monkeypatch.setattr(litellm, "completion", completion)
+    try:
+        response = router.completion(
+            model="gpt-4", messages=[{"role": "user", "content": "synthetic"}], stream=True,
+            **({"litellm_metadata": {}} if both_buckets else {}),
+        )
+        if limit < 2:
+            with pytest.raises(RequestRetryLimitError):
+                list(response)
+        else:
+            assert list(response) == []
+        assert calls == list(range(max(1, limit)))
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("copier", [copy.copy, copy.deepcopy, lambda value: value.copy()])
+def test_request_retry_state_copies_share_cap_without_serializing_context(copier):
+    from litellm.litellm_core_utils.core_helpers import (
+        advance_request_retry_count, get_request_retry_count, initialize_request_retry_state,
+    )
+
+    original = {"metadata": {"owner": "synthetic"}}
+    initialize_request_retry_state(original)
+    deferred = {"metadata": copier(original["metadata"])}
+    advance_request_retry_count(original)
+    advance_request_retry_count(deferred)
+    assert get_request_retry_count(original) == 1
+    assert original["metadata"] is not deferred["metadata"]
+    assert json.loads(json.dumps(deferred["metadata"])) == {"owner": "synthetic", "request_retry_count": 1}
+    assert set(vars(original["metadata"]._retry_state)) == {"count", "history"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("both_buckets", [False, True])
+async def test_request_retry_state_ignores_client_fallback_depth_and_state_shape(both_buckets):
+    calls = []
+    router = litellm.Router(model_list=[], num_retries=0)
+    shared = {"request_retry_count": 999, "_retry_state": {"count": 999}, "previous_models": [{"messages": "private"}]}
+
+    async def request(**kwargs):
+        calls.append(kwargs["litellm_metadata" if both_buckets else "metadata"])
+        return litellm.ModelResponse()
+
+    try:
+        await router.async_function_with_fallbacks(
+            original_function=request, model="synthetic", metadata=shared, fallback_depth=123,
+            **({"litellm_metadata": shared} if both_buckets else {}),
+        )
+        assert calls[0]["request_retry_count"] == 0
+        assert "previous_models" not in calls[0]
+        assert shared["request_retry_count"] == 999
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+async def test_request_retry_state_stays_out_of_responses_transport_json(monkeypatch):
+    import httpx
+
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+    bodies = []
+
+    async def handle(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "id": "resp_synthetic", "object": "response", "created_at": 1,
+            "status": "completed", "model": "gpt-4o-mini", "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as transport:
+        monkeypatch.setattr(AsyncHTTPHandler, "create_client", lambda *args, **kwargs: transport)
+        client = AsyncHTTPHandler()
+        router = litellm.Router(model_list=[{
+            "model_name": "synthetic", "litellm_params": {
+                "model": "openai/gpt-4o-mini", "api_key": "synthetic", "api_base": "https://synthetic.invalid/v1",
+            },
+        }], num_retries=0)
+        try:
+            await router.aresponses(
+                model="synthetic", input="synthetic", metadata={"owner": "synthetic"},
+                litellm_metadata={"principal": "synthetic"}, client=client,
+            )
+            assert len(bodies) == 1
+            assert bodies[0]["metadata"] == {"owner": "synthetic"}
+            assert "_retry_state" not in json.dumps(bodies)
+            assert "request_retry_count" not in json.dumps(bodies)
+            assert "litellm_metadata" not in bodies[0]
+        finally:
+            router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,bucket", [("/v1/chat/completions", "metadata"), ("/v1/responses", "litellm_metadata")])
+async def test_request_retry_state_preserves_proxy_post_call_metadata_identity(path, bucket):
+    from fastapi import Request
+
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+
+    request = MagicMock(spec=Request)
+    request.url = MagicMock()
+    request.url.path = path
+    request.url.__str__.return_value = "https://synthetic.invalid" + path
+    request.method = "POST"
+    request.query_params = {}
+    request.headers = {"Content-Type": "application/json"}
+    request.client = MagicMock()
+    request.client.host = "127.0.0.1"
+    request.state = MagicMock()
+    data = await add_litellm_data_to_request(
+        data={"model": "synthetic", bucket: {"previous_models": [{"messages": "private"}], "request_retry_count": 100}},
+        request=request, user_api_key_dict=UserAPIKeyAuth(api_key="synthetic"),
+        proxy_config=MagicMock(), general_settings={}, version="synthetic",
+    )
+    owned = data[bucket]
+    forwarded = []
+    router = litellm.Router(model_list=[], num_retries=0)
+
+    async def dispatch(**kwargs):
+        forwarded.append(kwargs[bucket])
+        return litellm.ModelResponse()
+
+    try:
+        await router.async_function_with_fallbacks(original_function=dispatch, **data)
+        assert forwarded[0] is owned
+        assert owned["request_retry_count"] == 0
+        assert "previous_models" not in owned
+        owned["standard_logging_guardrail_information"] = [{"guardrail_name": "synthetic-post-call"}]
+        assert forwarded[0]["standard_logging_guardrail_information"] == [{"guardrail_name": "synthetic-post-call"}]
+        assert "_retry_state" not in json.dumps(owned, default=str)
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 2])
+@pytest.mark.parametrize("both_buckets", [False, True])
+async def test_request_retry_state_survives_fallback_metadata_overrides(limit, both_buckets, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError, get_request_retry_count
+
+    router = _make_router_with_fallback()
+    router.num_retries = 0
+    router.fallbacks = [{"gpt-4": [{"model": "gpt-3.5-turbo", "metadata": {}, "litellm_metadata": {"request_retry_count": -100}}]}]
+    monkeypatch.setattr(litellm, "num_retries_per_request", limit)
+    calls = []
+
+    async def request(**kwargs):
+        calls.append((kwargs["model"], get_request_retry_count(kwargs)))
+        if len(calls) == 1:
+            raise litellm.InternalServerError(message="synthetic", model="gpt-4", llm_provider="openai")
+        return litellm.ModelResponse()
+
+    try:
+        if limit == 1:
+            with pytest.raises(RequestRetryLimitError):
+                await router.async_function_with_fallbacks(
+                    model="gpt-4", original_function=request,
+                    **({"metadata": {}, "litellm_metadata": {}} if both_buckets else {}),
+                )
+        else:
+            await router.async_function_with_fallbacks(
+                    model="gpt-4", original_function=request,
+                    **({"metadata": {}, "litellm_metadata": {}} if both_buckets else {}),
+                )
+        assert calls == [("gpt-4", 0)] + ([("gpt-3.5-turbo", 1)] if limit == 2 else [])
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 1, 2])
+@pytest.mark.parametrize("both_buckets", [False, True])
+async def test_request_retry_state_survives_async_chat_stream_reentry(limit, both_buckets, monkeypatch):
+    from litellm.litellm_core_utils.core_helpers import RequestRetryLimitError, get_request_retry_count
+
+    router = _make_router_with_fallback()
+    router.num_retries = 0
+    monkeypatch.setattr(litellm, "num_retries_per_request", limit)
+    calls = []
+
+    class Stream(litellm.CustomStreamWrapper):
+        def __init__(self, fail):
+            self.model = "gpt-4"
+            self.custom_llm_provider = "openai"
+            self.logging_obj = MagicMock()
+            self.completion_stream = iter(())
+            self.chunks = []
+            self.fail = fail
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.fail:
+                raise MidStreamFallbackError(
+                    message="synthetic", model=self.model, llm_provider="openai",
+                    is_pre_first_chunk=True, generated_content="",
+                )
+            raise StopAsyncIteration
+
+    async def acompletion(**kwargs):
+        calls.append(get_request_retry_count(kwargs))
+        return Stream(len(calls) == 1)
+
+    monkeypatch.setattr(litellm, "acompletion", acompletion)
+
+    async def consume():
+        response = await router.acompletion(
+            model="gpt-4", messages=[{"role": "user", "content": "synthetic"}], stream=True,
+            **({"litellm_metadata": {}} if both_buckets else {}),
+        )
+        return [chunk async for chunk in response]
+
+    try:
+        if limit < 2:
+            with pytest.raises(RequestRetryLimitError):
+                await consume()
+        else:
+            assert await consume() == []
+        assert calls == list(range(max(1, limit)))
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("first_bucket", ["metadata", "litellm_metadata"])
+def test_request_retry_state_is_shared_when_internal_bucket_selection_changes(first_bucket):
+    from litellm.litellm_core_utils.core_helpers import (
+        advance_request_retry_count, get_request_retry_count, initialize_request_retry_state,
+    )
+
+    caller = {"metadata": {"owner": "synthetic"}, "litellm_metadata": {"owner": "synthetic"}}
+    request = caller.copy()
+    second_bucket = "metadata" if first_bucket == "litellm_metadata" else "litellm_metadata"
+    initialize_request_retry_state(request, first_bucket)
+    first_owned = request[first_bucket]
+    advance_request_retry_count(request)
+    initialize_request_retry_state(request, second_bucket)
+    advance_request_retry_count(request)
+    initialize_request_retry_state(request, first_bucket)
+    assert request[first_bucket] is first_owned
+    assert get_request_retry_count(request) == 1
+    assert request["metadata"]._retry_state is request["litellm_metadata"]._retry_state
+    assert caller == {"metadata": {"owner": "synthetic"}, "litellm_metadata": {"owner": "synthetic"}}
