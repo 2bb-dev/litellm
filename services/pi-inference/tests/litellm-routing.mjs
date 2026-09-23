@@ -18,14 +18,16 @@ const listen = async (server) => {
   return `http://127.0.0.1:${server.address().port}`;
 };
 const received = [];
+const receivedBetas = [];
 const stub = createServer(async (req, res) => {
   const parts = [];
   for await (const p of req) parts.push(p);
   const body = JSON.parse(Buffer.concat(parts));
   received.push(body);
+  receivedBetas.push(req.headers["anthropic-beta"] ?? "");
   const toolName = body.tools?.[0]?.name;
   res.writeHead(200, { "content-type": "text/event-stream" });
-  if (req.url === "/v1/messages") {
+  if (new URL(req.url, "http://stub.invalid").pathname === "/v1/messages") {
     for (const ev of [
       {
         type: "message_start",
@@ -115,6 +117,12 @@ const runtime = loadRuntime(
         baseUrl: stubUrl,
         metadata: metadata("anthropic-messages"),
       },
+      {
+        alias: "claude-opus-5-5",
+        provider: "anthropic",
+        model: "claude-opus-5-5",
+        baseUrl: stubUrl,
+      },
     ],
   },
   {
@@ -188,6 +196,16 @@ async def main():
       assert r['content'][0]['input']=={'city':'Vienna'},r
       assert r['usage']['input_tokens']==10,r
     print('LiteLLM OAuth tools Messages stream='+str(stream)+' PASS')
+  opus_messages=[{'role':'user','content':'hello'},{'role':'system','content':[],'output_config':{'effort':'xhigh'}}]
+  for stream in (False,True):
+    r=await acreate(model='anthropic/claude-opus-5-5',api_base=base,api_key=key,max_tokens=64000,messages=opus_messages,thinking={'type':'adaptive','display':'summarized','block_binding':{'prefix_mismatch_behavior':'error'}},output_config={'effort':'xhigh'},extra_headers={'anthropic-beta':'mid-conversation-output-config-2026-07-01,thinking-binding-controls-2026-08-01'},stream=stream)
+    if stream:
+      chunks=[x async for x in r]
+      wire=''.join(x.decode() if isinstance(x,bytes) else x if isinstance(x,str) else json.dumps(x) for x in chunks)
+      assert 'local routing works' in wire and 'message_stop' in wire,wire
+    else:
+      assert r['content'][0]['text']=='local routing works',r
+    print('LiteLLM Opus 5.5 Messages stream='+str(stream)+' PASS')
   await asyncio.sleep(0.1)
 asyncio.run(main())`;
 try {
@@ -208,6 +226,30 @@ try {
   );
   console.log(stdout);
   if (stderr) console.error(stderr);
+  const opus = received
+    .map((payload, index) => ({ payload, betas: receivedBetas[index] }))
+    .filter(({ payload }) => payload.model === "claude-opus-5-5");
+  assert.equal(opus.length, 2);
+  for (const { payload, betas } of opus) {
+    assert.deepEqual(payload.messages.at(-1), {
+      role: "system",
+      content: [],
+      output_config: { effort: "xhigh" },
+    });
+    assert.deepEqual(payload.thinking, {
+      type: "adaptive",
+      display: "summarized",
+      block_binding: { prefix_mismatch_behavior: "error" },
+    });
+    assert.deepEqual(payload.output_config, { effort: "xhigh" });
+    assert.equal(payload.max_tokens, 64000);
+    for (const beta of [
+      "mid-conversation-output-config-2026-07-01",
+      "thinking-binding-controls-2026-08-01",
+      "oauth-2025-04-20",
+    ])
+      assert(betas.split(",").includes(beta), betas);
+  }
   const toolRequests = received.filter((payload) => payload.tools?.length);
   assert.equal(toolRequests.length, 4);
   for (const payload of toolRequests) {
