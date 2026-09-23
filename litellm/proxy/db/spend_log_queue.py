@@ -277,21 +277,23 @@ def create_spend_log_spool_from_env() -> Optional[SQLiteSpendLogSpool]:
     return spool
 
 
-async def enqueue_spend_log(prisma_client: Any, payload: Dict[str, Any]) -> None:
-    """Persist a row, falling back to memory if the local spool is unavailable."""
+async def enqueue_spend_log(prisma_client: Any, payload: Dict[str, Any]) -> bool:
+    """Persist a row, falling back to bounded memory if the local spool is unavailable."""
     spool = getattr(prisma_client, "_spend_log_spool", None)
     if spool is not None:
         try:
             await spool.enqueue(payload)
-            return
+            return True
         except Exception as error:
             verbose_proxy_logger.error(
                 "Spend tracking - durable enqueue failed; retaining row in memory. error=%s",
                 error,
             )
 
-    async with prisma_client._spend_log_transactions_lock:
-        prisma_client.spend_log_transactions.append(payload)
+    from litellm.proxy.utils import enqueue_spend_logs
+
+    await enqueue_spend_logs(prisma_client, (payload,))
+    return False
 
 
 async def spend_log_queue_stats(prisma_client: Any) -> SpendLogQueueStats:
@@ -334,7 +336,13 @@ async def take_spend_log_batch(
             batch.append(entry)
             serialized_bytes = candidate_bytes
         if batch:
-            prisma_client.spend_log_transactions = prisma_client.spend_log_transactions[len(batch) :]
+            from litellm.proxy.db.spend_log_batching import spend_log_row_bytes
+            from litellm.proxy.utils import PrismaClient
+
+            prisma_client.spend_log_transactions[:] = prisma_client.spend_log_transactions[len(batch) :]
+            PrismaClient.spend_log_queue_bytes = sum(
+                spend_log_row_bytes(row) for row in prisma_client.spend_log_transactions
+            )
             return SpendLogQueueBatch(logs=batch, serialized_bytes=serialized_bytes)
 
     spool = getattr(prisma_client, "_spend_log_spool", None)
@@ -371,8 +379,6 @@ async def release_spend_log_batch(prisma_client: Any, batch: SpendLogQueueBatch)
     """Return memory rows; durable rows remain in place until acknowledged."""
     if batch.is_durable or not batch.logs:
         return
-    async with prisma_client._spend_log_transactions_lock:
-        prisma_client.spend_log_transactions = [
-            *batch.logs,
-            *prisma_client.spend_log_transactions,
-        ]
+    from litellm.proxy.utils import enqueue_spend_logs
+
+    await enqueue_spend_logs(prisma_client, batch.logs, at_head=True)
