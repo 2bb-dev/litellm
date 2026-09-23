@@ -76,6 +76,7 @@ from litellm.litellm_core_utils.asyncify import asyncify
 from litellm.litellm_core_utils.litellm_logging import (
     _init_custom_logger_compatible_class,
 )
+from litellm.litellm_core_utils.request_content_mode import encryption_enabled
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.token_counter import offload_token_count
@@ -2493,7 +2494,8 @@ def cost_tracking():
         spend_event_producer = build_spend_event_producer(CollectorSettings(), fallback=run_spend_event)
         litellm.logging_callback_manager.add_litellm_callback(_ProxyDBLogger(spend_event_producer))
         litellm.logging_callback_manager.add_litellm_async_success_callback(_ProxyDBLogger(spend_event_producer))
-        litellm.logging_callback_manager.add_litellm_callback(ShadowEvalLogger())
+        if not encryption_enabled():
+            litellm.logging_callback_manager.add_litellm_callback(ShadowEvalLogger())
 
 
 async def _drain_spend_event_producer_on_shutdown() -> None:
