@@ -20,7 +20,7 @@ import {
   type WireEvent,
 } from "./protocol.js";
 
-const text = z.string().max(1_000_000);
+const text = z.string().max(32 * 1024 * 1024);
 const name = z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/);
 const cache = z.strictObject({
   type: z.literal("ephemeral"),
@@ -71,6 +71,17 @@ const assistantBlock = z.discriminatedUnion("type", [
   }),
   z.strictObject({ type: z.literal("redacted_thinking"), data: text.min(1) }),
 ]);
+const effort = z.enum(["low", "medium", "high", "xhigh", "max"]);
+const toolChange = z.strictObject({
+  type: z.enum(["tool_addition", "tool_removal"]),
+  tool: z.strictObject({ type: z.literal("tool_reference"), name }),
+});
+const systemMessage = z.strictObject({
+  role: z.literal("system"),
+  content: z.union([text, z.array(z.union([textBlock, toolChange])).max(4096)]),
+  output_config: z.strictObject({ effort }).optional(),
+  clear_at: z.literal("next_user_message").optional(),
+});
 const natural = z.number().int().nonnegative();
 const requestSchema = z.strictObject({
   model: z.string().min(1).max(256),
@@ -87,20 +98,27 @@ const requestSchema = z.strictObject({
             z
               .array(z.union([textBlock, imageBlock, toolResult]))
               .min(1)
-              .max(256),
+              .max(4096),
           ]),
         }),
         z.strictObject({
           role: z.literal("assistant"),
           content: z.union([
             text.min(1),
-            z.array(assistantBlock).min(1).max(256),
+            z.array(assistantBlock).min(1).max(4096),
           ]),
         }),
+        systemMessage,
       ]),
     )
     .min(1)
-    .max(1000),
+    .max(10_000)
+    // Anthropic accepts only an effort-only system message as messages[0].
+    .refine(
+      ([first]) =>
+        first?.role !== "system" ||
+        (Array.isArray(first.content) && first.content.length === 0),
+    ),
   system: z.union([text, z.array(textBlock).max(256)]).optional(),
   tools: z
     .array(
@@ -112,10 +130,11 @@ const requestSchema = z.strictObject({
           .refine((value) => value.type === "object"),
         eager_input_streaming: z.boolean().optional(),
         strict: z.boolean().optional(),
+        defer_loading: z.boolean().optional(),
         cache_control: cache.optional(),
       }),
     )
-    .max(128)
+    .max(1000)
     .optional(),
   thinking: z
     .discriminatedUnion("type", [
@@ -126,13 +145,33 @@ const requestSchema = z.strictObject({
       }),
       z.strictObject({
         type: z.literal("adaptive"),
-        display: z.enum(["summarized", "omitted"]).optional(),
+        display: z.enum(["summarized", "omitted", "updates"]).optional(),
+        block_binding: z
+          .strictObject({
+            prefix_mismatch_behavior: z.enum(["error", "drop_block"]),
+          })
+          .optional(),
       }),
       z.strictObject({ type: z.literal("disabled") }),
     ])
     .optional(),
   output_config: z
-    .strictObject({ effort: z.enum(["low", "medium", "high", "xhigh", "max"]) })
+    .strictObject({
+      effort: effort.optional(),
+      task_budget: z
+        .strictObject({
+          type: z.literal("tokens"),
+          total: z.number().int().positive(),
+          remaining: natural.optional(),
+        })
+        .optional(),
+      format: z
+        .strictObject({
+          type: z.literal("json_schema"),
+          schema: z.record(z.string(), z.json()),
+        })
+        .optional(),
+    })
     .optional(),
   tool_choice: z
     .discriminatedUnion("type", [
@@ -178,6 +217,7 @@ function toContext(input: NativeRequest, model: Model<Api>): Context {
       : [],
   );
   const messages = input.messages.flatMap((message): Message[] => {
+    if (message.role === "system") return [];
     if (message.role === "assistant") {
       const content: AssistantMessage["content"] =
         typeof message.content === "string"
@@ -277,11 +317,16 @@ function nativePayload(
 ): unknown {
   const parsed = generatedSchema.safeParse(payload);
   if (!parsed.success) throw new Error("Unsupported native provider payload");
+  // Request semantics are the client's; Pi's payload contributes only the envelope and OAuth transforms.
   const {
     system,
     tools,
     thinking: _thinking,
     output_config: _effort,
+    fallbacks: _fallbacks,
+    temperature: _temperature,
+    tool_choice: _toolChoice,
+    metadata: _metadata,
     ...generated
   } = parsed.data;
   const names = new Map(
@@ -346,7 +391,6 @@ function nativePayload(
     ...(nativeTools
       ? {
           tools: nativeTools.map((tool, index) => ({
-            ...tools?.[index],
             ...tool,
             name: tools?.[index]?.name ?? tool.name,
           })),
@@ -386,7 +430,12 @@ export function prepareMessages(
     return invalid(
       "stop_sequences is unsupported: Pi does not preserve the matched stop sequence",
     );
-  const thinking = input.thinking && input.thinking.type !== "disabled";
+  const alwaysThinks =
+    model.compat?.forceAdaptiveThinking === true &&
+    model.thinkingLevelMap?.off === null;
+  const thinking =
+    (input.thinking && input.thinking.type !== "disabled") ||
+    (alwaysThinks && input.thinking === undefined);
   const choice = input.tool_choice;
   if (input.max_tokens > model.maxTokens)
     return invalid("max_tokens exceeds model limit");
@@ -395,7 +444,12 @@ export function prepareMessages(
     input.thinking.budget_tokens >= input.max_tokens
   )
     return invalid("Thinking budget must be less than max_tokens");
-  if ((thinking || input.output_config) && !model.reasoning)
+  if (
+    (input.thinking?.type === "enabled" ||
+      input.thinking?.type === "adaptive" ||
+      input.output_config?.effort) &&
+    !model.reasoning
+  )
     return invalid("Model does not support thinking");
   if (
     input.thinking?.type === "disabled" &&
@@ -411,6 +465,11 @@ export function prepareMessages(
     return invalid(
       "Temperature is unsupported with this model or thinking mode",
     );
+  if (
+    (input.top_p !== undefined || input.top_k !== undefined) &&
+    model.compat?.supportsTemperature === false
+  )
+    return invalid("Sampling parameters are unsupported with this model");
   if (thinking && (choice?.type === "any" || choice?.type === "tool"))
     return invalid("Thinking cannot force tool use");
   if (choice && choice.type !== "none" && !input.tools?.length)

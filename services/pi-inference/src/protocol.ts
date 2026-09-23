@@ -10,6 +10,7 @@ export interface ApiError {
   status: number;
   type: string;
   message: string;
+  retryAfter?: string;
 }
 
 export type Result<T> = { ok: true; value: T } | { ok: false; error: ApiError };

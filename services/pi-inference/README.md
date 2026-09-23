@@ -62,8 +62,10 @@ LiteLLM and this service. Both example LiteLLM routes read that same key via
 `os.environ/PI_INFERENCE_API_KEY`;
 it is **not** the front LiteLLM master/virtual key. Runtime settings are
 `PI_INFERENCE_CONFIG=/config/models.json`, `PI_INFERENCE_HOST=0.0.0.0`,
-`PI_INFERENCE_PORT=4001` (valid range 1–65535), and
-`PI_INFERENCE_SLOT_ID=slot1`. The image entrypoint is
+`PI_INFERENCE_PORT=4001` (valid range 1–65535),
+`PI_INFERENCE_SLOT_ID=slot1`, and `PI_INFERENCE_TIMEOUT_MS=600000` (the whole
+request deadline, 1000–3600000; streams get a `ping` or keep-alive comment every
+15 seconds of silence). The image entrypoint is
 `node dist/main.js`. Restart after changing the enabled model configuration
 
 All Pi built-in providers are available, but the explicit `models` allowlist

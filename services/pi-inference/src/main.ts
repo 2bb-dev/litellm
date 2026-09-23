@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { FileCredentialStore } from "./credentials.js";
 import { loadRuntime } from "./runtime.js";
-import { createInferenceServer } from "./server.js";
+import { createInferenceServer, defaultTimeoutMs } from "./server.js";
 
 async function main(): Promise<void> {
   if (process.argv[2] === "catalog") {
@@ -34,16 +34,22 @@ async function main(): Promise<void> {
   const apiKey = process.env.PI_INFERENCE_API_KEY;
   const path = process.env.PI_INFERENCE_CONFIG;
   const port = Number(process.env.PI_INFERENCE_PORT ?? 4001);
+  const timeoutMs = Number(
+    process.env.PI_INFERENCE_TIMEOUT_MS ?? defaultTimeoutMs,
+  );
   if (
     !apiKey ||
     apiKey.length < 32 ||
     !path ||
     !Number.isInteger(port) ||
     port < 1 ||
-    port > 65535
+    port > 65535 ||
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs < 1_000 ||
+    timeoutMs > 3_600_000
   ) {
     console.error(
-      "Set PI_INFERENCE_CONFIG, a PI_INFERENCE_API_KEY of at least 32 characters, and a valid PI_INFERENCE_PORT",
+      "Set PI_INFERENCE_CONFIG, a PI_INFERENCE_API_KEY of at least 32 characters, a valid PI_INFERENCE_PORT, and PI_INFERENCE_TIMEOUT_MS between 1000 and 3600000",
     );
     process.exitCode = 1;
     return;
@@ -71,6 +77,7 @@ async function main(): Promise<void> {
     }
     const backend = createInferenceServer({
       apiKey,
+      timeoutMs,
       runtime: runtime.value,
       log: (record) =>
         console.log(JSON.stringify({ ...record, slot_id: slot })),

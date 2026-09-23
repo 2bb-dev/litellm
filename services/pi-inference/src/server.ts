@@ -38,6 +38,7 @@ export interface ServerOptions {
   timeoutMs?: number;
   maxBodyBytes?: number;
   maxInflight?: number;
+  keepAliveMs?: number;
 }
 
 const genericFailure: ApiError = {
@@ -51,12 +52,76 @@ const timeoutFailure: ApiError = {
   message: "Inference deadline exceeded",
 };
 const modelRequest = z.object({ model: z.string().min(1) });
-// Anthropic SDK clients (Claude Code, pi-ai >= 0.85) call `/v1/messages?beta=true`,
-// so routing matches the path and ignores the query string.
+export const defaultTimeoutMs = 600_000;
 const pathOf = (req: IncomingMessage): string =>
   URL.canParse(req.url ?? "", "http://backend.invalid")
     ? new URL(req.url ?? "", "http://backend.invalid").pathname
     : "";
+// Added by pi-ai from its model metadata; on the native route only the client enables them.
+const derivedFeatureBetas = new Set([
+  "fine-grained-tool-streaming-2025-05-14",
+  "interleaved-thinking-2025-05-14",
+  "server-side-fallback-2026-07-01",
+  "mid-conversation-output-config-2026-07-01",
+  "thinking-binding-controls-2026-08-01",
+  "mid-conversation-tool-changes-2026-07-01",
+]);
+const betaList = (value: string | string[] | null | undefined): string[] =>
+  (Array.isArray(value) ? value.join(",") : (value ?? ""))
+    .split(",")
+    .map((beta) => beta.trim())
+    .filter(Boolean);
+const upstreamError = z.object({
+  error: z.object({
+    type: z.string().regex(/^[a-z_]{1,64}$/),
+    message: z.string().max(2000),
+  }),
+});
+interface Upstream {
+  status?: number;
+  requestId?: string;
+  retryAfter?: string;
+  error?: z.infer<typeof upstreamError>["error"];
+}
+function upstreamFetch(
+  upstream: Upstream,
+  clientBetas: string[] | undefined,
+): typeof fetch {
+  return async (input, init) => {
+    const headers = new Headers(init?.headers);
+    if (clientBetas) {
+      const merged = [
+        ...new Set([
+          ...betaList(headers.get("anthropic-beta")).filter(
+            (beta) => !derivedFeatureBetas.has(beta),
+          ),
+          ...clientBetas,
+        ]),
+      ];
+      if (merged.length) headers.set("anthropic-beta", merged.join(","));
+      else headers.delete("anthropic-beta");
+    }
+    const response = await fetch(input, { ...init, headers });
+    upstream.status = response.status;
+    upstream.requestId = safeId(
+      response.headers.get("request-id") ??
+        response.headers.get("x-request-id") ??
+        undefined,
+    );
+    upstream.retryAfter =
+      safeId(response.headers.get("retry-after") ?? undefined) ?? undefined;
+    if (!response.ok) {
+      const body = upstreamError.safeParse(
+        await response
+          .clone()
+          .json()
+          .catch(() => undefined),
+      );
+      upstream.error = body.success ? body.data.error : undefined;
+    }
+    return response;
+  };
+}
 
 export function createInferenceServer(options: ServerOptions) {
   const active = new Set<AbortController>();
@@ -157,7 +222,7 @@ export function createInferenceServer(options: ServerOptions) {
       return;
     }
     const controller = new AbortController();
-    const deadline = AbortSignal.timeout(options.timeoutMs ?? 90_000);
+    const deadline = AbortSignal.timeout(options.timeoutMs ?? defaultTimeoutMs);
     const signal = AbortSignal.any([controller.signal, deadline]);
     const started = performance.now();
     const id =
@@ -168,14 +233,30 @@ export function createInferenceServer(options: ServerOptions) {
       message?: AssistantMessage;
       error?: ApiError;
       firstTokenMs?: number;
-      upstreamStatus?: number;
-      upstreamId?: string;
       requests: number;
       alias?: string;
       provider?: string;
       model?: string;
       api?: string;
     } = { requests: 0 };
+    const upstream: Upstream = {};
+    const keepAliveMs = options.keepAliveMs ?? 15_000;
+    let lastWrite = 0;
+    let keepAlive: NodeJS.Timeout | undefined;
+    const startKeepAlive = (native: boolean) => {
+      lastWrite = performance.now();
+      keepAlive = setInterval(() => {
+        if (res.writableEnded || performance.now() - lastWrite < keepAliveMs)
+          return;
+        res.write(
+          native
+            ? formatEvent({ event: "ping", data: { type: "ping" } })
+            : ": keepalive\n\n",
+        );
+        lastWrite = performance.now();
+      }, keepAliveMs);
+      keepAlive.unref();
+    };
     const abort = () => controller.abort();
     active.add(controller);
     req.once("aborted", abort);
@@ -185,7 +266,7 @@ export function createInferenceServer(options: ServerOptions) {
     try {
       const body = await readBody(
         req,
-        options.maxBodyBytes ?? 16 * 1024 * 1024,
+        options.maxBodyBytes ?? 32 * 1024 * 1024,
         signal,
       );
       if (!body.ok) {
@@ -234,19 +315,17 @@ export function createInferenceServer(options: ServerOptions) {
         signal,
         transport: "sse",
         maxRetries: 0,
-        timeoutMs: options.timeoutMs ?? 90_000,
+        timeoutMs: options.timeoutMs ?? defaultTimeoutMs,
         headers: { traceparent: trace.header },
+        fetch: upstreamFetch(
+          upstream,
+          native ? betaList(req.headers["anthropic-beta"]) : undefined,
+        ),
         onPayload: async (payload, resolved) => {
           result.requests += 1;
           return call.options.onPayload
             ? call.options.onPayload(payload, resolved)
             : undefined;
-        },
-        onResponse: (response) => {
-          result.upstreamStatus = response.status;
-          result.upstreamId = safeId(
-            response.headers["request-id"] ?? response.headers["x-request-id"],
-          );
         },
       });
       const encode = native
@@ -273,7 +352,7 @@ export function createInferenceServer(options: ServerOptions) {
           result.message = event.error;
           result.error = deadline.aborted
             ? timeoutFailure
-            : providerFailure(result.upstreamStatus);
+            : providerFailure(upstream);
           if (call.stream && res.headersSent)
             await writeEvent(
               res,
@@ -288,14 +367,17 @@ export function createInferenceServer(options: ServerOptions) {
         }
         if (event.type === "done") result.message = event.message;
         if (call.stream) {
-          if (!res.headersSent)
+          if (!res.headersSent) {
             res.writeHead(200, {
               "content-type": "text/event-stream",
               "cache-control": "no-cache",
               "x-accel-buffering": "no",
             });
+            startKeepAlive(native);
+          }
           for (const frame of encode(event)) {
             await writeEvent(res, frame, signal);
+            lastWrite = performance.now();
             if (frame.error) {
               result.error = frame.error;
               return;
@@ -342,6 +424,7 @@ export function createInferenceServer(options: ServerOptions) {
           );
       }
     } finally {
+      clearInterval(keepAlive);
       controller.abort();
       active.delete(controller);
       req.off("aborted", abort);
@@ -368,8 +451,8 @@ export function createInferenceServer(options: ServerOptions) {
             ? undefined
             : Math.round(result.firstTokenMs),
         provider_requests: result.requests,
-        upstream_status: result.upstreamStatus,
-        upstream_request_id: result.upstreamId,
+        upstream_status: upstream.status,
+        upstream_request_id: upstream.requestId,
         upstream_response_id: safeId(result.message?.responseId),
         usage: usage
           ? {
@@ -510,17 +593,33 @@ function sendError(
   error: ApiError,
   native: boolean,
 ): void {
+  if (error.retryAfter) res.setHeader("retry-after", error.retryAfter);
   sendJson(res, error.status, errorBody(error, native));
 }
 
-function providerFailure(status: number | undefined): ApiError {
-  if (status === 429)
-    return {
-      status: 429,
-      type: "rate_limit_error",
-      message: "Provider rate limit reached",
-    };
-  return genericFailure;
+const statusTypes: Record<number, string> = {
+  400: "invalid_request_error",
+  401: "authentication_error",
+  402: "billing_error",
+  403: "permission_error",
+  404: "not_found_error",
+  413: "request_too_large",
+  429: "rate_limit_error",
+  500: "api_error",
+  504: "timeout_error",
+  529: "overloaded_error",
+};
+
+function providerFailure(upstream: Upstream): ApiError {
+  const status = upstream.status;
+  if (status === undefined || status < 400 || status > 599)
+    return genericFailure;
+  return {
+    status,
+    type: upstream.error?.type ?? statusTypes[status] ?? "api_error",
+    message: upstream.error?.message ?? "Provider request failed",
+    retryAfter: upstream.retryAfter,
+  };
 }
 
 function safeId(value: string | string[] | undefined): string | undefined {
