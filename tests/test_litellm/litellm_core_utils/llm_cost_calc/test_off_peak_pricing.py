@@ -4,7 +4,16 @@ from typing import cast
 
 import pytest
 
-from litellm.litellm_core_utils.llm_cost_calc.off_peak_pricing import get_off_peak_pricing_overrides
+from litellm.litellm_core_utils.llm_cost_calc.utils import _open_off_peak_block, _parse_off_peak_rate
+
+
+def get_off_peak_pricing_overrides(model_info: "ModelInfo", request_time: datetime) -> dict[str, float]:
+    schedule = _open_off_peak_block(model_info, request_time)
+    if schedule is None:
+        return {}
+    return {key: rate for key, value in schedule.items() if (rate := _parse_off_peak_rate(value)) is not None}
+
+
 from litellm.types.utils import ModelInfo
 
 

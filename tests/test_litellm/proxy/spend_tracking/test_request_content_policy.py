@@ -120,9 +120,19 @@ async def test_ready_profile_preserves_request_and_installs_identity_marker(prot
     assert data["messages"][0]["content"] == CANARY
 
 
-def test_actual_proxy_and_usage_router_callbacks_fit_the_protected_profile(protected_runtime, monkeypatch):
+@pytest.mark.parametrize("protected", [True, False])
+def test_actual_proxy_and_usage_router_callbacks_fit_the_protected_profile(protected_runtime, monkeypatch, protected):
+    from litellm.integrations.shadow_eval_logger import ShadowEvalLogger
     from litellm.proxy import proxy_server
 
+    if not protected:
+        monkeypatch.delenv(CONFIG_ENV)
+    assert encryption_enabled() is protected
+    monkeypatch.setenv("LITELLM_COLLECTOR_ENABLED", "false")
+    monkeypatch.setattr(proxy_server, "spend_event_producer", None)
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    proxy_server.cost_tracking()
     router = litellm.Router(
         model_list=[{"model_name": "test", "litellm_params": {"model": "openai/test-model", "api_key": "synthetic"}}],
         routing_strategy="usage-based-routing",
@@ -131,6 +141,9 @@ def test_actual_proxy_and_usage_router_callbacks_fit_the_protected_profile(prote
     )
     monkeypatch.setattr(proxy_server, "llm_router", router)
     proxy_server.proxy_logging_obj._init_litellm_callbacks(llm_router=router)
+    assert sum(isinstance(callback, _ProxyDBLogger) for callback in litellm.callbacks) == 1
+    assert sum(isinstance(callback, _ProxyDBLogger) for callback in litellm._async_success_callback) == 1
+    assert sum(isinstance(callback, ShadowEvalLogger) for callback in litellm.callbacks) == int(not protected)
     assert protected_profile_failure() is None
 
 

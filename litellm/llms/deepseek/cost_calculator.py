@@ -5,15 +5,12 @@ Handles prompt caching scenario.
 """
 
 from datetime import datetime
-from typing import Optional, Tuple, Union
 
 from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token
 from litellm.types.utils import Usage
 
 
-def cost_per_token(
-    model: str, usage: Usage, request_time: Optional[Union[datetime, float]] = None
-) -> Tuple[float, float]:
+def cost_per_token(model: str, usage: Usage, request_time: datetime | float | None = None) -> tuple[float, float]:
     """
     Calculates the cost per token for a given model, prompt tokens, and completion tokens.
 

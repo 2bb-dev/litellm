@@ -33,6 +33,9 @@ jobs:
         with:
           version: "0.11.8"
 
+      - name: Set up Rust
+        run: rustup toolchain install --component rust-docs
+
       - name: Install test dependencies
         run: >-
           .github/scripts/uv_sync_with_retries.sh --frozen
@@ -49,9 +52,10 @@ jobs:
         run: |
           uv run --no-sync pytest -q \
             tests/test_litellm/responses/test_responses_utils.py \
-            tests/litellm/test_effective_token_pricing.py \
+            tests/test_litellm/test_effective_token_pricing.py \
             tests/test_litellm/litellm_core_utils/llm_cost_calc/test_off_peak_pricing.py \
             tests/test_litellm/litellm_core_utils/llm_cost_calc/test_llm_cost_calc_utils.py \
+            tests/test_litellm/litellm_core_utils/test_get_model_cost_map.py \
             tests/test_litellm/litellm_core_utils/test_safe_json_dumps.py \
             tests/test_litellm/litellm_core_utils/test_redact_messages.py \
             tests/test_litellm/llms/chatgpt/chat/test_chatgpt_transformation.py \
@@ -79,7 +83,7 @@ jobs:
             tests/test_litellm/test_router.py \
             tests/test_litellm/test_utils.py \
             tests/test_litellm/litellm_core_utils/test_core_helpers.py \
-            -k 'retry_history or request_retry_cap or request_retry_state'
+            -k 'retry_history or request_retry_cap or request_retry_state or retry_breadcrumbs'
 
       - name: Verify OSS dependency graph and imports
         run: |
@@ -87,9 +91,16 @@ jobs:
           ! grep -q 'litellm-enterprise' pyproject.toml
           uv run --no-sync python tests/code_coverage_tests/check_unsafe_enterprise_import.py
           uv run --no-sync python tests/code_coverage_tests/check_licenses.py
+          cargo fetch --locked --manifest-path litellm-rust/Cargo.toml
+          uv run --no-sync python scripts/generate_openorange_native_notices.py
 
       - name: Build wheel
-        run: uv build --wheel
+        run: |
+          uv build --wheel
+          uv run --no-sync python tests/code_coverage_tests/check_openorange_artifact.py \
+            --wheel dist/*.whl --license-sha256 "$(sha256sum LICENSE | cut -d ' ' -f 1)" \
+            --native-notices-sha256 "$(sha256sum litellm-rust/THIRD_PARTY_NOTICES.txt | cut -d ' ' -f 1)" \
+            --rust-notices-sha256 "$(sha256sum litellm-rust/notices/RUST-COPYRIGHT-library.html | cut -d ' ' -f 1)"
 
   image:
     name: Build OSS runtime image
@@ -102,3 +113,11 @@ jobs:
 
       - name: Build image
         run: docker build --tag litellm-openorange:ci .
+
+      - name: Verify installed OSS runtime
+        run: |
+          docker run --rm --interactive --network none --entrypoint python litellm-openorange:ci \
+            - --license-sha256 "$(sha256sum LICENSE | cut -d ' ' -f 1)" \
+            --native-notices-sha256 "$(sha256sum litellm-rust/THIRD_PARTY_NOTICES.txt | cut -d ' ' -f 1)" \
+            --rust-notices-sha256 "$(sha256sum litellm-rust/notices/RUST-COPYRIGHT-library.html | cut -d ' ' -f 1)" \
+            < tests/code_coverage_tests/check_openorange_artifact.py

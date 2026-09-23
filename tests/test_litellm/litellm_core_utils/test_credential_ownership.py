@@ -114,6 +114,35 @@ def test_explicit_custom_llm_provider_param_is_ambiguous():
 
 
 @pytest.mark.parametrize("provider", ["openai", "litellm_proxy"])
+@pytest.mark.parametrize("caller_override", [False, True])
+def test_provider_discriminator_cannot_override_selected_credential(provider, caller_override):
+    route = deployment()
+    route["litellm_params"]["model"] = f"{provider}/test-model"
+    request = selected_request(route, {"custom_llm_provider": provider} if caller_override else None)
+    if not caller_override:
+        request["custom_llm_provider"] = "openai" if provider == "litellm_proxy" else "litellm_proxy"
+    fact = ownership_for_spend(resolve_ownership(request, {}, {}), "selected-a")
+    assert (fact["source"], fact["provenance"]) == ("unknown", "credential_override")
+
+
+@pytest.mark.parametrize("provider", ["openai", "litellm_proxy"])
+@pytest.mark.parametrize("change", ["model", "provider", "header", "missing_provider"])
+def test_bridge_normalization_cannot_change_dispatch_binding(provider, change):
+    route = deployment()
+    route["litellm_params"]["model"] = f"{provider}/test-model"
+    request = {**selected_request(route), "model": "test-model", "custom_llm_provider": provider, "extra_headers": {}}
+    if change == "model":
+        request["model"] = "other-model"
+    elif change == "provider":
+        request["custom_llm_provider"] = "openai" if provider == "litellm_proxy" else "litellm_proxy"
+    elif change == "header":
+        request["extra_headers"] = {"Authorization": "Bearer changed-after-selection"}
+    else:
+        request.pop("custom_llm_provider")
+    assert ownership_for_spend(resolve_ownership(request, {}, {}), "selected-a")["source"] == "unknown"
+
+
+@pytest.mark.parametrize("provider", ["openai", "litellm_proxy"])
 def test_router_resolves_environment_key_before_selection(monkeypatch, provider):
     # Static server configuration binds `api_key: os.environ/NAME`; the Router
     # resolves it while loading the deployment, so selection digests the real key.
@@ -398,6 +427,69 @@ async def test_real_router_sdk_callbacks_stamp_actual_completed_credential(
                 await client.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "litellm_proxy"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("bridge", [False, True])
+async def test_responses_dispatch_retains_registered_ownership(monkeypatch, upstream_server, provider, stream, bridge):
+    import asyncio
+
+    from litellm.integrations.custom_logger import CustomLogger
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+    from litellm.responses.main import mock_responses_api_response
+
+    rows = []
+    done = asyncio.Event()
+
+    class Capture(CustomLogger):
+        async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+            rows.append(get_logging_payload(kwargs, response_obj, start_time, end_time))
+            done.set()
+
+    for name in (
+        "callbacks", "success_callback", "failure_callback", "_async_success_callback",
+        "_async_failure_callback", "input_callback",
+    ):
+        monkeypatch.setattr(litellm, name, [])
+    monkeypatch.setattr(litellm, "callbacks", [Capture()])
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    base, calls, replies = upstream_server
+    route = deployment()
+    route["litellm_params"].update(model=f"{provider}/test-model", api_base=base)
+    router = litellm.Router(model_list=[route], num_retries=0)
+    if bridge:
+        body = {
+            "id": "synthetic-bridge", "object": "chat.completion.chunk" if stream else "chat.completion",
+            "created": 1, "model": "test-model",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "delta" if stream else "message": {"role": "assistant", "content": "synthetic"}}],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12},
+        }
+        replies.append((200, f"data: {json.dumps(body)}\n\ndata: [DONE]\n\n".encode() if stream else body))
+    else:
+        body = mock_responses_api_response("synthetic").model_dump(mode="json")
+        body["usage"] = {"input_tokens": 9, "output_tokens": 3, "total_tokens": 12}
+        event = {"type": "response.completed", "response": body, "sequence_number": 1}
+        replies.append((200, f"event: response.completed\ndata: {json.dumps(event)}\n\n".encode() if stream else body))
+
+    response = await router.aresponses(
+        model="requested-group", input="synthetic", stream=stream, use_chat_completions_api=bridge,
+    )
+    if stream:
+        events = [event async for event in response]
+        assert any(event.type == "response.completed" for event in events)
+    await asyncio.wait_for(done.wait(), 5)
+    assert calls == [("/v1/chat/completions" if bridge else "/v1/responses", "Bearer synthetic-upstream-key")]
+    assert len(rows) == 1
+    row = rows[0]
+    assert json.loads(row["metadata"])[FIELD] == {
+        **REGISTRATION, "provenance": "route_registration", "deployment_id": "selected-a",
+    }
+    assert row["model_id"] == "selected-a"
+    assert row["custom_llm_provider"] == provider
+    assert (row["prompt_tokens"], row["completion_tokens"], row["total_tokens"]) == (9, 3, 12)
+
+
 def test_db_model_registration_is_not_reviewed_static_authority():
     route = deployment()
     route["model_info"]["db_model"] = True
@@ -603,9 +695,9 @@ def upstream_server():
                     },
                 )
             )
-            data = json.dumps(body).encode()
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
             self.send_response(code)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "text/event-stream" if isinstance(body, bytes) else "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)

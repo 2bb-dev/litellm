@@ -10,17 +10,14 @@ from litellm.proxy.utils import _get_redoc_url, _get_docs_url
 import pytest
 from fastapi import Request
 
-sys.path.insert(
-    0, os.path.abspath("../..")
-)  # Adds the parent directory to the system path
 import litellm
 from unittest.mock import MagicMock, patch, AsyncMock
 
 
 import httpx
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
+from litellm.proxy._types import DB_CONNECTION_ERROR_TYPES
 from litellm.proxy.utils import (
-    DB_CONNECTION_ERROR_TYPES,
     ProxyUpdateSpend,
     _spend_log_batch_prefix,
     drain_spend_log_queue,
@@ -30,8 +27,54 @@ from litellm.proxy.utils import (
 from litellm.proxy.db.spend_log_queue import (
     SQLiteSpendLogSpool,
     enqueue_spend_log,
+    release_spend_log_batch,
     spend_log_queue_stats,
+    take_spend_log_batch,
 )
+import math
+from litellm.constants import SPEND_LOG_WRITE_BATCH_MAX_ROWS
+
+# The flush chunks the queue by BATCH_SIZE and then splits each chunk by the row
+# budget, so statement counts below are derived from both rather than hardcoded.
+_OUTER_BATCH_SIZE = 1000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spool_failure", [False, True])
+async def test_memory_fallback_and_failed_batch_requeue_share_upstream_byte_budget(monkeypatch, caplog, spool_failure):
+    from functools import partial
+
+    from litellm.proxy import utils
+    from litellm.proxy.db.spend_log_batching import spend_log_row_bytes
+
+    client = MockPrismaClient()
+    if spool_failure:
+        client._spend_log_spool = MagicMock()
+        client._spend_log_spool.enqueue = AsyncMock(side_effect=OSError("synthetic disk full"))
+    rows = [{"request_id": f"row-{index}", "content": "PRIVATE-CONTENT" * 8} for index in range(4)]
+    cap = 2 * spend_log_row_bytes(rows[0])
+    monkeypatch.setattr(utils.PrismaClient, "spend_log_queue_bytes", 0)
+    monkeypatch.setattr(utils, "enqueue_spend_logs", partial(utils.enqueue_spend_logs, max_bytes=cap))
+
+    assert await enqueue_spend_log(client, rows[0]) is False
+    assert await enqueue_spend_log(client, rows[1]) is False
+    batch = await take_spend_log_batch(client, max_count=1, max_bytes=cap)
+    assert not batch.is_durable
+    assert utils.PrismaClient.spend_log_queue_bytes == spend_log_row_bytes(rows[1])
+    assert await enqueue_spend_log(client, rows[2]) is False
+    assert await enqueue_spend_log(client, rows[3]) is False
+    await release_spend_log_batch(client, batch)
+
+    assert client.spend_log_transactions == rows[2:]
+    assert utils.PrismaClient.spend_log_queue_bytes <= cap
+    assert caplog.text.count("dropped the 1 oldest spend logs") == 2
+    assert "PRIVATE-CONTENT" not in caplog.text
+
+
+def _statements_for(rows: int) -> int:
+    full, remainder = divmod(rows, _OUTER_BATCH_SIZE)
+    chunks = [_OUTER_BATCH_SIZE] * full + ([remainder] if remainder else [])
+    return sum(math.ceil(chunk / SPEND_LOG_WRITE_BATCH_MAX_ROWS) for chunk in chunks)
 
 
 class MockPrismaClient:
@@ -44,13 +87,17 @@ class MockPrismaClient:
         # Initialize transaction lists
         self.spend_log_transactions = []
         self.daily_user_spend_transactions = {}
+        self.tool_usage_transactions = []
+        self.autorouter_turn_transactions = []
 
-        # Add lock for spend_log_transactions (matches real PrismaClient)
+        # Add locks for the transaction queues (matches real PrismaClient)
         import asyncio
 
         self._spend_log_transactions_lock = asyncio.Lock()
         self._spend_log_write_lock = asyncio.Lock()
         self._spend_log_spool = None
+        self._tool_usage_transactions_lock = asyncio.Lock()
+        self._autorouter_turn_transactions_lock = asyncio.Lock()
 
     def jsonify_object(self, obj):
         return obj
@@ -466,7 +513,7 @@ async def test_update_spend_logs_non_connection_error():
     prisma_client.db.litellm_spendlogs.create_many = create_many_mock
 
     # Execute and verify it raises immediately without retrying
-    with pytest.raises(ValueError) as exc_info:
+    with pytest.raises(ValueError, match='Unexpected database error') as exc_info:
         await update_spend(prisma_client, None, proxy_logging_obj)
 
     # Verify error message
@@ -548,25 +595,16 @@ async def test_update_spend_logs_multiple_batches_success():
     await update_spend(prisma_client, None, proxy_logging_obj)
 
     # Verify
-    assert create_many_mock.call_count == 2  # Should have made 2 batch calls
+    assert create_many_mock.call_count == _statements_for(1500)
 
-    # Get the actual data from each batch call
-    first_batch = create_many_mock.call_args_list[0][1]["data"]
-    second_batch = create_many_mock.call_args_list[1][1]["data"]
+    # No statement may exceed the row budget, which is what bounds the query
+    # engine's resident memory.
+    batches = [call[1]["data"] for call in create_many_mock.call_args_list]
+    assert all(len(batch) <= SPEND_LOG_WRITE_BATCH_MAX_ROWS for batch in batches)
 
-    # Verify batch sizes
-    assert len(first_batch) == 1000
-    assert len(second_batch) == 500
-
-    # Verify exact IDs in each batch
-    expected_first_batch_ids = {str(i) for i in range(1000)}
-    expected_second_batch_ids = {str(i) for i in range(1000, 1500)}
-
-    actual_first_batch_ids = {item["id"] for item in first_batch}
-    actual_second_batch_ids = {item["id"] for item in second_batch}
-
-    assert actual_first_batch_ids == expected_first_batch_ids
-    assert actual_second_batch_ids == expected_second_batch_ids
+    # Every row is written exactly once and in order, whatever the split.
+    written_ids = [item["id"] for batch in batches for item in batch]
+    assert written_ids == [str(i) for i in range(1500)]
 
     # Verify all logs were processed
     assert len(prisma_client.spend_log_transactions) == 0
@@ -610,8 +648,9 @@ async def test_update_spend_logs_multiple_batches_with_failure():
         logs_to_process=logs_to_process,
     )
 
-    # Verify
-    assert create_many_mock.call_count == 6  # 4 batches + 2 retries for failed batch
+    # The first attempt aborts on its second statement, then the whole flush
+    # replays, so the total is those two calls plus one complete pass.
+    assert create_many_mock.call_count == 2 + _statements_for(4000)
 
     # Verify all batches were processed
     all_processed_logs = []
@@ -645,4 +684,47 @@ async def test_graceful_shutdown_drains_all_spend_batches():
 
     assert remaining == 0
     assert len(prisma_client.spend_log_transactions) == 0
-    assert prisma_client.db.litellm_spendlogs.create_many.call_count == 2
+    written = [row for call in prisma_client.db.litellm_spendlogs.create_many.await_args_list for row in call.kwargs["data"]]
+    assert [row["request_id"] for row in written] == [str(i) for i in range(1200)]
+    assert all(len(call.kwargs["data"]) <= SPEND_LOG_WRITE_BATCH_MAX_ROWS for call in prisma_client.db.litellm_spendlogs.create_many.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_durable_deadlock_is_retried_without_quarantine_or_memory_duplicate(tmp_path):
+    from prisma.errors import DataError
+
+    client = MockPrismaClient()
+    client._spend_log_spool = SQLiteSpendLogSpool(str(tmp_path / "spend.sqlite"))
+    logging = create_mock_proxy_logging()
+    await enqueue_spend_log(client, {"request_id": "deadlocked"})
+    failure = DataError(data={"user_facing_error": {"message": "deadlock detected (40P01)"}})
+    client.db.litellm_spendlogs.create_many.side_effect = failure
+    with pytest.raises(DataError):
+        await update_spend_logs_job(client, None, logging)
+    stats = await spend_log_queue_stats(client)
+    assert (stats.count, stats.quarantined_count) == (1, 0)
+    assert client.spend_log_transactions == []
+    assert client.db.litellm_spendlogs.create_many.await_count == 1
+    client.db.litellm_spendlogs.create_many.side_effect = None
+    await update_spend_logs_job(client, None, logging)
+    assert (await spend_log_queue_stats(client)).count == 0
+    assert client.db.litellm_spendlogs.create_many.await_args.kwargs["skip_duplicates"] is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drain_deadline_releases_uncommitted_durable_rows(tmp_path):
+    from litellm.proxy.utils import drain_spend_logs_queue
+
+    client = MockPrismaClient()
+    client._spend_log_spool = SQLiteSpendLogSpool(str(tmp_path / "shutdown.sqlite"))
+    client.spend_logs_queue_monitor_task = None
+    await enqueue_spend_log(client, {"request_id": "uncommitted"})
+
+    async def stalled_insert(**kwargs):
+        await asyncio.Event().wait()
+
+    client.db.litellm_spendlogs.create_many.side_effect = stalled_insert
+    remaining = await drain_spend_logs_queue(client, None, create_mock_proxy_logging(), timeout_seconds=0.02)
+    assert remaining == 1
+    assert (await spend_log_queue_stats(client)).count == 1
+    assert client.db.litellm_spendlogs.create_many.await_count == 1
