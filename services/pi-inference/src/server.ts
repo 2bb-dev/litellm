@@ -108,8 +108,9 @@ function upstreamFetch(
         response.headers.get("x-request-id") ??
         undefined,
     );
-    upstream.retryAfter =
-      safeId(response.headers.get("retry-after") ?? undefined) ?? undefined;
+    upstream.retryAfter = safeId(
+      response.headers.get("retry-after") ?? undefined,
+    );
     if (!response.ok) {
       const body = upstreamError.safeParse(
         await response
@@ -243,7 +244,7 @@ export function createInferenceServer(options: ServerOptions) {
     const keepAliveMs = options.keepAliveMs ?? 15_000;
     let lastWrite = 0;
     let keepAlive: NodeJS.Timeout | undefined;
-    const startKeepAlive = (native: boolean) => {
+    const startKeepAlive = () => {
       lastWrite = performance.now();
       keepAlive = setInterval(() => {
         if (res.writableEnded || performance.now() - lastWrite < keepAliveMs)
@@ -373,7 +374,7 @@ export function createInferenceServer(options: ServerOptions) {
               "cache-control": "no-cache",
               "x-accel-buffering": "no",
             });
-            startKeepAlive(native);
+            startKeepAlive();
           }
           for (const frame of encode(event)) {
             await writeEvent(res, frame, signal);
