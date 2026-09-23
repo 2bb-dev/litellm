@@ -6,9 +6,9 @@ from collections.abc import AsyncGenerator, AsyncIterator, Generator, Iterator
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
-from pydantic import Field, JsonValue, TypeAdapter, ValidationError, model_validator
+from pydantic import Field, JsonValue, StringConstraints, TypeAdapter, ValidationError, model_validator
 
-from litellm.litellm_core_utils.terminal_receipt_evidence import Closed, Identifier
+from litellm.litellm_core_utils.terminal_receipt_evidence import Closed
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.terminal_receipt_hooks import Session
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 FIELD = "openorange_usage_observation"
 LOCAL_STAMP = "_openorange_local_usage"
 Quantity = Annotated[int, Field(strict=True, ge=0, le=9007199254740991)]
+LocalObservationId = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._:/+=-]{0,1535}$")]
 _VALUES = TypeAdapter(dict[str, object])
 _OPAQUE = TypeAdapter(object)
 _QUANTITY: TypeAdapter[int] = TypeAdapter(Quantity)
@@ -37,7 +38,7 @@ class UsageObservation(UsageSnapshot):
     v: Annotated[int, Field(strict=True, ge=1, le=1)]
     # A local spend row can use an upstream response ID, independently of the
     # UUID identifiers used by the separate signed supplier receipt protocol.
-    local_attempt_id: Identifier
+    local_attempt_id: LocalObservationId
     state: Literal["observed", "partial", "unobserved"]
 
     @model_validator(mode="after")

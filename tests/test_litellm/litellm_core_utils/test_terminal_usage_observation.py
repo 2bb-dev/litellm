@@ -1,13 +1,15 @@
 """No default or estimated counts may become private provider observation."""
 
+import json
 from uuid import uuid4
 
 import pytest
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from pydantic import TypeAdapter, ValidationError
 
 from litellm.litellm_core_utils.credential_ownership import strip_ownership
 from litellm.litellm_core_utils.terminal_receipt_client import Authority
-from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP, Terminal
+from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP, Identifier, Terminal
 from litellm.litellm_core_utils.terminal_usage_observation import (
     FIELD,
     LOCAL_STAMP,
@@ -133,6 +135,80 @@ def test_local_native_astra_usage_does_not_require_supplier_session(streamed):
     assert fact["state"] == "observed"
     assert fact["cache_read_tokens"] == 0
     assert fact["cache_write_tokens"] is None
+
+
+@pytest.mark.parametrize("request_id", ["resp-local", "resp_" + "aB0_-/+" * 127 + "=="], ids=["short", "encoded"])
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("status", ["completed", "incomplete"])
+@pytest.mark.parametrize("cached", [None, 0])
+def test_native_responses_observation_keeps_storage_id_and_usage_presence(request_id, streamed, status, cached):
+    from litellm.litellm_core_utils.terminal_receipt_hooks import finish, metadata_for_spend
+
+    details = {"custom_llm_provider": "litellm_proxy"}
+    body = {
+        "id": request_id,
+        "object": "response",
+        "status": status,
+        "usage": {
+            "input_tokens": 15,
+            "output_tokens": 16,
+            "total_tokens": 31,
+            **({"input_tokens_details": {"cached_tokens": cached}} if cached is not None else {}),
+        },
+    }
+    observe_native_usage(
+        details, {"type": f"response.{status}", "response": body} if streamed else body, streamed=streamed
+    )
+    finish(details, None, "success")
+    fact = metadata_for_spend(None, local_observation=details[LOCAL_STAMP], request_id=request_id)[FIELD]
+    assert fact["local_attempt_id"] == request_id
+    assert fact["state"] == ("partial" if streamed and status == "incomplete" else "observed")
+    assert (fact["prompt_tokens"], fact["completion_tokens"], fact["total_tokens"]) == (15, 16, 31)
+    assert fact["cache_read_tokens"] == cached
+    assert fact["cache_write_tokens"] is None
+    assert safe_usage(fact) == fact
+    finish(details, None, "failure")
+    assert (
+        metadata_for_spend(None, local_observation=details[LOCAL_STAMP], request_id=request_id)[FIELD]["state"]
+        == "partial"
+    )
+
+
+def test_local_observation_id_bounds_preserve_envelope_and_signed_identifier_limits():
+    from litellm.litellm_core_utils.terminal_receipt_hooks import finish
+
+    details = {}
+    observe_native_usage(details, {"usage": {name: 9007199254740991 for name in UsageSnapshot.model_fields}})
+    finish(details, None, "success")
+    request_id = "resp_" + "a" * 1529 + "=="
+    fact = usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id=request_id)[FIELD]
+    assert fact["local_attempt_id"] == request_id
+    maximum_fact = {**fact, **{name: 9007199254740991 for name in UsageSnapshot.model_fields}}
+    assert len(json.dumps(maximum_fact, separators=(",", ":")).encode()) <= 2048
+    assert safe_usage(maximum_fact) == maximum_fact
+    assert TypeAdapter(Identifier).validate_python("a" * 256) == "a" * 256
+    for invalid_signed in ("a" * 257, "resp_encoded==", request_id):
+        with pytest.raises(ValidationError):
+            TypeAdapter(Identifier).validate_python(invalid_signed)
+    for invalid in (request_id + "a", "resp-\nprivate", "resp-private\n", 'resp-"private', "resp-☃", ""):
+        assert usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id=invalid) == {}
+        assert safe_usage({**fact, "local_attempt_id": invalid}) == {"v": 1, "state": "invalid"}
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_native_responses_long_id_cannot_create_missing_usage(streamed):
+    from litellm.litellm_core_utils.terminal_receipt_hooks import finish
+
+    details = {"custom_llm_provider": "litellm_proxy"}
+    body = {"id": "resp_" + "a" * 890 + "==", "object": "response", "status": "completed"}
+    observe_native_usage(
+        details, {"type": "response.completed", "response": body} if streamed else body, streamed=streamed
+    )
+    finish(details, None, "success")
+    fact = usage_for_spend(None, local_observation=details[LOCAL_STAMP], request_id=body["id"])[FIELD]
+    assert fact["local_attempt_id"] == body["id"]
+    assert fact["state"] == "unobserved"
+    assert all(fact[name] is None for name in UsageSnapshot.model_fields)
 
 
 def test_local_observation_is_private_and_failure_does_not_become_final_zero():
