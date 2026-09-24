@@ -91,7 +91,7 @@ test("Google Chat reaches its provider without an unsupported custom fetch", asy
   assert(calls > 0, "Google adapter should reach the provider transport");
 });
 
-test("Chat hides provider error details while native Messages preserves them", async (t) => {
+test("provider errors never return provider credentials to clients", async (t) => {
   const upstream = createServer((_req, res) => {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(
@@ -158,7 +158,9 @@ test("Chat hides provider error details while native Messages preserves them", a
     }),
   });
   assert.equal(native.status, 401);
-  assert.match(await native.text(), new RegExp(providerKey));
+  const nativeError = await native.text();
+  assert.doesNotMatch(nativeError, new RegExp(providerKey));
+  assert.match(nativeError, /Provider request failed/);
 });
 
 test("HTTP ingress crosses real Pi adapter with streaming, isolated auth, usage and correlated traces", async (t) => {

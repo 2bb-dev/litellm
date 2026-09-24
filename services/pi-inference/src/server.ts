@@ -82,8 +82,15 @@ interface Upstream {
   requestId?: string;
   retryAfter?: string;
   error?: z.infer<typeof upstreamError>["error"];
+  credentials?: string[];
   rawJson?: string;
   rawStream?: Response;
+}
+function redactCredentials(value: string, credentials: string[]): string {
+  return credentials.reduce(
+    (text, credential) => text.replaceAll(credential, "[REDACTED]"),
+    value,
+  );
 }
 function upstreamFetch(
   upstream: Upstream,
@@ -107,6 +114,12 @@ function upstreamFetch(
     }
     const direct =
       native && !headers.get("authorization")?.includes("sk-ant-oat");
+    upstream.credentials = [
+      headers.get("x-api-key"),
+      headers.get("authorization")?.replace(/^Bearer\s+/i, ""),
+    ].filter((credential): credential is string =>
+      Boolean(credential && credential.length >= 8),
+    );
     let request: Request | undefined;
     if (direct && !clientStream) {
       const original = new Request(input, { ...init, headers });
@@ -138,12 +151,25 @@ function upstreamFetch(
           .catch(() => undefined),
       );
       upstream.error = body.success ? body.data.error : undefined;
+      if (
+        upstream.error &&
+        upstream.credentials.some((credential) =>
+          upstream.error?.message.includes(credential),
+        )
+      )
+        upstream.error = {
+          ...upstream.error,
+          message: "Provider request failed",
+        };
     }
     if (direct && response.ok) {
       if (clientStream) {
         upstream.rawStream = response.clone();
       } else {
-        upstream.rawJson = await response.text();
+        upstream.rawJson = redactCredentials(
+          await response.text(),
+          upstream.credentials,
+        );
         const message = JSON.parse(upstream.rawJson) as Record<string, unknown>;
         const synthetic = [
           {
@@ -410,6 +436,7 @@ export function createInferenceServer(options: ServerOptions) {
             res,
             signal,
             startKeepAlive,
+            upstream.credentials ?? [],
             () => {
               lastWrite = performance.now();
             },
@@ -686,6 +713,7 @@ async function forwardNativeStream(
   res: ServerResponse,
   signal: AbortSignal,
   startKeepAlive: () => void,
+  credentials: string[],
   onWrite: () => void,
 ): Promise<void> {
   if (!response.body) throw new Error("Upstream stream has no body");
@@ -705,7 +733,10 @@ async function forwardNativeStream(
       const end = lf < 0 ? crlf : crlf < 0 ? lf : Math.min(lf, crlf);
       if (end < 0) return;
       const size = end === crlf ? 4 : 2;
-      const frame = pending.slice(0, end + size);
+      const frame = redactCredentials(
+        pending.slice(0, end + size),
+        credentials,
+      );
       pending = pending.slice(end + size);
       if (!res.write(frame)) await once(res, "drain", { signal });
       onWrite();
@@ -722,7 +753,8 @@ async function forwardNativeStream(
     pending += decoder.decode();
     await flush();
     if (pending) {
-      if (!res.write(pending)) await once(res, "drain", { signal });
+      if (!res.write(redactCredentials(pending, credentials)))
+        await once(res, "drain", { signal });
       onWrite();
     }
   } finally {

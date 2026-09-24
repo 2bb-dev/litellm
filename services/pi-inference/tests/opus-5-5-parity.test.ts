@@ -450,6 +450,33 @@ test("API-key native JSON preserves upstream response fields and unknown blocks"
   }
 });
 
+test("API-key native JSON redacts an echoed provider credential", async () => {
+  const backend = await sidecar((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "msg_fixture",
+        type: "message",
+        role: "assistant",
+        model: "claude-opus-5-5",
+        content: [{ type: "text", text: apiKey }],
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+    );
+  });
+  try {
+    const response = await backend.call({ stream: false });
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.doesNotMatch(body, new RegExp(apiKey));
+    assert.match(body, /\[REDACTED\]/);
+  } finally {
+    await backend.close();
+  }
+});
+
 test("API-key native SSE preserves unknown events and mid-stream errors", async () => {
   const frames = [
     sse({
@@ -479,6 +506,27 @@ test("API-key native SSE preserves unknown events and mid-stream errors", async 
     const response = await backend.call({ stream: true });
     assert.equal(response.status, 200);
     assert.equal(await response.text(), frames);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("API-key native SSE redacts an echoed provider credential", async () => {
+  const backend = await sidecar((res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(
+      sse({
+        type: "error",
+        error: { type: "authentication_error", message: apiKey },
+      }),
+    );
+  });
+  try {
+    const response = await backend.call({ stream: true });
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.doesNotMatch(body, new RegExp(apiKey));
+    assert.match(body, /\[REDACTED\]/);
   } finally {
     await backend.close();
   }
