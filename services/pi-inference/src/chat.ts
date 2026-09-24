@@ -124,6 +124,30 @@ function parts(value: z.infer<typeof content>): (TextContent | ImageContent)[] {
   });
 }
 
+const managedEffortPayload = z.looseObject({
+  messages: z.array(
+    z.looseObject({ role: z.string(), content: z.unknown().optional() }),
+  ),
+});
+// pi-ai pins effort "high" when the caller sets none; drop it so Anthropic applies its model default.
+function withoutDefaultEffort(payload: unknown): unknown {
+  const parsed = managedEffortPayload.safeParse(payload);
+  if (!parsed.success) return undefined;
+  const { output_config: _effort, ...rest } = parsed.data;
+  return {
+    ...rest,
+    messages: parsed.data.messages.filter(
+      (message) =>
+        !(
+          message.role === "system" &&
+          Array.isArray(message.content) &&
+          message.content.length === 0 &&
+          "output_config" in message
+        ),
+    ),
+  };
+}
+
 export function prepareChat(
   body: unknown,
   model: Model<Api>,
@@ -261,6 +285,11 @@ export function prepareChat(
         maxTokens,
         temperature: input.temperature,
         reasoning: effort === "off" ? undefined : effort,
+        ...(effort === undefined &&
+        hasApi(model, "anthropic-messages") &&
+        model.compat?.supportsMidConvoEffort
+          ? { onPayload: withoutDefaultEffort }
+          : {}),
         sessionId: input.prompt_cache_key,
         metadata: input.user ? { user_id: input.user } : undefined,
       },

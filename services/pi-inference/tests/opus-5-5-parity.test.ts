@@ -503,3 +503,70 @@ test("long silent thinking keeps the client stream alive with pings", async () =
     await backend.close();
   }
 });
+
+test("Chat without reasoning_effort leaves effort to Anthropic's default", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const upstream = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString()));
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(upstreamResponse("lookup_weather"));
+  });
+  const upstreamUrl = await listen(upstream);
+  const runtime = loadRuntime(
+    {
+      models: [
+        {
+          alias,
+          provider: "anthropic",
+          model: "claude-opus-5-5",
+          baseUrl: upstreamUrl,
+        },
+      ],
+    },
+    {
+      authContext: {
+        env: async (name) =>
+          name === "ANTHROPIC_API_KEY" ? apiKey : undefined,
+        fileExists: async () => false,
+      },
+    },
+  );
+  assert(runtime.ok);
+  const backend = createInferenceServer({
+    apiKey: internalKey,
+    runtime: runtime.value,
+    log: () => {},
+  });
+  const url = await listen(backend.server);
+  const chat = (extra: Record<string, unknown>) =>
+    fetch(`${url}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${internalKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: alias,
+        messages: [{ role: "user", content: "hi" }],
+        ...extra,
+      }),
+    });
+  const effortMessages = (body: Record<string, unknown>) =>
+    (body.messages as { role: string; output_config?: unknown }[]).filter(
+      (message) => message.role === "system",
+    );
+  try {
+    assert.equal((await chat({})).status, 200);
+    assert.equal(bodies[0]!.output_config, undefined);
+    assert.deepEqual(effortMessages(bodies[0]!), []);
+    assert.equal((await chat({ reasoning_effort: "low" })).status, 200);
+    assert.deepEqual(effortMessages(bodies[1]!).at(-1)?.output_config, {
+      effort: "low",
+    });
+  } finally {
+    await close(backend.server);
+    await close(upstream);
+  }
+});
