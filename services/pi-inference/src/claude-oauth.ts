@@ -47,7 +47,9 @@ const coreTools = new Set([
   "websearch",
 ]);
 
-function toolAliases(context: TranscriptContext): ReadonlyMap<string, string> {
+function toolAliases(
+  context: Pick<TranscriptContext, "messages">,
+): ReadonlyMap<string, string> {
   const names = new Set(
     context.messages.flatMap((message) => {
       if (message.role === "system")
@@ -83,6 +85,26 @@ function toolAliases(context: TranscriptContext): ReadonlyMap<string, string> {
     aliases.set(name, alias);
   }
   return aliases;
+}
+
+function assertStableDirectMcpNames(context: TranscriptContext): void {
+  for (const [index, message] of context.messages.entries()) {
+    if (message.role !== "system" || index === 0) continue;
+    const direct = message.toolsAdded?.filter((tool) =>
+      tool.name.toLowerCase().startsWith("mcp__"),
+    );
+    if (!direct?.length) continue;
+    const previous = toolAliases({
+      messages: context.messages.slice(0, index),
+    });
+    const existing = new Set(
+      [...previous.values()].map((alias) => alias.toLowerCase()),
+    );
+    if (direct.some((tool) => existing.has(tool.name.toLowerCase())))
+      throw new Error(
+        "Late direct MCP tool collides with an existing OAuth alias",
+      );
+  }
 }
 
 function renameMessage(
@@ -277,6 +299,7 @@ function compatibleStream<T extends StreamOptions>(
     ("client" in options && options.client)
   )
     return invoke(context, options);
+  assertStableDirectMcpNames(context);
   const aliases = toolAliases(context);
   const reverse = new Map([...aliases].map(([name, alias]) => [alias, name]));
   const choice = "toolChoice" in options ? options.toolChoice : undefined;

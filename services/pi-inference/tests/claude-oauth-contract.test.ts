@@ -544,6 +544,51 @@ test("late collisions keep earlier tool aliases stable", async () => {
   await output.result();
 });
 
+test("late direct MCP collision rejects instead of rewriting signed history", async () => {
+  const f = fixture();
+  const declaration = (name: string) => ({
+    name,
+    description: "fixture",
+    parameters: Type.Object({}),
+  });
+  const initial = normalizeContext({
+    tools: [declaration("foo")],
+    messages: [message(["foo"])],
+  });
+  const baseline = f.wrapped.streamSimple(model, initial, { apiKey });
+  const [definition, history] = f.calls[0]!.context.messages;
+  assert(definition?.role === "system");
+  assert(history?.role === "assistant");
+  assert.equal(definition.toolsAdded?.[0]?.name, "mcp__pi__foo");
+  assert.equal(
+    history.content.find((block) => block.type === "toolCall")?.name,
+    "mcp__pi__foo",
+  );
+  f.source.end(message());
+  await baseline.result();
+
+  const later = {
+    role: "system" as const,
+    content: "",
+    toolsAdded: [declaration("mcp__pi__foo")],
+    timestamp: 2,
+  };
+  const continued = normalizeContext({
+    messages: [...initial.messages, later],
+  });
+  const before = structuredClone(continued);
+  assert.throws(
+    () => f.wrapped.streamSimple(model, continued, { apiKey }),
+    /Late direct MCP tool collides with an existing OAuth alias/,
+  );
+  assert.equal(
+    f.calls.length,
+    1,
+    "conflicting request must not reach the provider",
+  );
+  assert.deepEqual(continued, before);
+});
+
 test("tool change references use aliased declaration names", async () => {
   const f = fixture();
   const context = normalizeContext({
