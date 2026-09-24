@@ -16,6 +16,14 @@ Upstream syncs must preserve these behaviors:
   `litellm-enterprise` or the `enterprise` workspace. Preserve the upstream
   MIT notice and the native dependency/compiler notices in built wheels and
   runtime images; source omission does not permit removing required notices.
+- **Private Pi inference:** `services/pi-inference` remains an independently
+  packaged, OSS-only inference sidecar, not an agent runtime. Only explicitly
+  enabled aliases are callable. Its internal key and optional per-slot credential
+  volume stay separate from client authentication; LiteLLM remains the sole
+  public model gateway and spend source. Preserve native Messages and generic
+  Chat routing, terminal usage, and credential-safe correlated stdout traces.
+  See `services/pi-inference/README.md` for the API, packaging, and opt-in smoke
+  contract; fork CI builds and tests this service without paid inference.
 - **ChatGPT subscription routing:** Responses state remains persistent where
   required, upstream storage stays disabled, prompt-cache parameters survive
   transformation, the ChatGPT session header follows `prompt_cache_key`,
