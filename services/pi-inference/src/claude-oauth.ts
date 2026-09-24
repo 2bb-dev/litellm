@@ -15,6 +15,18 @@ import {
 } from "@earendil-works/pi-ai";
 import { emptyUsage } from "./protocol.js";
 
+const coreToolNames = new Map([
+  ["askuserquestion", "AskUserQuestion"],
+  ["enterplanmode", "EnterPlanMode"],
+  ["exitplanmode", "ExitPlanMode"],
+  ["killshell", "KillShell"],
+  ["notebookedit", "NotebookEdit"],
+  ["taskoutput", "TaskOutput"],
+  ["todowrite", "TodoWrite"],
+  ["webfetch", "WebFetch"],
+  ["websearch", "WebSearch"],
+]);
+
 const coreTools = new Set([
   "read",
   "write",
@@ -54,7 +66,7 @@ function toolAliases(context: TranscriptContext): ReadonlyMap<string, string> {
   const reserved = new Set([...names].map((name) => name.toLowerCase()));
   const aliases = new Map<string, string>();
   const suffixes = new Map<string, number>();
-  for (const name of [...names].sort()) {
+  for (const name of names) {
     const lower = name.toLowerCase();
     if (!name || coreTools.has(lower) || lower.startsWith("mcp__")) continue;
     const segment =
@@ -127,6 +139,46 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+export function renameClaudeOAuthResponse(
+  value: unknown,
+  context: TranscriptContext,
+): unknown {
+  if (!object(value)) return value;
+  const aliases = toolAliases(context);
+  const reverse = new Map([...aliases].map(([name, alias]) => [alias, name]));
+  for (const message of context.messages) {
+    if (message.role !== "system") continue;
+    for (const tool of message.toolsAdded ?? []) {
+      const lower = tool.name.toLowerCase();
+      if (coreTools.has(lower))
+        reverse.set(
+          coreToolNames.get(lower) ?? lower[0]!.toUpperCase() + lower.slice(1),
+          tool.name,
+        );
+    }
+  }
+  const block =
+    value.type === "content_block_start" ? value.content_block : undefined;
+  if (
+    object(block) &&
+    block.type === "tool_use" &&
+    typeof block.name === "string"
+  )
+    return {
+      ...value,
+      content_block: { ...block, name: reverse.get(block.name) ?? block.name },
+    };
+  if (!Array.isArray(value.content)) return value;
+  return {
+    ...value,
+    content: value.content.map((item: unknown) =>
+      object(item) && item.type === "tool_use" && typeof item.name === "string"
+        ? { ...item, name: reverse.get(item.name) ?? item.name }
+        : item,
+    ),
+  };
+}
+
 function rewriteSystem(payload: unknown): unknown {
   if (!object(payload) || payload.system === undefined) return payload;
   const text = (value: string) =>
@@ -149,6 +201,44 @@ function rewriteSystem(payload: unknown): unknown {
                 : block,
             )
           : system,
+  };
+}
+
+function renameToolReferences(
+  payload: unknown,
+  aliases: ReadonlyMap<string, string>,
+): unknown {
+  if (!object(payload) || !Array.isArray(payload.messages)) return payload;
+  return {
+    ...payload,
+    messages: payload.messages.map((message: unknown) => {
+      if (
+        !object(message) ||
+        message.role !== "system" ||
+        !Array.isArray(message.content)
+      )
+        return message;
+      return {
+        ...message,
+        content: message.content.map((block: unknown) => {
+          if (
+            !object(block) ||
+            (block.type !== "tool_addition" && block.type !== "tool_removal") ||
+            !object(block.tool) ||
+            block.tool.type !== "tool_reference" ||
+            typeof block.tool.name !== "string"
+          )
+            return block;
+          return {
+            ...block,
+            tool: {
+              ...block.tool,
+              name: aliases.get(block.tool.name) ?? block.tool.name,
+            },
+          };
+        }),
+      };
+    }),
   };
 }
 
@@ -204,7 +294,10 @@ function compatibleStream<T extends StreamOptions>(
       : {}),
     onPayload: async (payload, resolved) => {
       const overlaid = await options.onPayload?.(payload, resolved);
-      return rewriteSystem(overlaid === undefined ? payload : overlaid);
+      return renameToolReferences(
+        rewriteSystem(overlaid === undefined ? payload : overlaid),
+        aliases,
+      );
     },
   });
   const stream = createAssistantMessageEventStream();

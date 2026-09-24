@@ -15,7 +15,10 @@ import {
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
-import { withClaudeOAuthCompatibility } from "../src/claude-oauth.js";
+import {
+  renameClaudeOAuthResponse,
+  withClaudeOAuthCompatibility,
+} from "../src/claude-oauth.js";
 
 const model: Model<"anthropic-messages"> = {
   id: "claude-offline-fixture",
@@ -506,6 +509,143 @@ for (const method of ["stream", "streamSimple"] as const) {
     assert.equal(f.calls.length, 1);
   });
 }
+
+test("late collisions keep earlier tool aliases stable", async () => {
+  const f = fixture();
+  const declaration = (name: string) => ({
+    name,
+    description: "fixture",
+    parameters: Type.Object({}),
+  });
+  const context = normalizeContext({
+    tools: [declaration("my_tool")],
+    messages: [
+      message(["my_tool"]),
+      {
+        role: "system",
+        content: "",
+        toolsAdded: [declaration("my-tool")],
+        timestamp: 2,
+      },
+    ],
+  });
+  const output = f.wrapped.streamSimple(model, context, { apiKey });
+  const [initial, history, later] = f.calls[0]!.context.messages;
+  assert(initial?.role === "system");
+  assert(history?.role === "assistant");
+  assert(later?.role === "system");
+  assert.equal(initial.toolsAdded?.[0]?.name, "mcp__pi__my_tool");
+  assert.equal(
+    history.content.find((block) => block.type === "toolCall")?.name,
+    "mcp__pi__my_tool",
+  );
+  assert.equal(later.toolsAdded?.[0]?.name, "mcp__pi__my_tool_2");
+  f.source.end(message());
+  await output.result();
+});
+
+test("tool change references use aliased declaration names", async () => {
+  const f = fixture();
+  const context = normalizeContext({
+    tools: [
+      {
+        name: originalName,
+        description: "fixture",
+        parameters: Type.Object({}),
+      },
+    ],
+    messages: [
+      message(),
+      {
+        role: "system",
+        content: "",
+        timestamp: 2,
+        toolsRemoved: [{ name: originalName }],
+        toolsAdded: [
+          {
+            name: "later_tool",
+            description: "fixture",
+            parameters: Type.Object({}),
+          },
+        ],
+      },
+    ],
+  });
+  const output = f.wrapped.streamSimple(model, context, { apiKey });
+  const payload = {
+    tools: [{ name: alias }, { name: "mcp__pi__later_tool" }],
+    messages: [
+      {
+        role: "system",
+        content: [
+          {
+            type: "tool_removal",
+            tool: { type: "tool_reference", name: originalName },
+          },
+          {
+            type: "tool_addition",
+            tool: { type: "tool_reference", name: "later_tool" },
+          },
+        ],
+      },
+    ],
+  };
+  const transformed = await f.calls[0]!.options!.onPayload!(payload, model);
+  assert.deepEqual((transformed as typeof payload).messages[0]!.content, [
+    { type: "tool_removal", tool: { type: "tool_reference", name: alias } },
+    {
+      type: "tool_addition",
+      tool: { type: "tool_reference", name: "mcp__pi__later_tool" },
+    },
+  ]);
+  assert.equal(payload.messages[0]!.content[0]!.tool.name, originalName);
+  f.source.end(message());
+  await output.result();
+});
+
+test("direct SSE and JSON tool-use names restore aliases and canonical core casing", () => {
+  const context = normalizeContext({
+    tools: [
+      { name: "my_tool", description: "fixture", parameters: Type.Object({}) },
+      { name: "my-tool", description: "fixture", parameters: Type.Object({}) },
+      { name: "BaSh", description: "fixture", parameters: Type.Object({}) },
+    ],
+    messages: [],
+  });
+  const blocks = ["mcp__pi__my_tool", "mcp__pi__my_tool_2", "Bash"].map(
+    (name) => ({ type: "tool_use", name, id: name, input: {} }),
+  );
+  const expected = ["my_tool", "my-tool", "BaSh"];
+  for (const [index, block] of blocks.entries()) {
+    const event = { type: "content_block_start", index, content_block: block };
+    assert.equal(
+      (renameClaudeOAuthResponse(event, context) as typeof event).content_block
+        .name,
+      expected[index],
+    );
+    assert.equal(
+      block.name,
+      ["mcp__pi__my_tool", "mcp__pi__my_tool_2", "Bash"][index],
+    );
+  }
+  const json = {
+    content: [...blocks, { type: "text", text: "mcp__pi__my_tool" }],
+    stop_details: { reason: "fixture" },
+  };
+  const result = renameClaudeOAuthResponse(json, context) as typeof json;
+  assert.deepEqual(
+    result.content.map((block) => ("name" in block ? block.name : block.text)),
+    [...expected, "mcp__pi__my_tool"],
+  );
+  assert.deepEqual(result.stop_details, json.stop_details);
+  assert.deepEqual(
+    renameClaudeOAuthResponse(
+      { type: "content_block_delta", delta: { text: "mcp__pi__my_tool" } },
+      context,
+    ),
+    { type: "content_block_delta", delta: { text: "mcp__pi__my_tool" } },
+  );
+});
 
 test("result-only SDK streams finish with restored tool names even without a terminal event", async () => {
   const f = fixture();
