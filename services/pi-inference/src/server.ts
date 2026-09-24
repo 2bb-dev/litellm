@@ -13,7 +13,9 @@ import type {
   Model,
   Api,
 } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { chatResponse, createChatEncoder, prepareChat } from "./chat.js";
+import { renameClaudeOAuthResponse } from "./claude-oauth.js";
 import {
   createMessagesEncoder,
   messagesResponse,
@@ -85,6 +87,7 @@ interface Upstream {
   credentials?: string[];
   rawJson?: string;
   rawStream?: Response;
+  oauth?: boolean;
 }
 function redactCredentials(value: string, credentials: string[]): string {
   return credentials.reduce(
@@ -97,6 +100,7 @@ function upstreamFetch(
   clientBetas: string[] | undefined,
   native: boolean,
   clientStream: boolean,
+  transformResponse?: (value: unknown) => unknown,
 ): typeof fetch {
   return async (input, init) => {
     const headers = new Headers(init?.headers);
@@ -112,8 +116,9 @@ function upstreamFetch(
       if (merged.length) headers.set("anthropic-beta", merged.join(","));
       else headers.delete("anthropic-beta");
     }
-    const direct =
-      native && !headers.get("authorization")?.includes("sk-ant-oat");
+    const direct = native;
+    upstream.oauth =
+      direct && Boolean(headers.get("authorization")?.includes("sk-ant-oat"));
     upstream.credentials = [
       headers.get("x-api-key"),
       headers.get("authorization")?.replace(/^Bearer\s+/i, ""),
@@ -165,11 +170,17 @@ function upstreamFetch(
     if (direct && response.ok) {
       if (clientStream) {
         upstream.rawStream = response.clone();
-      } else {
+      } else if (
+        !response.headers.get("content-type")?.includes("text/event-stream")
+      ) {
         upstream.rawJson = redactCredentials(
           await response.text(),
           upstream.credentials,
         );
+        if (upstream.oauth && transformResponse)
+          upstream.rawJson = JSON.stringify(
+            transformResponse(JSON.parse(upstream.rawJson)),
+          );
         const message = JSON.parse(upstream.rawJson) as Record<string, unknown>;
         const synthetic = [
           {
@@ -392,6 +403,13 @@ export function createInferenceServer(options: ServerOptions) {
         return;
       }
       const call = prepared.value;
+      const responseContext =
+        native && model.provider === "anthropic"
+          ? normalizeContext(call.context)
+          : undefined;
+      const transformResponse = responseContext
+        ? (value: unknown) => renameClaudeOAuthResponse(value, responseContext)
+        : undefined;
       const stream = options.runtime.models.streamSimple(model, call.context, {
         ...call.options,
         signal,
@@ -406,6 +424,7 @@ export function createInferenceServer(options: ServerOptions) {
                 native ? betaList(req.headers["anthropic-beta"]) : undefined,
                 native,
                 call.stream,
+                transformResponse,
               ),
             }
           : {}),
@@ -437,6 +456,7 @@ export function createInferenceServer(options: ServerOptions) {
             signal,
             startKeepAlive,
             upstream.credentials ?? [],
+            upstream.oauth ? transformResponse : undefined,
             () => {
               lastWrite = performance.now();
             },
@@ -714,6 +734,7 @@ async function forwardNativeStream(
   signal: AbortSignal,
   startKeepAlive: () => void,
   credentials: string[],
+  transformResponse: ((value: unknown) => unknown) | undefined,
   onWrite: () => void,
 ): Promise<void> {
   if (!response.body) throw new Error("Upstream stream has no body");
@@ -738,7 +759,10 @@ async function forwardNativeStream(
         credentials,
       );
       pending = pending.slice(end + size);
-      if (!res.write(frame)) await once(res, "drain", { signal });
+      const output = transformResponse
+        ? transformNativeFrame(frame, transformResponse)
+        : frame;
+      if (!res.write(output)) await once(res, "drain", { signal });
       onWrite();
     }
   };
@@ -760,6 +784,23 @@ async function forwardNativeStream(
   } finally {
     reader.releaseLock();
   }
+}
+
+function transformNativeFrame(
+  frame: string,
+  transformResponse: (value: unknown) => unknown,
+): string {
+  const match = /^data: ?(.+)\r?$/m.exec(frame);
+  if (!match) return frame;
+  let value: unknown;
+  try {
+    value = JSON.parse(match[1]!);
+  } catch {
+    return frame;
+  }
+  const transformed = transformResponse(value);
+  if (transformed === value) return frame;
+  return frame.replace(match[0], `data: ${JSON.stringify(transformed)}`);
 }
 
 function formatEvent(frame: WireEvent): string {

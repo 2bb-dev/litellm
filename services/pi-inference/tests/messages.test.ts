@@ -60,6 +60,50 @@ test("prepares native text without accepting lossy cross-protocol routing", asyn
   assert.equal(rejected.ok, false);
 });
 
+test("rejects tool additions that cannot be mapped to a stable declaration", () => {
+  const addition = {
+    role: "system",
+    content: [
+      {
+        type: "tool_addition",
+        tool: { type: "tool_reference", name: "lookup_weather" },
+      },
+    ],
+  };
+  const removal = {
+    role: "system",
+    content: [
+      {
+        type: "tool_removal",
+        tool: { type: "tool_reference", name: "lookup_weather" },
+      },
+    ],
+  };
+  assert.equal(
+    prepareMessages(
+      { ...request, messages: [request.messages[0], addition] },
+      model,
+    ).ok,
+    false,
+  );
+  assert.equal(
+    prepareMessages(
+      {
+        ...request,
+        tools: [
+          {
+            name: "lookup_weather",
+            input_schema: { type: "object", properties: {} },
+          },
+        ],
+        messages: [request.messages[0], removal, addition],
+      },
+      model,
+    ).ok,
+    false,
+  );
+});
+
 const cache = { type: "ephemeral", ttl: "1h" };
 const image = {
   type: "image",

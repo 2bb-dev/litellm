@@ -361,7 +361,7 @@ async function sidecar(
     res: import("node:http").ServerResponse,
     body: Record<string, unknown>,
   ) => void | Promise<void>,
-  options: { keepAliveMs?: number } = {},
+  options: { keepAliveMs?: number; providerKey?: string } = {},
 ) {
   const upstream = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
@@ -386,7 +386,9 @@ async function sidecar(
     {
       authContext: {
         env: async (name) =>
-          name === "ANTHROPIC_API_KEY" ? apiKey : undefined,
+          name === "ANTHROPIC_API_KEY"
+            ? (options.providerKey ?? apiKey)
+            : undefined,
         fileExists: async () => false,
       },
     },
@@ -445,6 +447,174 @@ test("API-key native JSON preserves upstream response fields and unknown blocks"
     assert.equal(response.status, 200);
     assert.equal(requestStream, false);
     assert.deepEqual(await response.json(), original);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("OAuth native JSON restores tool names and preserves unknown response fields", async () => {
+  const original = {
+    id: "msg_oauth",
+    type: "message",
+    role: "assistant",
+    model: "claude-opus-5-5",
+    content: [
+      { type: "thinking", thinking: "signed", signature: "opaque-signature" },
+      {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "mcp__pi__lookup_weather",
+        input: { city: "Paris" },
+      },
+      { type: "future_block", value: { nested: true } },
+    ],
+    stop_reason: "tool_use",
+    stop_sequence: null,
+    stop_details: { reason: "fixture" },
+    usage: { input_tokens: 4, output_tokens: 2 },
+  };
+  let requestStream: unknown;
+  const backend = await sidecar(
+    (res, body) => {
+      requestStream = body.stream;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(original));
+    },
+    { providerKey: oauthKey },
+  );
+  try {
+    const response = await backend.call({
+      stream: false,
+      tools: [
+        {
+          name: "lookup_weather",
+          input_schema: { type: "object", properties: {} },
+        },
+      ],
+    });
+    assert.equal(response.status, 200);
+    assert.equal(requestStream, false);
+    assert.deepEqual(await response.json(), {
+      ...original,
+      content: original.content.map((block) =>
+        block.type === "tool_use"
+          ? { ...block, name: "lookup_weather" }
+          : block,
+      ),
+    });
+  } finally {
+    await backend.close();
+  }
+});
+
+test("OAuth native SSE restores late tool aliases and preserves unknown events", async () => {
+  const frames = [
+    sse({
+      type: "message_start",
+      message: {
+        id: "msg_oauth",
+        type: "message",
+        role: "assistant",
+        model: "claude-opus-5-5",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 4, output_tokens: 0 },
+      },
+    }),
+    sse({ type: "future_event", value: { nested: true } }),
+    sse({
+      type: "content_block_start",
+      index: 0,
+      content_block: {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "mcp__pi__lookup_weather",
+        input: {},
+      },
+    }),
+    sse({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: '{"city":"Paris"}' },
+    }),
+    sse({ type: "content_block_stop", index: 0 }),
+    sse({
+      type: "message_delta",
+      delta: { stop_reason: "tool_use", stop_sequence: null },
+      usage: { output_tokens: 2 },
+    }),
+    sse({ type: "message_stop" }),
+  ].join("");
+  let requestBody: Record<string, unknown> | undefined;
+  const backend = await sidecar(
+    (res, body) => {
+      requestBody = body;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(frames);
+    },
+    { providerKey: oauthKey },
+  );
+  try {
+    const response = await backend.call({
+      stream: true,
+      tools: [
+        {
+          name: "initial_lookup",
+          input_schema: { type: "object", properties: {} },
+        },
+        {
+          name: "lookup_weather",
+          input_schema: { type: "object", properties: {} },
+        },
+      ],
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "system",
+          content: [
+            {
+              type: "tool_addition",
+              tool: { type: "tool_reference", name: "lookup_weather" },
+            },
+          ],
+        },
+        { role: "user", content: "use the tool" },
+      ],
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(requestBody?.messages, [
+      { role: "user", content: "hi" },
+      {
+        role: "system",
+        content: [
+          {
+            type: "tool_addition",
+            tool: {
+              type: "tool_reference",
+              name: "mcp__pi__lookup_weather",
+            },
+          },
+        ],
+      },
+      { role: "user", content: "use the tool" },
+    ]);
+    const requestTools = requestBody?.tools as {
+      name: string;
+      defer_loading?: boolean;
+    }[];
+    assert.equal(requestTools?.[0]?.name, "mcp__pi__initial_lookup");
+    assert.equal(requestTools?.[2]?.name, "mcp__pi__lookup_weather");
+    assert.equal(requestTools?.[2]?.defer_loading, true);
+    assert(
+      (requestBody?.tools as { name: string }[])?.some(
+        (tool) => tool.name === "__pi_deferred_placeholder__",
+      ),
+    );
+    const wire = await response.text();
+    assert.match(wire, /event: future_event/);
+    assert.match(wire, /"name":"lookup_weather"/);
+    assert.doesNotMatch(wire, /"name":"mcp__pi__lookup_weather"/);
   } finally {
     await backend.close();
   }

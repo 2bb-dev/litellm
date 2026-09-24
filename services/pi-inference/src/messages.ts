@@ -211,13 +211,54 @@ const inputBlock = (block: InputBlock): TextContent | ImageContent =>
       };
 
 function toContext(input: NativeRequest, model: Model<Api>): Context {
+  const declaredTools = new Map(input.tools?.map((tool) => [tool.name, tool]));
+  const lateNames = new Set(
+    input.messages.flatMap((message) =>
+      message.role === "system" && Array.isArray(message.content)
+        ? message.content.flatMap((block) =>
+            block.type === "tool_addition" ? [block.tool.name] : [],
+          )
+        : [],
+    ),
+  );
   const calls = input.messages.flatMap((message) =>
     message.role === "assistant" && Array.isArray(message.content)
       ? message.content.filter((block) => block.type === "tool_use")
       : [],
   );
   const messages = input.messages.flatMap((message): Message[] => {
-    if (message.role === "system") return [];
+    if (message.role === "system") {
+      const blocks = Array.isArray(message.content) ? message.content : [];
+      return [
+        {
+          role: "system",
+          content:
+            typeof message.content === "string"
+              ? message.content
+              : blocks
+                  .filter((block) => block.type === "text")
+                  .map((block) => block.text)
+                  .join("\n\n"),
+          toolsAdded: blocks.flatMap((block) => {
+            if (block.type !== "tool_addition") return [];
+            const tool = declaredTools.get(block.tool.name);
+            return tool
+              ? [
+                  {
+                    name: tool.name,
+                    description: tool.description ?? "",
+                    parameters: tool.input_schema,
+                  },
+                ]
+              : [];
+          }),
+          toolsRemoved: blocks.flatMap((block) =>
+            block.type === "tool_removal" ? [{ name: block.tool.name }] : [],
+          ),
+          timestamp: 0,
+        },
+      ];
+    }
     if (message.role === "assistant") {
       const content: AssistantMessage["content"] =
         typeof message.content === "string"
@@ -284,11 +325,17 @@ function toContext(input: NativeRequest, model: Model<Api>): Context {
       typeof input.system === "string"
         ? input.system
         : input.system?.map((block) => block.text).join("\n\n"),
-    tools: input.tools?.map((tool) => ({
-      name: tool.name,
-      description: tool.description ?? "",
-      parameters: tool.input_schema,
-    })),
+    tools: input.tools
+      ?.filter(
+        (tool) =>
+          tool.name !== "__pi_deferred_placeholder__" &&
+          !lateNames.has(tool.name),
+      )
+      .map((tool) => ({
+        name: tool.name,
+        description: tool.description ?? "",
+        parameters: tool.input_schema,
+      })),
   };
 }
 
@@ -351,10 +398,38 @@ function nativePayload(
     Math.max(0, (system?.length ?? 0) - (context.systemPrompt ? 1 : 0)),
   );
   const choice = input.tool_choice;
-  const choiceIndex =
-    choice?.type === "tool"
-      ? nativeTools?.findIndex((tool) => tool.name === choice.name)
-      : undefined;
+  const declaredNames = [
+    ...(context.tools?.map((tool) => tool.name) ?? []),
+    ...context.messages.flatMap((message) =>
+      message.role === "system"
+        ? (message.toolsAdded?.map((tool) => tool.name) ?? [])
+        : [],
+    ),
+  ];
+  const convertedTools = tools?.filter(
+    (tool) => tool.name !== "__pi_deferred_placeholder__",
+  );
+  const convertedByName = new Map(
+    declaredNames.map((name, index) => [name, convertedTools?.[index]]),
+  );
+  const nativeOutputTools: Record<string, unknown>[] | undefined =
+    nativeTools?.map((tool) => {
+      const converted = convertedByName.get(tool.name);
+      return {
+        ...tool,
+        name: converted?.name ?? tool.name,
+        ...(converted?.defer_loading ? { defer_loading: true } : {}),
+      };
+    });
+  const placeholder = tools?.find(
+    (tool) => tool.name === "__pi_deferred_placeholder__",
+  );
+  if (
+    placeholder &&
+    nativeOutputTools &&
+    !nativeOutputTools.some((tool) => tool.name === placeholder.name)
+  )
+    nativeOutputTools.splice(context.tools?.length ?? 0, 0, placeholder);
   return {
     ...generated,
     ...fields,
@@ -362,7 +437,7 @@ function nativePayload(
       ? {
           tool_choice: {
             ...choice,
-            name: tools?.[choiceIndex ?? -1]?.name ?? choice.name,
+            name: convertedByName.get(choice.name)?.name ?? choice.name,
           },
         }
       : {}),
@@ -388,12 +463,9 @@ function nativePayload(
           ],
         }
       : {}),
-    ...(nativeTools
+    ...(nativeOutputTools
       ? {
-          tools: nativeTools.map((tool, index) => ({
-            ...tool,
-            name: tools?.[index]?.name ?? tool.name,
-          })),
+          tools: nativeOutputTools,
         }
       : {}),
   };
@@ -426,6 +498,20 @@ export function prepareMessages(
   if (!parsed.success)
     return invalid("Invalid or unsupported Messages request");
   const input = parsed.data;
+  const changedTools = new Set<string>();
+  for (const message of input.messages) {
+    if (message.role !== "system" || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.type === "text") continue;
+      if (
+        block.type === "tool_addition" &&
+        (changedTools.has(block.tool.name) ||
+          !input.tools?.some((tool) => tool.name === block.tool.name))
+      )
+        return invalid("Unsupported tool addition sequence");
+      changedTools.add(block.tool.name);
+    }
+  }
   if (input.stop_sequences !== undefined)
     return invalid(
       "stop_sequences is unsupported: Pi does not preserve the matched stop sequence",
