@@ -4888,15 +4888,12 @@ def test_pre_call_checks_no_messages_or_input_does_not_crash(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_aresponses_enforces_context_window_pre_call_check():
-    """
-    End-to-end router regression: a Responses API call whose `input` exceeds the
-    deployment's max_input_tokens must be filtered by the pre-call check, raising
-    ContextWindowExceededError instead of being silently routed. This guards the
-    wiring that forwards `input` from the generic-call path into deployment selection
-    (the deployment uses mock_response, so the check must trip before any real call).
-    """
-    router = litellm.Router(
+@pytest.mark.parametrize("api", ["responses_string", "responses_list", "chat"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_router_context_window_pre_call_check(
+    api: Literal["responses_string", "responses_list", "chat"], stream: bool
+) -> None:
+    router: Final = litellm.Router(
         model_list=[
             {
                 "model_name": "small-ctx",
@@ -4905,12 +4902,79 @@ async def test_aresponses_enforces_context_window_pre_call_check():
             }
         ],
         enable_pre_call_checks=True,
+        num_retries=0,
     )
-    with pytest.raises(litellm.ContextWindowExceededError):
-        await router.aresponses(
-            model="small-ctx",
-            input="this responses input is definitely much longer than five tokens for sure",
+    prompt: Final = "this input is definitely much longer than five tokens for sure"
+    try:
+        with pytest.raises(litellm.ContextWindowExceededError, match="context_length_exceeded:") as raised:
+            if api == "chat":
+                await router.acompletion(
+                    model="small-ctx", messages=[{"role": "user", "content": prompt}], stream=stream
+                )
+            else:
+                await router.aresponses(
+                    model="small-ctx",
+                    input=prompt if api == "responses_string" else [{"role": "user", "content": prompt}],
+                    stream=stream,
+                )
+        assert raised.value.status_code == 400
+        assert "Max Input Tokens=5, Got=" in str(raised.value)
+    finally:
+        router.reset()
+
+
+def test_router_context_window_pre_call_check_preserves_rate_limit_error() -> None:
+    from litellm.types.router import RouterRateLimitErrorBasic
+
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "limited",
+                "litellm_params": {"model": "gpt-3.5-turbo", "rpm": 0},
+                "model_info": {"max_input_tokens": 20},
+            },
+        ],
+        enable_pre_call_checks=True,
+        num_retries=0,
+    )
+    try:
+        with pytest.raises(RouterRateLimitErrorBasic) as raised:
+            router._pre_call_checks(
+                model="limited",
+                healthy_deployments=router.model_list,
+                input="small prompt",
+                input_token_count=20,
+            )
+        assert raised.value.model == "limited"
+        assert "context_length_exceeded" not in str(raised.value)
+    finally:
+        router.reset()
+
+
+def test_router_context_window_pre_call_check_keeps_larger_deployment() -> None:
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "mixed",
+                "litellm_params": {"model": "gpt-3.5-turbo"},
+                "model_info": {"id": "small", "max_input_tokens": 5},
+            },
+            {
+                "model_name": "mixed",
+                "litellm_params": {"model": "gpt-3.5-turbo"},
+                "model_info": {"id": "large", "max_input_tokens": 20},
+            },
+        ],
+        enable_pre_call_checks=True,
+        num_retries=0,
+    )
+    try:
+        available: Final = router._pre_call_checks(
+            model="mixed", healthy_deployments=router.model_list, input="small prompt", input_token_count=20
         )
+        assert [deployment["model_info"]["id"] for deployment in available] == ["large"]
+    finally:
+        router.reset()
 
 
 def test_get_deployment_model_info_base_model_flow():
