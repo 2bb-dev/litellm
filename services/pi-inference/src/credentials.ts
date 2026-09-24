@@ -147,6 +147,12 @@ export class FileCredentialStore implements CredentialStore {
         closeSync(fd);
       }
       renameSync(temp, this.#file);
+      const directory = openSync(dirname(this.#file), constants.O_RDONLY);
+      try {
+        fsyncSync(directory);
+      } finally {
+        closeSync(directory);
+      }
     } catch {
       throw new Error("Unable to persist credential file data");
     } finally {

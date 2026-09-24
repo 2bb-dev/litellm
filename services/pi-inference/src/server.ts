@@ -95,6 +95,20 @@ function redactCredentials(value: string, credentials: string[]): string {
     value,
   );
 }
+function redactParsed(value: unknown, credentials: string[]): unknown {
+  if (typeof value === "string") return redactCredentials(value, credentials);
+  if (Array.isArray(value))
+    return value.map((item) => redactParsed(item, credentials));
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        redactParsed(item, credentials),
+      ]),
+    );
+  return value;
+}
+
 function upstreamFetch(
   upstream: Upstream,
   clientBetas: string[] | undefined,
@@ -156,16 +170,19 @@ function upstreamFetch(
           .catch(() => undefined),
       );
       upstream.error = body.success ? body.data.error : undefined;
-      if (
-        upstream.error &&
-        upstream.credentials.some((credential) =>
-          upstream.error?.message.includes(credential),
-        )
-      )
+      if (upstream.error) {
+        const message = redactCredentials(
+          upstream.error.message,
+          upstream.credentials,
+        );
         upstream.error = {
           ...upstream.error,
-          message: "Provider request failed",
+          message:
+            message === upstream.error.message
+              ? message
+              : "Provider request failed",
         };
+      }
     }
     if (direct && response.ok) {
       if (clientStream) {
@@ -177,6 +194,10 @@ function upstreamFetch(
           await response.text(),
           upstream.credentials,
         );
+        const parsed = JSON.parse(upstream.rawJson) as unknown;
+        const redacted = redactParsed(parsed, upstream.credentials);
+        if (JSON.stringify(parsed) !== JSON.stringify(redacted))
+          upstream.rawJson = JSON.stringify(redacted);
         if (upstream.oauth && transformResponse)
           upstream.rawJson = JSON.stringify(
             transformResponse(JSON.parse(upstream.rawJson)),
@@ -747,6 +768,7 @@ async function forwardNativeStream(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let pending = "";
+  let stopped = false;
   const flush = async () => {
     while (true) {
       const lf = pending.indexOf("\n\n");
@@ -759,9 +781,28 @@ async function forwardNativeStream(
         credentials,
       );
       pending = pending.slice(end + size);
-      const output = transformResponse
-        ? transformNativeFrame(frame, transformResponse)
-        : frame;
+      const event = /^event: ([^\r\n]+)\r?$/m.exec(frame)?.[1];
+      const data = /^data: ?(.+)\r?$/m.exec(frame)?.[1];
+      let payload: unknown;
+      try {
+        payload = JSON.parse(data ?? "");
+      } catch {
+        throw new Error("Malformed upstream SSE frame");
+      }
+      if (
+        !event ||
+        !payload ||
+        typeof payload !== "object" ||
+        (payload as { type?: unknown }).type !== event ||
+        stopped
+      )
+        throw new Error("Malformed upstream SSE frame");
+      const output = transformNativeFrame(
+        frame,
+        credentials,
+        transformResponse,
+      );
+      if (event === "message_stop" || event === "error") stopped = true;
       if (!res.write(output)) await once(res, "drain", { signal });
       onWrite();
     }
@@ -776,11 +817,8 @@ async function forwardNativeStream(
     }
     pending += decoder.decode();
     await flush();
-    if (pending) {
-      if (!res.write(redactCredentials(pending, credentials)))
-        await once(res, "drain", { signal });
-      onWrite();
-    }
+    if (pending || !stopped)
+      throw new Error("Upstream stream ended before message_stop");
   } finally {
     reader.releaseLock();
   }
@@ -788,7 +826,8 @@ async function forwardNativeStream(
 
 function transformNativeFrame(
   frame: string,
-  transformResponse: (value: unknown) => unknown,
+  credentials: string[],
+  transformResponse?: (value: unknown) => unknown,
 ): string {
   const match = /^data: ?(.+)\r?$/m.exec(frame);
   if (!match) return frame;
@@ -798,8 +837,11 @@ function transformNativeFrame(
   } catch {
     return frame;
   }
-  const transformed = transformResponse(value);
-  if (transformed === value) return frame;
+  const redacted = redactParsed(value, credentials);
+  const transformed = transformResponse
+    ? transformResponse(redacted)
+    : redacted;
+  if (JSON.stringify(transformed) === JSON.stringify(value)) return frame;
   return frame.replace(match[0], `data: ${JSON.stringify(transformed)}`);
 }
 
