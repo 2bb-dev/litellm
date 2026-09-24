@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import {
+  chmodSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -389,6 +390,7 @@ test("rejects symlinked credential files without reading or changing the target"
   const { file, directory } = tempFile(t);
   const target = join(directory, "target.json");
   writeFileSync(target, JSON.stringify({ other: unrelated }), { mode: 0o644 });
+  chmodSync(target, 0o644);
   symlinkSync(target, file);
   assert.throws(() => new FileCredentialStore(file), /credential file/);
   assert.equal(statSync(target).mode & 0o777, 0o644);
