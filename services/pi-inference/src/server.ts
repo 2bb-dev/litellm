@@ -82,10 +82,14 @@ interface Upstream {
   requestId?: string;
   retryAfter?: string;
   error?: z.infer<typeof upstreamError>["error"];
+  rawJson?: string;
+  rawStream?: Response;
 }
 function upstreamFetch(
   upstream: Upstream,
   clientBetas: string[] | undefined,
+  native: boolean,
+  clientStream: boolean,
 ): typeof fetch {
   return async (input, init) => {
     const headers = new Headers(init?.headers);
@@ -101,7 +105,22 @@ function upstreamFetch(
       if (merged.length) headers.set("anthropic-beta", merged.join(","));
       else headers.delete("anthropic-beta");
     }
-    const response = await fetch(input, { ...init, headers });
+    const direct =
+      native && !headers.get("authorization")?.includes("sk-ant-oat");
+    let request: Request | undefined;
+    if (direct && !clientStream) {
+      const original = new Request(input, { ...init, headers });
+      const body = (await original.clone().json()) as Record<string, unknown>;
+      const requestHeaders = new Headers(original.headers);
+      requestHeaders.delete("content-length");
+      request = new Request(original, {
+        body: JSON.stringify({ ...body, stream: false }),
+        headers: requestHeaders,
+      });
+    }
+    const response = request
+      ? await fetch(request)
+      : await fetch(input, { ...init, headers });
     upstream.status = response.status;
     upstream.requestId = safeId(
       response.headers.get("request-id") ??
@@ -119,6 +138,41 @@ function upstreamFetch(
           .catch(() => undefined),
       );
       upstream.error = body.success ? body.data.error : undefined;
+    }
+    if (direct && response.ok) {
+      if (clientStream) {
+        upstream.rawStream = response.clone();
+      } else {
+        upstream.rawJson = await response.text();
+        const message = JSON.parse(upstream.rawJson) as Record<string, unknown>;
+        const synthetic = [
+          {
+            event: "message_start",
+            data: {
+              type: "message_start",
+              message: { ...message, content: [] },
+            },
+          },
+          {
+            event: "message_delta",
+            data: {
+              type: "message_delta",
+              delta: {
+                stop_reason: message.stop_reason ?? "end_turn",
+                stop_sequence: message.stop_sequence ?? null,
+              },
+              usage: message.usage ?? { output_tokens: 0 },
+            },
+          },
+          { event: "message_stop", data: { type: "message_stop" } },
+        ];
+        const responseHeaders = new Headers(response.headers);
+        responseHeaders.set("content-type", "text/event-stream");
+        return new Response(synthetic.map(formatEvent).join(""), {
+          status: response.status,
+          headers: responseHeaders,
+        });
+      }
     }
     return response;
   };
@@ -244,6 +298,7 @@ export function createInferenceServer(options: ServerOptions) {
     const keepAliveMs = options.keepAliveMs ?? 15_000;
     let lastWrite = 0;
     let keepAlive: NodeJS.Timeout | undefined;
+    let rawForward: Promise<boolean> | undefined;
     const startKeepAlive = () => {
       lastWrite = performance.now();
       keepAlive = setInterval(() => {
@@ -318,10 +373,26 @@ export function createInferenceServer(options: ServerOptions) {
         maxRetries: 0,
         timeoutMs: options.timeoutMs ?? defaultTimeoutMs,
         headers: { traceparent: trace.header },
-        fetch: upstreamFetch(
-          upstream,
-          native ? betaList(req.headers["anthropic-beta"]) : undefined,
-        ),
+        ...(model.api === "anthropic-messages"
+          ? {
+              fetch: upstreamFetch(
+                upstream,
+                native ? betaList(req.headers["anthropic-beta"]) : undefined,
+                native,
+                call.stream,
+              ),
+            }
+          : {}),
+        onResponse: (response) => {
+          upstream.status = response.status;
+          upstream.requestId =
+            safeId(
+              response.headers["request-id"] ??
+                response.headers["x-request-id"],
+            ) ?? upstream.requestId;
+          upstream.retryAfter =
+            safeId(response.headers["retry-after"]) ?? upstream.retryAfter;
+        },
         onPayload: async (payload, resolved) => {
           result.requests += 1;
           return call.options.onPayload
@@ -333,6 +404,20 @@ export function createInferenceServer(options: ServerOptions) {
         ? createMessagesEncoder(alias, id)
         : createChatEncoder(alias, id, call.includeUsage);
       for await (const update of withDeadline(stream, signal)) {
+        if (native && call.stream && upstream.rawStream && !rawForward) {
+          rawForward = forwardNativeStream(
+            upstream.rawStream,
+            res,
+            signal,
+            startKeepAlive,
+            () => {
+              lastWrite = performance.now();
+            },
+          ).then(
+            () => true,
+            () => false,
+          );
+        }
         const event =
           update.type === "error" &&
           update.reason === "error" &&
@@ -353,7 +438,11 @@ export function createInferenceServer(options: ServerOptions) {
           result.message = event.error;
           result.error = deadline.aborted
             ? timeoutFailure
-            : providerFailure(upstream);
+            : providerFailure(
+                upstream,
+                native && model.provider === "anthropic",
+              );
+          if (rawForward || upstream.rawJson !== undefined) continue;
           if (call.stream && res.headersSent)
             await writeEvent(
               res,
@@ -367,6 +456,7 @@ export function createInferenceServer(options: ServerOptions) {
           return;
         }
         if (event.type === "done") result.message = event.message;
+        if (rawForward || upstream.rawJson !== undefined) continue;
         if (call.stream) {
           if (!res.headersSent) {
             res.writeHead(200, {
@@ -385,6 +475,24 @@ export function createInferenceServer(options: ServerOptions) {
             }
           }
         }
+      }
+      if (rawForward) {
+        if (!(await rawForward) && !res.destroyed) {
+          result.error = genericFailure;
+          if (!res.headersSent) sendError(res, result.error, native);
+          else
+            await writeEvent(
+              res,
+              { event: "error", data: errorBody(result.error, native) },
+              signal,
+            );
+        }
+        return;
+      }
+      if (upstream.rawJson !== undefined) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(upstream.rawJson);
+        return;
       }
       if (!result.message || failed(result.message)) {
         result.error = genericFailure;
@@ -573,6 +681,55 @@ async function writeEvent(
   if (!res.write(formatEvent(frame))) await once(res, "drain", { signal });
 }
 
+async function forwardNativeStream(
+  response: Response,
+  res: ServerResponse,
+  signal: AbortSignal,
+  startKeepAlive: () => void,
+  onWrite: () => void,
+): Promise<void> {
+  if (!response.body) throw new Error("Upstream stream has no body");
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    "x-accel-buffering": "no",
+  });
+  startKeepAlive();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  const flush = async () => {
+    while (true) {
+      const lf = pending.indexOf("\n\n");
+      const crlf = pending.indexOf("\r\n\r\n");
+      const end = lf < 0 ? crlf : crlf < 0 ? lf : Math.min(lf, crlf);
+      if (end < 0) return;
+      const size = end === crlf ? 4 : 2;
+      const frame = pending.slice(0, end + size);
+      pending = pending.slice(end + size);
+      if (!res.write(frame)) await once(res, "drain", { signal });
+      onWrite();
+    }
+  };
+  try {
+    while (true) {
+      signal.throwIfAborted();
+      const { value, done } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      await flush();
+    }
+    pending += decoder.decode();
+    await flush();
+    if (pending) {
+      if (!res.write(pending)) await once(res, "drain", { signal });
+      onWrite();
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 function formatEvent(frame: WireEvent): string {
   return `${frame.event ? `event: ${frame.event}\n` : ""}data: ${frame.data === "[DONE]" ? "[DONE]" : JSON.stringify(frame.data)}\n\n`;
 }
@@ -611,14 +768,17 @@ const statusTypes: Record<number, string> = {
   529: "overloaded_error",
 };
 
-function providerFailure(upstream: Upstream): ApiError {
+function providerFailure(upstream: Upstream, exposeMessage: boolean): ApiError {
   const status = upstream.status;
   if (status === undefined || status < 400 || status > 599)
     return genericFailure;
   return {
     status,
     type: upstream.error?.type ?? statusTypes[status] ?? "api_error",
-    message: upstream.error?.message ?? "Provider request failed",
+    message:
+      exposeMessage && upstream.error?.message
+        ? upstream.error.message
+        : "Provider request failed",
     retryAfter: upstream.retryAfter,
   };
 }

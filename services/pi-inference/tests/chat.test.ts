@@ -124,6 +124,35 @@ test("unsupported fields and incomplete tool histories fail before provider disp
   );
 });
 
+test("strict Chat tools fail explicitly before provider dispatch", () => {
+  const result = prepareChat(
+    {
+      model: "claude",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "save",
+            strict: true,
+            parameters: {
+              type: "object",
+              properties: { item: { $ref: "#/$defs/Item" } },
+              $defs: { Item: { type: "string" } },
+            },
+          },
+        },
+      ],
+    },
+    model,
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.error.status, 400);
+    assert.match(result.error.message, /strict.*unsupported/i);
+  }
+});
+
 test("tool streaming emits complete arguments once despite advanced mutable partial", () => {
   const tool = {
     type: "toolCall" as const,

@@ -357,12 +357,19 @@ for (const providerKey of [apiKey, oauthKey]) {
 }
 
 async function sidecar(
-  handler: (res: import("node:http").ServerResponse) => void | Promise<void>,
+  handler: (
+    res: import("node:http").ServerResponse,
+    body: Record<string, unknown>,
+  ) => void | Promise<void>,
   options: { keepAliveMs?: number } = {},
 ) {
   const upstream = createServer(async (req, res) => {
-    for await (const _chunk of req);
-    await handler(res);
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    await handler(
+      res,
+      JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>,
+    );
   });
   const upstreamUrl = await listen(upstream);
   const runtime = loadRuntime(
@@ -414,6 +421,68 @@ async function sidecar(
     },
   };
 }
+
+test("API-key native JSON preserves upstream response fields and unknown blocks", async () => {
+  const original = {
+    id: "msg_original",
+    type: "message",
+    role: "assistant",
+    model: "claude-opus-5-5",
+    content: [{ type: "future_block", value: { nested: true } }],
+    stop_reason: "stop_sequence",
+    stop_sequence: "END",
+    stop_details: { reason: "matched" },
+    usage: { input_tokens: 4, output_tokens: 2 },
+  };
+  let requestStream: unknown;
+  const backend = await sidecar((res, body) => {
+    requestStream = body.stream;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(original));
+  });
+  try {
+    const response = await backend.call({ stream: false });
+    assert.equal(response.status, 200);
+    assert.equal(requestStream, false);
+    assert.deepEqual(await response.json(), original);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("API-key native SSE preserves unknown events and mid-stream errors", async () => {
+  const frames = [
+    sse({
+      type: "message_start",
+      message: {
+        id: "msg_original",
+        type: "message",
+        role: "assistant",
+        model: "claude-opus-5-5",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 4, output_tokens: 0 },
+      },
+    }),
+    sse({ type: "future_event", value: { nested: true } }),
+    sse({
+      type: "error",
+      error: { type: "overloaded_error", message: "retry later" },
+    }),
+  ].join("");
+  const backend = await sidecar((res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(frames);
+  });
+  try {
+    const response = await backend.call({ stream: true });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), frames);
+  } finally {
+    await backend.close();
+  }
+});
 
 test("Anthropic error statuses, types, messages and retry-after reach the client", async () => {
   const cases = [

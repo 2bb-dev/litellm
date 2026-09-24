@@ -10,6 +10,7 @@ import { createInferenceServer } from "../src/server.js";
 
 interface Payload {
   model: string;
+  stream?: boolean;
   system?: { type: string; text?: string; cache_control?: unknown }[];
   tools?: { name: string; input_schema: unknown; [key: string]: unknown }[];
   tool_choice?: { type: string; name?: string };
@@ -182,6 +183,33 @@ async function fixture(
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
     const payload = JSON.parse(Buffer.concat(chunks).toString()) as Payload;
     captured.push(payload);
+    if (
+      provider === "anthropic" &&
+      !apiKey.includes("sk-ant-oat") &&
+      !payload.stream
+    ) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "msg_fixture",
+          type: "message",
+          role: "assistant",
+          model: "claude-haiku-4-5",
+          content: [
+            {
+              type: "tool_use",
+              id: "new_call",
+              name: payload.tools?.[0]?.name ?? "lookup_weather",
+              input: { city: "Vienna" },
+            },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 5, output_tokens: 4 },
+        }),
+      );
+      return;
+    }
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.end(
       await (options.respond?.(payload) ??

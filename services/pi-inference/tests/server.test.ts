@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
-import { createServer, type Server } from "node:http";
+import { createServer, request, type Server } from "node:http";
 import { test } from "node:test";
 import {
   createModels,
@@ -13,6 +13,11 @@ import {
   type Model,
 } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
+import {
+  builtinModels,
+  getBuiltinModel,
+} from "@earendil-works/pi-ai/providers/all";
 import { createInferenceServer } from "../src/server.js";
 
 const internalKey = "internal-test-key-never-forward-to-provider";
@@ -32,6 +37,129 @@ async function close(server: Server) {
     server.close((error) => (error ? reject(error) : resolve())),
   );
 }
+
+test("Google Chat reaches its provider without an unsupported custom fetch", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    throw new Error("Fixture blocks provider network");
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const models = builtinModels({
+    authContext: {
+      env: async (name) =>
+        name === "GEMINI_API_KEY" ? "fixture-key" : undefined,
+      fileExists: async () => false,
+    },
+  });
+  const model = getBuiltinModel("google", "gemini-2.5-flash");
+  const backend = createInferenceServer({
+    apiKey: internalKey,
+    runtime: { models, routes: new Map([["gemini", model]]) },
+    log: () => {},
+  });
+  const url = await listen(backend.server);
+  t.after(() => close(backend.server));
+  const port = Number(new URL(url).port);
+  const status = await new Promise<number | undefined>((resolve) => {
+    const client = request(
+      {
+        port,
+        method: "POST",
+        path: "/v1/chat/completions",
+        headers: {
+          authorization: `Bearer ${internalKey}`,
+          "content-type": "application/json",
+        },
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode));
+      },
+    );
+    client.end(
+      JSON.stringify({
+        model: "gemini",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    );
+  });
+  assert.equal(status, 502);
+  assert(calls > 0, "Google adapter should reach the provider transport");
+});
+
+test("Chat hides provider error details while native Messages preserves them", async (t) => {
+  const upstream = createServer((_req, res) => {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        type: "error",
+        error: {
+          type: "authentication_error",
+          message: `Incorrect API key: ${providerKey}`,
+        },
+      }),
+    );
+  });
+  const upstreamUrl = await listen(upstream);
+  t.after(() => close(upstream));
+  const model = {
+    ...getBuiltinModel("anthropic", "claude-haiku-4-5"),
+    baseUrl: upstreamUrl,
+  };
+  const models = createModels({
+    authContext: {
+      env: async (name) =>
+        name === "ANTHROPIC_API_KEY" ? providerKey : undefined,
+      fileExists: async () => false,
+    },
+  });
+  models.setProvider(
+    createProvider({
+      id: "anthropic",
+      auth: { apiKey: envApiKeyAuth("Anthropic", ["ANTHROPIC_API_KEY"]) },
+      models: [model],
+      api: anthropicMessagesApi(),
+    }),
+  );
+  const backend = createInferenceServer({
+    apiKey: internalKey,
+    runtime: { models, routes: new Map([["claude", model]]) },
+    log: () => {},
+  });
+  const url = await listen(backend.server);
+  t.after(() => close(backend.server));
+  const response = await fetch(`${url}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${internalKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude",
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  });
+  assert.equal(response.status, 401);
+  assert.doesNotMatch(await response.text(), new RegExp(providerKey));
+  const native = await fetch(`${url}/v1/messages`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${internalKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude",
+      max_tokens: 128,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  });
+  assert.equal(native.status, 401);
+  assert.match(await native.text(), new RegExp(providerKey));
+});
 
 test("HTTP ingress crosses real Pi adapter with streaming, isolated auth, usage and correlated traces", async (t) => {
   const captured: {

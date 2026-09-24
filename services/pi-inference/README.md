@@ -67,8 +67,8 @@ it is **not** the front LiteLLM master/virtual key. Runtime settings are
 `PI_INFERENCE_CONFIG=/config/models.json`, `PI_INFERENCE_HOST=0.0.0.0`,
 `PI_INFERENCE_PORT=4001` (valid range 1–65535),
 `PI_INFERENCE_SLOT_ID=slot1`, and `PI_INFERENCE_TIMEOUT_MS=600000` (the whole
-request deadline, 1000–3600000; streams get a `ping` or keep-alive comment every
-15 seconds of silence). The image entrypoint is
+request deadline, 1000–3600000; streams get a `ping` or keep-alive comment after
+15–30 seconds of silence). The image entrypoint is
 `node dist/main.js`. Restart after changing the enabled model configuration
 
 All Pi built-in providers are available, but the explicit `models` allowlist
@@ -157,6 +157,8 @@ catalog or subscription prices; verify your contract before accounting against
 them
 
 Both APIs return terminal usage and support text streaming. Native Messages
+with an Anthropic API key forwards the upstream JSON or SSE response body;
+subscription OAuth responses still use the Pi adapter. Native Messages
 retains supported thinking/tool blocks and refusal stop reasons; tool definitions
 are data, never locally executed. `stop_sequences` is explicitly unsupported.
 The generic Chat bridge does not preserve opaque/signed reasoning round-trips;

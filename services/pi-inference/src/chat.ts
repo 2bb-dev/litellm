@@ -156,6 +156,8 @@ export function prepareChat(
   if (!parsed.success)
     return invalid("Unsupported or invalid Chat Completions request fields");
   const input = parsed.data;
+  if (input.tools?.some(({ function: tool }) => tool.strict))
+    return invalid("Strict tools are unsupported on the Chat bridge");
   const effort =
     input.reasoning_effort === "none" ? "off" : input.reasoning_effort;
   if (effort && !getSupportedThinkingLevels(model).includes(effort))
@@ -271,14 +273,6 @@ export function prepareChat(
                 name: tool.name,
                 description: tool.description ?? "",
                 parameters: Type.Unsafe(tool.parameters),
-                ...(tool.strict
-                  ? {
-                      constrainedSampling: {
-                        type: "json_schema" as const,
-                        strict: "require" as const,
-                      },
-                    }
-                  : {}),
               })),
       },
       options: {
