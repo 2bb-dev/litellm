@@ -702,6 +702,77 @@ test("API-key native SSE redacts an echoed provider credential", async () => {
   }
 });
 
+test("truncated native SSE terminates with an error, never a success stop", async () => {
+  for (const suffix of [
+    "",
+    'event: message_delta\ndata: {"type":"message_delta"',
+    "event: message_delta\ndata: {bad}\n\n" + sse({ type: "message_stop" }),
+  ]) {
+    const backend = await sidecar((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(
+        sse({ type: "message_start", message: { id: "msg_partial" } }) + suffix,
+      );
+    });
+    try {
+      const response = await backend.call({ stream: true });
+      const wire = await response.text();
+      assert.equal(response.status, 200);
+      assert.match(wire, /event: error\ndata: \{[^\n]+\}\n\n$/);
+      assert.doesNotMatch(wire, /event: message_stop/);
+      assert.doesNotMatch(wire, /event: message_delta/);
+    } finally {
+      await backend.close();
+    }
+  }
+});
+
+test("native JSON, SSE and errors redact escaped credentials while retaining other fields", async () => {
+  const escaped = apiKey.replace("a", "\\u0061");
+  const json = JSON.stringify({
+    id: "msg_fixture",
+    type: "message",
+    role: "assistant",
+    model: "claude-opus-5-5",
+    content: [{ type: "text", text: "safe" }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: 1, output_tokens: 1 },
+    extra: `before ${apiKey} after`,
+  }).replaceAll(apiKey, escaped);
+  for (const kind of ["json", "sse", "error"] as const) {
+    const backend = await sidecar((res) => {
+      res.writeHead(kind === "error" ? 401 : 200, {
+        "content-type":
+          kind === "sse" ? "text/event-stream" : "application/json",
+      });
+      res.end(
+        kind === "json"
+          ? json
+          : kind === "sse"
+            ? `event: message_start\ndata: {"type":"message_start","echo":"${escaped}","safe":"kept"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`
+            : `{"type":"error","error":{"type":"authentication_error","message":"before ${escaped} after"}}`,
+      );
+    });
+    try {
+      const response = await backend.call({ stream: kind === "sse" });
+      const wire = await response.text();
+      assert.doesNotMatch(wire, new RegExp(apiKey));
+      assert.doesNotMatch(wire, /\\u0061/);
+      if (kind === "error") assert.match(wire, /Provider request failed/);
+      else {
+        assert.match(wire, /\[REDACTED\]/);
+        assert.match(
+          wire,
+          kind === "sse" ? /"safe":"kept"/ : /before \[REDACTED\] after/,
+        );
+      }
+    } finally {
+      await backend.close();
+    }
+  }
+});
+
 test("Anthropic error statuses, types, messages and retry-after reach the client", async () => {
   const cases = [
     {

@@ -142,6 +142,42 @@ test("serializes concurrent refresh-style updates across providers and atomicall
   ]);
 });
 
+test("directory sync failure rejects a credential update rather than acknowledging durability", async (t) => {
+  const { file } = tempFile(t);
+  writeFileSync(file, "{}\n", { mode: 0o600 });
+  const source = new URL("../src/credentials.ts", import.meta.url).href;
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--import",
+      "tsx",
+      "--input-type=module",
+      "--eval",
+      `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const original = fs.fsyncSync;
+      fs.fsyncSync = (fd) => {
+        if (fs.fstatSync(fd).isDirectory()) throw new Error('synthetic directory sync failure');
+        return original(fd);
+      };
+      syncBuiltinESMExports();
+      const { FileCredentialStore } = await import(${JSON.stringify(source)});
+      const store = new FileCredentialStore(${JSON.stringify(file)});
+      try {
+        await store.modify('provider', async () => ({ type: 'api_key', key: 'synthetic-test-key' }));
+        process.exitCode = 1;
+      } catch (error) {
+        process.exitCode = /Unable to persist credential/.test(error.message) ? 0 : 2;
+      } finally { await store.close(); }
+      `,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.stdout, "");
+});
+
 test("failed, invalid and unchanged modifications leave previous credentials intact and queue usable", async (t) => {
   const { file, open } = tempFile(t);
   const store = open();
