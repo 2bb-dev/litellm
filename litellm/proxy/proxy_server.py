@@ -376,6 +376,11 @@ from litellm.proxy.common_utils.http_parsing_utils import (
 )
 from litellm.proxy.common_utils.load_config_utils import get_config_from_bucket
 from litellm.proxy.common_utils.model_deprecation import collect_model_deprecations
+from litellm.proxy.common_utils.subscription_discovery import (
+    PROTECTED_NAMES,
+    subscription_model_visible,
+    subscription_deployment_visible,
+)
 from litellm.proxy.common_utils.model_listing_utils import (
     ClaudeCodeRoutingNames,
     TeamModelNameTranslator,
@@ -10754,7 +10759,17 @@ async def model_list(
         # The internal routing key drives the metadata/fallback lookup, while the
         # public name is what the client sees as the model id.
         model_data = []
-        admin_entries: Final = TeamModelNameTranslator.listing_entries(all_models, llm_router, settings)
+        admin_entries = TeamModelNameTranslator.listing_entries(all_models, llm_router, settings)
+        admin_entries = [
+            (response_id, lookup_id) for response_id, lookup_id in admin_entries
+            if subscription_model_visible(user_api_key_dict.token, response_id)
+            and subscription_model_visible(user_api_key_dict.token, lookup_id)
+            and all(
+                subscription_deployment_visible(user_api_key_dict.token, row)
+                for row in (llm_router.model_list if llm_router is not None else [])
+                if row.get("model_name") == lookup_id
+            )
+        ]
         for response_id, lookup_id in admin_entries:
             model_info = create_model_info_response(
                 model_id=lookup_id,
@@ -10807,7 +10822,17 @@ async def model_list(
     # The internal routing key drives the metadata/fallback lookup, while the
     # public name is what the client sees as the model id.
     model_data = []
-    entries: Final = TeamModelNameTranslator.listing_entries(all_models, llm_router, settings)
+    entries = TeamModelNameTranslator.listing_entries(all_models, llm_router, settings)
+    entries = [
+        (response_id, lookup_id) for response_id, lookup_id in entries
+        if subscription_model_visible(user_api_key_dict.token, response_id)
+        and subscription_model_visible(user_api_key_dict.token, lookup_id)
+        and all(
+            subscription_deployment_visible(user_api_key_dict.token, row)
+            for row in (llm_router.model_list if llm_router is not None else [])
+            if row.get("model_name") == lookup_id
+        )
+    ]
     for response_id, lookup_id in entries:
         model_info = create_model_info_response(
             model_id=lookup_id,
@@ -10902,6 +10927,10 @@ async def model_info(
     if hidden_names:
         all_models = [m for m in all_models if m not in hidden_names]
 
+    all_models = [m for m in all_models if subscription_model_visible(user_api_key_dict.token, m)]
+    if not subscription_model_visible(user_api_key_dict.token, model_id):
+        raise HTTPException(status_code=404, detail="Model not found")
+
     internal_to_public: Final = TeamModelNameTranslator.build_internal_to_public_map(llm_router, settings)
     resolved_model_id: Final = TeamModelNameTranslator.resolve_public_name(
         model_id=model_id,
@@ -10909,6 +10938,9 @@ async def model_info(
         llm_router=llm_router,
         general_settings=settings,
     )
+
+    if not subscription_model_visible(user_api_key_dict.token, resolved_model_id):
+        raise HTTPException(status_code=404, detail="Model not found")
 
     # Validate that the requested model is accessible
     validate_model_access(model_id=resolved_model_id, available_models=all_models)
@@ -10923,6 +10955,8 @@ async def model_info(
             status_code=404,
             detail=f"Model '{model_id}' not found in router configuration",
         )
+    if not subscription_deployment_visible(user_api_key_dict.token, deployment.model_dump(exclude_none=True)):
+        raise HTTPException(status_code=404, detail="Model not found")
 
     # Use the actual litellm model from the deployment to get provider info
     _, provider, _, _ = litellm.get_llm_provider(model=deployment.litellm_params.model)
@@ -13647,6 +13681,7 @@ async def _fetch_db_models_for_search(
     sort_by: str | None,
     is_byok_outside_caller_teams: Callable[[dict[str, JsonValue]], bool],
     model_name: str | None = None,
+    subscription_token: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """
     Run the bounded DB query that backs `/v2/model/info?search=`. Returns
@@ -13666,6 +13701,17 @@ async def _fetch_db_models_for_search(
     db_where_condition: Final[dict[str, Any]] = {
         "model_name": {"contains": search_lower, "mode": "insensitive"} if model_name is None else model_name
     }
+    if not subscription_model_visible(subscription_token, "claude-opus-5-5-pi-native"):
+        db_where_condition["NOT"] = {
+            "OR": [
+                {"model_name": {"in": list(PROTECTED_NAMES)}},
+                {"model_id": {"in": list(PROTECTED_NAMES)}},
+                *(
+                    {"model_info": {"path": ["team_public_model_name"], "equals": name}}
+                    for name in PROTECTED_NAMES
+                ),
+            ]
+        }
     if db_model_ids_in_router:
         db_where_condition["model_id"] = {"not": {"in": list(db_model_ids_in_router)}}
 
@@ -13692,6 +13738,10 @@ async def _fetch_db_models_for_search(
         m
         for m in db_models_raw
         if not is_byok_outside_caller_teams(m.model_info if isinstance(m.model_info, dict) else {})
+        and subscription_deployment_visible(
+            subscription_token,
+            {"model_name": m.model_name, "model_info": {**(m.model_info or {}), "id": m.model_id}},
+        )
     ]
 
     decrypted: Final[list[dict[str, object]]] = []
@@ -13713,6 +13763,7 @@ async def _apply_search_filter_to_models(
     size: int = 50,
     sort_by: str | None = None,
     model_name: str | None = None,
+    subscription_token: str | None = None,
 ) -> tuple[list[dict[str, Any]], int | None]:
     """
     Apply search filter to models, querying database for additional matching models.
@@ -13742,6 +13793,7 @@ async def _apply_search_filter_to_models(
     Returns:
         Tuple of (filtered_models, total_count). total_count is None if not searching.
     """
+    all_models = [m for m in all_models if subscription_deployment_visible(subscription_token, m)]
     if not search or not search.strip():
         return all_models, None
 
@@ -13809,6 +13861,7 @@ async def _apply_search_filter_to_models(
                 sort_by=sort_by,
                 is_byok_outside_caller_teams=_is_byok_outside_caller_teams,
                 model_name=model_name,
+                subscription_token=subscription_token,
             )
             search_total_count = router_models_count + db_models_total_count
         except Exception as e:
@@ -14374,6 +14427,11 @@ async def model_info_v2(
 
     # Load existing config
     await proxy_config.get_config()
+    token = user_api_key_dict.token
+    if isinstance(model, str) and not subscription_model_visible(token, model):
+        return {"data": [], "total_count": 0, "current_page": page, "total_pages": 0, "size": size}
+    if isinstance(modelId, str) and not subscription_model_visible(token, modelId):
+        return {"data": [], "total_count": 0, "current_page": page, "total_pages": 0, "size": size}
 
     # If modelId is provided, search for the specific model
     if modelId is not None:
@@ -14386,11 +14444,12 @@ async def model_info_v2(
         )
     else:
         # Normal flow when modelId is not provided
-        all_models = copy.deepcopy(llm_router.model_list)
+        all_models = [m for m in copy.deepcopy(llm_router.model_list) if subscription_deployment_visible(token, m)]
 
         if user_model is not None:
             # if user does not use a config.yaml, https://github.com/BerriAI/litellm/issues/2061
             all_models += [user_model]
+            all_models = [m for m in all_models if subscription_deployment_visible(token, m)]
 
         if model is not None:
             all_models = [m for m in all_models if _deployment_matches_allowed_model_names(m, frozenset((model,)))]
@@ -14406,7 +14465,12 @@ async def model_info_v2(
             size=size,
             sort_by=sortBy,
             model_name=model,
+            subscription_token=token,
         )
+
+    all_models = [m for m in all_models if subscription_deployment_visible(token, m)]
+    if search_total_count is not None and modelId is not None:
+        search_total_count = len(all_models)
 
     if user_models_only:
         all_models = await non_admin_all_models(
@@ -14464,6 +14528,7 @@ async def model_info_v2(
             sort_order=sortOrder or "asc",
         )
 
+    all_models = [m for m in all_models if subscription_deployment_visible(token, m)]
     verbose_proxy_logger.debug("all_models: %s", all_models)
 
     # Append A2A agents to models list
@@ -14482,8 +14547,14 @@ async def model_info_v2(
         m for m in all_models if _matches_model_info_filters(m, exclude_auto_routers, access_group, wildcard_only)
     ]
 
-    # Update total count to include agents
-    search_total_count = len(all_models)
+    all_models = [m for m in all_models if subscription_deployment_visible(token, m)]
+    # Preserve the DB-side filtered count for paginated searches.
+    if (
+        not isinstance(search, str) or not search.strip() or modelId is not None
+        or teamId is not None or access_group is not None or wildcard_only is True
+        or exclude_auto_routers is True
+    ):
+        search_total_count = len(all_models)
 
     # Translate `model_name` to the public name for team-scoped rows.
     all_models = [_translate_model_name_for_response(m) for m in all_models]
@@ -15122,6 +15193,8 @@ async def model_info_v1(
         teamId = None
 
     if user_model is not None:
+        if not subscription_model_visible(user_api_key_dict.token, user_model):
+            return {"data": []}
         # user is trying to get specific model from litellm router
         try:
             model_info: dict = cast(dict, litellm.get_model_info(model=user_model))
@@ -15164,6 +15237,8 @@ async def model_info_v1(
         )
 
     if litellm_model_id is not None:
+        if not subscription_model_visible(user_api_key_dict.token, litellm_model_id):
+            raise HTTPException(status_code=404, detail="Model not found")
         # user is trying to get specific model from litellm router
         deployment_info: Final = llm_router.get_deployment(model_id=litellm_model_id)
         if deployment_info is None:
@@ -15171,6 +15246,8 @@ async def model_info_v1(
                 status_code=400,
                 detail={"error": f"Model id = {litellm_model_id} not found on litellm proxy"},
             )
+        if not subscription_deployment_visible(user_api_key_dict.token, deployment_info.model_dump(exclude_none=True)):
+            raise HTTPException(status_code=404, detail="Model not found")
         _deployment_info_dict = _get_proxy_model_info(model=deployment_info.model_dump(exclude_none=True))
         single_model_list: list[dict] = [_deployment_info_dict]
         if prisma_client is not None:
@@ -15199,8 +15276,10 @@ async def model_info_v1(
     all_models: list[dict] = copy.deepcopy(llm_router.model_list)
     alias_models: Final = copy.deepcopy(llm_router.get_model_list_from_model_alias())
     all_models.extend(alias_models)
+    all_models = [m for m in all_models if subscription_deployment_visible(user_api_key_dict.token, m)]
 
     all_models = expand_wildcard_deployments_for_model_info(all_models)
+    all_models = [m for m in all_models if subscription_deployment_visible(user_api_key_dict.token, m)]
 
     allowed_model_names: Final = _get_v1_model_info_allowed_model_names(
         user_api_key_dict=user_api_key_dict,
@@ -15518,6 +15597,7 @@ async def model_group_info(
         return_wildcard_routes=False,
         user_api_key_cache=user_api_key_cache,
     )
+    all_models_str = [m for m in all_models_str if subscription_model_visible(user_api_key_dict.token, m)]
     model_groups: list[ModelGroupInfoProxy] = _get_model_group_info(
         llm_router=llm_router, all_models_str=all_models_str, model_group=model_group
     )
@@ -15531,6 +15611,7 @@ async def model_group_info(
         model_groups=model_groups,
         user_api_key_dict=user_api_key_dict,
     )
+    model_groups = [m for m in model_groups if subscription_model_visible(user_api_key_dict.token, m.model_group)]
 
     return {"data": model_groups}
 
