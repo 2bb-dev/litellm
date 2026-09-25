@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Final
 
 import httpx
+import openai
 import pytest
 import respx
 from fastapi.testclient import TestClient
@@ -3709,6 +3710,58 @@ def test_stream_chunk_builder_leaves_xai_reported_cost_to_the_calculator(monkeyp
     assert getattr(response.usage, "cost", None) == pytest.approx(0.42)
     assert response._hidden_params.get("response_cost") is None
     assert logging_obj._response_cost_calculator(result=response) == pytest.approx(0.63)
+
+
+def _recording_openai_client(response: httpx.Response) -> tuple[openai.AsyncOpenAI, MagicMock]:
+    upstream: Final = MagicMock(return_value=response)
+    client: Final = openai.AsyncOpenAI(
+        api_key="sk-test",
+        base_url="https://central.example/v1",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(upstream)),
+    )
+    return client, upstream
+
+
+@pytest.mark.asyncio
+async def test_atranscription_sends_extra_headers_to_an_openai_compatible_upstream():
+    client, upstream = _recording_openai_client(httpx.Response(200, json={"text": "hello"}))
+
+    response: Final = await litellm.atranscription(
+        model="litellm_proxy/whisper-1",
+        file=("audio.mp3", b"\x00\x01\x02", "audio/mpeg"),
+        api_base="https://central.example/v1",
+        api_key="sk-test",
+        client=client,
+        extra_headers={"x-litellm-call-id": "call-from-instance"},
+    )
+
+    request: Final[httpx.Request] = upstream.call_args.args[0]
+    assert request.url.path == "/v1/audio/transcriptions"
+    assert request.headers["x-litellm-call-id"] == "call-from-instance"
+    assert b"extra_headers" not in request.content
+    assert b"call-from-instance" not in request.content
+    assert response.text == "hello"
+
+
+@pytest.mark.asyncio
+async def test_aspeech_sends_extra_headers_to_an_openai_compatible_upstream():
+    client, upstream = _recording_openai_client(httpx.Response(200, content=b"ID3-fake-mp3-bytes"))
+
+    response: Final = await litellm.aspeech(
+        model="litellm_proxy/tts-1",
+        input="hello",
+        voice="alloy",
+        api_base="https://central.example/v1",
+        api_key="sk-test",
+        client=client,
+        extra_headers={"x-litellm-call-id": "call-from-instance"},
+    )
+
+    request: Final[httpx.Request] = upstream.call_args.args[0]
+    assert request.url.path == "/v1/audio/speech"
+    assert request.headers["x-litellm-call-id"] == "call-from-instance"
+    assert json.loads(request.content) == {"model": "tts-1", "input": "hello", "voice": "alloy"}
+    assert response.content == b"ID3-fake-mp3-bytes"
 
 
 def test_speech_mistral_dispatches_and_decodes_audio(respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch):

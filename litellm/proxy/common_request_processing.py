@@ -217,6 +217,10 @@ _CLIENT_DISCONNECTED_ERROR_INFORMATION: Final[StandardLoggingPayloadErrorInforma
 }
 
 
+def litellm_call_id_from_request(request: Request) -> str:
+    return request.headers.get("x-litellm-call-id", str(uuid.uuid4()))
+
+
 def _withheld_provider_output(response: object) -> bool:
     return getattr(response, "has_buffered_provider_output", False) is True
 
@@ -1946,7 +1950,7 @@ class ProxyBaseLLMRequestProcessing:
                 if alias_target is not None:
                     self.data["model"] = alias_target
 
-        self.data["litellm_call_id"] = request.headers.get("x-litellm-call-id", str(uuid.uuid4()))
+        self.data["litellm_call_id"] = litellm_call_id_from_request(request)
         DDSpanTagger.tag_call_id(self.data.get("litellm_call_id"))
         DDSpanTagger.tag_request(
             user_api_key_dict=user_api_key_dict,
