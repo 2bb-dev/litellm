@@ -34,6 +34,7 @@ _APPROVED_CALLBACKS = frozenset(
     {
         _COLLECTOR,
         "callbacks.request_context.OpenOrangeRequestContextCallback",
+        "callbacks.central_call_id.CentralCallIdCallback",
         "litellm._service_logger.ServiceLogging",
         "litellm.proxy.hooks.model_max_budget_limiter._PROXY_VirtualKeyModelMaxBudgetLimiter",
         "litellm.proxy.hooks.max_budget_limiter._PROXY_MaxBudgetLimiter",

@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Final, Optional, cast
 
 import httpx
@@ -30,6 +31,7 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
         openai_aclient: AsyncOpenAI,
         data: dict,
         timeout: float | httpx.Timeout,
+        extra_headers: Mapping[str, str] | None = None,
     ):
         """
         Helper to:
@@ -37,7 +39,9 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
         - call openai_aclient.audio.transcriptions.create by default
         """
         try:
-            raw_response = await openai_aclient.audio.transcriptions.with_raw_response.create(**data, timeout=timeout)
+            raw_response = await openai_aclient.audio.transcriptions.with_raw_response.create(
+                **data, timeout=timeout, extra_headers=extra_headers
+            )
             headers: Final = dict(raw_response.headers)
             response: Final = raw_response.parse()
 
@@ -50,6 +54,7 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
         openai_client: OpenAI,
         data: dict,
         timeout: float | httpx.Timeout,
+        extra_headers: Mapping[str, str] | None = None,
     ):
         """
         Helper to:
@@ -58,12 +63,16 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
         """
         try:
             if litellm.return_response_headers is True:
-                raw_response = openai_client.audio.transcriptions.with_raw_response.create(**data, timeout=timeout)
+                raw_response = openai_client.audio.transcriptions.with_raw_response.create(
+                    **data, timeout=timeout, extra_headers=extra_headers
+                )
                 headers: Final = dict(raw_response.headers)
                 response = raw_response.parse()
                 return headers, response
             else:
-                response = openai_client.audio.transcriptions.create(**data, timeout=timeout)
+                response = openai_client.audio.transcriptions.create(
+                    **data, timeout=timeout, extra_headers=extra_headers
+                )
                 return None, response
         except Exception as e:
             raise e
@@ -84,6 +93,7 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
         atranscription: bool = False,
         provider_config: BaseAudioTranscriptionConfig | None = None,
         shared_session: Optional["ClientSession"] = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> TranscriptionResponse:
         """
         Handle audio transcription request
@@ -112,6 +122,7 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
                 max_retries=max_retries,
                 logging_obj=logging_obj,
                 shared_session=shared_session,
+                extra_headers=extra_headers,
             )
 
         openai_client: Final[OpenAI] = self._get_openai_client(
@@ -137,6 +148,7 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
             openai_client=openai_client,
             data=data,
             timeout=timeout,
+            extra_headers=extra_headers,
         )
 
         if isinstance(response, BaseModel):
@@ -172,6 +184,7 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
         client=None,
         max_retries=None,
         shared_session: Optional["ClientSession"] = None,
+        extra_headers: Mapping[str, str] | None = None,
     ):
         try:
             openai_aclient: Final[AsyncOpenAI] = self._get_openai_client(
@@ -198,6 +211,7 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
                 openai_aclient=openai_aclient,
                 data=data,
                 timeout=timeout,
+                extra_headers=extra_headers,
             )
             logging_obj.model_call_details["response_headers"] = headers
             if isinstance(response, BaseModel):

@@ -348,6 +348,7 @@ from litellm.proxy.common_request_processing import (
     _is_azure_model_router_request,
     _should_return_raw_model_name,
     create_response,
+    litellm_call_id_from_request,
     open_sse_before_first_byte,
     ttft_keepalive_interval,
 )
@@ -11583,6 +11584,7 @@ async def audio_speech(
             version=version,
             proxy_config=proxy_config,
         )
+        data["litellm_call_id"] = litellm_call_id_from_request(request)
 
         if data.get("user", None) is None and user_api_key_dict.user_id is not None:
             data["user"] = user_api_key_dict.user_id
@@ -11712,6 +11714,7 @@ async def audio_transcriptions(
             version=version,
             proxy_config=proxy_config,
         )
+        data["litellm_call_id"] = litellm_call_id_from_request(request)
 
         if data.get("user", None) is None and user_api_key_dict.user_id is not None:
             data["user"] = user_api_key_dict.user_id

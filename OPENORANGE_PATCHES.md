@@ -35,6 +35,9 @@ Upstream syncs must preserve these behaviors:
 - **OpenClaw attribution:** trusted runtime context and supported OpenClaw
   payload markers continue to populate actor, parent, session, channel,
   execution, and Langfuse metadata without persisting raw credentials.
+- **Context overflow recovery:** router pre-call context errors retain the
+  `context_length_exceeded` marker so clients recognize overflow and can
+  compact and retry. Preserve configured limits and unrelated error types.
 - **ChatGPT rate limits:** transient subscription 429 responses remain eligible
   for bounded backoff retries. Only structured `usage_limit_reached` or
   `insufficient_quota` codes trigger quota cooldown and skip retries, including

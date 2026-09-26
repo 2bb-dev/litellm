@@ -1574,6 +1574,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         aspeech: bool | None = None,
         client=None,
         shared_session: Optional["ClientSession"] = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> HttpxBinaryResponseContent:
         if aspeech is not None and aspeech is True:
             return self.async_audio_speech(
@@ -1590,6 +1591,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                 logging_obj=logging_obj,
                 client=client,
                 shared_session=shared_session,
+                extra_headers=extra_headers,
             )
 
         openai_client: Final = self._get_openai_client(
@@ -1616,6 +1618,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             model=model,
             voice=voice,
             input=input,
+            extra_headers=extra_headers,
             **optional_params,
         )
         return HttpxBinaryResponseContent(response=response.response)
@@ -1635,6 +1638,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         logging_obj: LiteLLMLoggingObj,
         client=None,
         shared_session: Optional["ClientSession"] = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> HttpxBinaryResponseContent:
         openai_client: Final = cast(
             AsyncOpenAI,
@@ -1662,6 +1666,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             model=model,
             voice=voice,
             input=input,
+            extra_headers=extra_headers,
             **optional_params,
         )
 
