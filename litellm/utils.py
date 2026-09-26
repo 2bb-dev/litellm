@@ -9918,7 +9918,7 @@ def strip_reasoning_summary_aliases_from_optional_params(
 def get_non_default_transcription_params(kwargs: dict) -> dict:
     from litellm.constants import OPENAI_TRANSCRIPTION_PARAMS
 
-    default_params: Final = OPENAI_TRANSCRIPTION_PARAMS + all_litellm_params
+    default_params: Final = (*OPENAI_TRANSCRIPTION_PARAMS, *all_litellm_params, "extra_headers")
     non_default_params: Final = {k: v for k, v in kwargs.items() if k not in default_params}
     return non_default_params
 

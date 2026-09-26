@@ -12483,7 +12483,11 @@ class Router:
 
             elif _context_window_error is True:
                 raise litellm.ContextWindowExceededError(
-                    message=f"litellm._pre_call_checks: Context Window exceeded for given call. No models have context window large enough for this call.\n{_potential_error_str}",
+                    message=(
+                        "context_length_exceeded: litellm._pre_call_checks: Context Window exceeded for given call. "
+                        "No models have context window large enough for this call.\n"
+                        f"{_potential_error_str}"
+                    ),
                     model=model,
                     llm_provider="",
                 )

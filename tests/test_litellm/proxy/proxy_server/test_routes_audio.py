@@ -10,6 +10,8 @@ Pins (PR2):
 from __future__ import annotations
 
 import io
+import uuid
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -151,6 +153,57 @@ def patched_transcription_error(monkeypatch, patched_transcription):
 
     monkeypatch.setattr(proxy_server, "route_request", _raise)
     yield
+
+
+def _record_routed_requests(monkeypatch) -> AsyncMock:
+    recorder: Final = AsyncMock(wraps=proxy_server.route_request)
+    monkeypatch.setattr(proxy_server, "route_request", recorder)
+    return recorder
+
+
+@pytest.fixture
+def speech_route(monkeypatch, patched_speech):
+    return _record_routed_requests(monkeypatch)
+
+
+@pytest.fixture
+def transcription_route(monkeypatch, patched_transcription):
+    return _record_routed_requests(monkeypatch)
+
+
+@pytest.mark.parametrize("path", ["/v1/audio/speech", "/audio/speech"])
+def test_audio_speech_adopts_the_callers_call_id(client, auth_as, speech_route, path):
+    payload = {"model": "tts-1", "input": "Hi", "voice": "alloy"}
+    with auth_as():
+        response = client.post(path, json=payload, headers={"x-litellm-call-id": "call-from-caller"})
+    assert response.status_code == 200
+    assert speech_route.call_args.kwargs["data"]["litellm_call_id"] == "call-from-caller"
+
+
+@pytest.mark.parametrize("path", ["/v1/audio/transcriptions", "/audio/transcriptions"])
+def test_audio_transcription_adopts_the_callers_call_id(client, auth_as, transcription_route, path):
+    files = {"file": ("audio.mp3", b"\x00\x01\x02", "audio/mpeg")}
+    with auth_as():
+        response = client.post(
+            path, files=files, data={"model": "whisper-1"}, headers={"x-litellm-call-id": "call-from-caller"}
+        )
+    assert response.status_code == 200
+    assert transcription_route.call_args.kwargs["data"]["litellm_call_id"] == "call-from-caller"
+
+
+def test_audio_speech_mints_a_call_id_when_the_caller_sends_none(client, auth_as, speech_route):
+    with auth_as():
+        response = client.post("/v1/audio/speech", json={"model": "tts-1", "input": "Hi", "voice": "alloy"})
+    assert response.status_code == 200
+    assert uuid.UUID(speech_route.call_args.kwargs["data"]["litellm_call_id"])
+
+
+def test_audio_transcription_mints_a_call_id_when_the_caller_sends_none(client, auth_as, transcription_route):
+    files = {"file": ("audio.mp3", b"\x00\x01\x02", "audio/mpeg")}
+    with auth_as():
+        response = client.post("/v1/audio/transcriptions", files=files, data={"model": "whisper-1"})
+    assert response.status_code == 200
+    assert uuid.UUID(transcription_route.call_args.kwargs["data"]["litellm_call_id"])
 
 
 @pytest.mark.parametrize("path", ["/v1/audio/speech", "/audio/speech"])
