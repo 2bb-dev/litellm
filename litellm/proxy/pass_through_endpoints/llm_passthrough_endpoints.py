@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Annotated, Final, Literal, Protocol, cast
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
+from pydantic import TypeAdapter
 from starlette.websockets import WebSocketState
 from typing_extensions import ReadOnly, TypedDict
 
@@ -554,8 +555,20 @@ async def typesafe_proxy_route(
         },
         custom_llm_provider="typesafe",
         is_streaming_request=False,
+        model_aliases=typesafe_model_aliases(),
     )
     return await endpoint_func(request, fastapi_response, user_api_key_dict)
+
+
+_MODEL_ALIASES_ADAPTER: Final = TypeAdapter(dict[str, str])
+
+
+def typesafe_model_aliases() -> Mapping[str, str]:
+    """Model names a caller may send, each with the TypeSafe model it runs; the call is priced as the alias."""
+    from litellm.proxy.proxy_server import general_settings
+
+    configured: Final = general_settings.get("typesafe_model_aliases") or {}
+    return MappingProxyType(_MODEL_ALIASES_ADAPTER.validate_python(configured))
 
 
 @router.api_route(
