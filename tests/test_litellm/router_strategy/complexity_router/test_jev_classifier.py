@@ -457,6 +457,56 @@ def test_jev_api_base_without_its_own_key_is_rejected_so_the_environment_key_sta
     assert JevClassifierConfig(api_key="sk-own").api_base is None
 
 
+@pytest.mark.asyncio
+async def test_jev_runtime_client_needs_no_key_and_falls_back_until_a_client_is_supplied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    config: Final = {
+        "classifier_type": "jev",
+        "jev_classifier_config": {"model": "openorange/jev-router", "runtime_client": True},
+        "classifier_fallback": "default_model",
+        "tiers": {"SIMPLE": "cheap", "MEDIUM": "cheap", "COMPLEX": "large", "REASONING": "large"},
+    }
+    with pytest.raises(ValueError, match="TYPESAFE_API_KEY is required"):
+        ComplexityRouter(
+            "keyed",
+            litellm.Router(model_list=[]),
+            {**config, "jev_classifier_config": {"model": "openorange/jev-router"}},
+            default_model="large",
+        )
+    registered: Final = ComplexityRouter("registered", litellm.Router(model_list=[]), config, default_model="large")
+    outcome: Final = await registered.aclassify("choose a tier")
+    assert (outcome.cause, outcome.jev_verdict) == ("default_model_fallback", None)
+
+    handler: Final = AsyncHTTPHandler()
+    handler.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"answers": {"tier": _answer().model_dump()}})
+        )
+    )
+    supplied: Final = ComplexityRouter(
+        "supplied",
+        litellm.Router(model_list=[]),
+        config,
+        default_model="large",
+        jev_client=HttpJevClassifierClient("sk-central", "https://central.test/typesafe", handler),
+        derive_savings_baseline=False,
+    )
+    classified: Final = await supplied.aclassify("choose a tier")
+    await handler.client.aclose()
+    assert (classified.cause, classified.jev_verdict.label if classified.jev_verdict else None) == (
+        "jev_classifier",
+        "SIMPLE",
+    )
+
+
+@pytest.mark.parametrize("credential", [{"api_key": "sk-own"}, {"api_key": "sk-own", "api_base": "https://x.test"}])
+def test_jev_runtime_client_rejects_its_own_credentials(credential: Mapping[str, str]) -> None:
+    with pytest.raises(ValueError, match="runtime_client takes no api_key or api_base"):
+        JevClassifierConfig(runtime_client=True, **credential)
+
+
 @pytest.mark.parametrize(
     ("probabilities", "confidence"),
     [
