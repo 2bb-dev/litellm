@@ -53,6 +53,12 @@ def _pricing_for(model_keys: tuple[str, ...]) -> _RegistryPricing:
     return _RegistryPricing()
 
 
+def _model_alias(logging_obj: LiteLLMLoggingObj) -> str | None:
+    payload: Final = logging_obj.model_call_details.get("passthrough_logging_payload")
+    alias: Final = payload.get("model_alias") if isinstance(payload, Mapping) else None
+    return alias if isinstance(alias, str) and alias else None
+
+
 class TypeSafePassthroughLoggingHandler:
     @staticmethod
     def typesafe_passthrough_handler(
@@ -73,12 +79,14 @@ class TypeSafePassthroughLoggingHandler:
         request_model_value: Final = request_body.get("model")
         request_model: Final = request_model_value if isinstance(request_model_value, str) else None
         logged_model: Final = response_model or request_model or "unknown"
-        model_name: Final = f"{custom_llm_provider}/{logged_model}"
+        model_alias: Final = _model_alias(logging_obj)
+        model_name: Final = model_alias or f"{custom_llm_provider}/{logged_model}"
         usage: Final = response.usage or _TypeSafeUsage()
         input_tokens: Final = usage.input_tokens
         output_tokens: Final = usage.output_tokens
-        candidate_model_keys: Final = tuple(
-            f"{custom_llm_provider}/{model}" for model in (response_model, request_model) if model is not None
+        candidate_model_keys: Final = (
+            *((model_alias,) if model_alias else ()),
+            *(f"{custom_llm_provider}/{model}" for model in (response_model, request_model) if model is not None),
         )
         pricing: Final = _pricing_for(candidate_model_keys)
         response_cost: Final = (

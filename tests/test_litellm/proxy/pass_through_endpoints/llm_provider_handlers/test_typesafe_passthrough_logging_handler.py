@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import httpx
@@ -116,6 +116,45 @@ def test_records_model_provider_and_cost_on_logging_details():
     assert logging_obj.model_call_details["model"] == "typesafe/jev-1.13.0"
     assert logging_obj.model_call_details["custom_llm_provider"] == "typesafe"
     assert logging_obj.model_call_details["response_cost"] == result["kwargs"]["response_cost"]
+
+
+def _aliased_result(monkeypatch: pytest.MonkeyPatch, alias_price: dict | None) -> tuple[dict, MagicMock]:
+    if alias_price is not None:
+        monkeypatch.setitem(litellm.model_cost, "openorange/jev-router", alias_price)
+    logging_obj = _logging_obj()
+    logging_obj.model_call_details["passthrough_logging_payload"] = {"model_alias": "openorange/jev-router"}
+    result = TypeSafePassthroughLoggingHandler.typesafe_passthrough_handler(
+        httpx_response=_response(),
+        response_body={"model": "jev-1.13.0", "usage": {"input_tokens": 1000, "output_tokens": 0}},
+        logging_obj=logging_obj,
+        url_route="https://api.typesafe.ai/v1/systemone",
+        result="{}",
+        start_time=datetime.now(UTC),
+        end_time=datetime.now(UTC),
+        cache_hit=False,
+        request_body={"model": "jev-1.13.0"},
+        custom_llm_provider="typesafe",
+    )
+    return result, logging_obj
+
+
+def test_aliased_call_is_logged_and_priced_as_the_alias(monkeypatch: pytest.MonkeyPatch):
+    result, logging_obj = _aliased_result(
+        monkeypatch, {"input_cost_per_token": 1e-6, "output_cost_per_token": 0, "litellm_provider": "typesafe"}
+    )
+
+    assert result["kwargs"]["model"] == "openorange/jev-router"
+    assert logging_obj.model_call_details["model"] == "openorange/jev-router"
+    assert result["kwargs"]["response_cost"] == pytest.approx(1000 * 1e-6)
+    assert result["kwargs"]["standard_logging_object"]["model"] == "openorange/jev-router"
+
+
+def test_aliased_call_without_its_own_price_costs_what_its_upstream_model_costs(monkeypatch: pytest.MonkeyPatch):
+    result, _ = _aliased_result(monkeypatch, None)
+
+    upstream = litellm.model_cost["typesafe/jev-1.13.0"]
+    assert result["kwargs"]["model"] == "openorange/jev-router"
+    assert result["kwargs"]["response_cost"] == pytest.approx(1000 * upstream["input_cost_per_token"])
 
 
 def test_success_handler_dispatches_to_typesafe_handler():

@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Final
 
-from typing_extensions import TypedDict
+from typing_extensions import ReadOnly, TypedDict
 
 # Request.state key for programmatic pass-through callers (e.g. Bedrock proxy) that attach
 # JSON without a FastAPI `custom_body` parameter (which would consume the HTTP body).
@@ -58,4 +58,10 @@ class PassthroughStandardLoggingPayload(TypedDict, total=False):
     The cost per request to the target endpoint
 
     Optional field, we use this for cost tracking only if it's set.
+    """
+
+    model_alias: ReadOnly[str]
+    """
+    The configured model alias the caller asked for. The upstream received the aliased model;
+    the call is logged and priced under this name.
     """
