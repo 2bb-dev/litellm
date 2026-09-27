@@ -12837,6 +12837,37 @@ def test_anthropic_stream_commits_now_direct_call():
 
 
 @pytest.mark.asyncio
+async def test_anthropic_messages_pre_content_sse_rate_limit_cools_selected_deployment():
+    router = Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": "anthropic/claude-sonnet-4-5", "api_key": "synthetic", "order": 1},
+                "model_info": {"id": "subscription"},
+            },
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": "anthropic/claude-sonnet-4-5", "api_key": "synthetic", "order": 2},
+                "model_info": {"id": "paid-api"},
+            },
+        ],
+        allowed_fails=0,
+        cooldown_time=300,
+    )
+    source = _AnthropicMessagesFakeByteStream([_anthropic_messages_rate_limit_error_chunk()])
+    source._hidden_params["model_id"] = "subscription"
+    fallback = _AnthropicMessagesFallbackByteStream([_anthropic_messages_content_chunk("paid")])
+    try:
+        with patch.object(router, "async_function_with_fallbacks_common_utils", new=AsyncMock(return_value=fallback)):
+            wrapped = await router._aanthropic_messages_streaming_iterator(source, {"model": "primary"})
+            assert [chunk async for chunk in wrapped] == [_anthropic_messages_content_chunk("paid")]
+        key = router.cooldown_cache.get_cooldown_cache_key("subscription")
+        assert router.cooldown_cache.cooldown_store.get_cache(key=key)["cooldown_time"] == 300
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_messages_fallback_merges_fallback_hidden_params():
     """Bugbot regression: after a successful mid-stream fallback, the
     wrapper's _hidden_params must reflect the FALLBACK deployment's own
