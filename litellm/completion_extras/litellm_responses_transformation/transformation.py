@@ -197,6 +197,20 @@ def _as_chat_reasoning_items(
     return cast(list[ChatCompletionReasoningItem], list(reasoning_items))
 
 
+def _offset_annotation(annotation: ChatCompletionAnnotation, offset: int) -> ChatCompletionAnnotation:
+    def shifted(fields: Mapping[str, object]) -> dict[str, object]:
+        return {
+            key: value + offset if key in ("start_index", "end_index") and type(value) is int else value
+            for key, value in fields.items()
+        }
+
+    fields: Final = shifted(annotation)
+    citation: Final = fields.get("url_citation")
+    if isinstance(citation, Mapping):
+        return cast(ChatCompletionAnnotation, {**fields, "url_citation": shifted(citation)})
+    return cast(ChatCompletionAnnotation, fields)
+
+
 def _map_incomplete_reason_to_finish_reason(incomplete_reason: str | None) -> Literal["length", "content_filter"]:
     if incomplete_reason == "content_filter":
         return "content_filter"
@@ -781,7 +795,32 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
             reasoning_content = None
             pending_reasoning_item = None
 
-        return choices
+        if not choices:
+            return choices
+        # Responses output items belong to one generation, not separate Chat choices.
+        content_parts: Final = tuple(choice.message.content for choice in choices if choice.message.content is not None)
+        all_reasoning: Final = _reasoning_items_from_output_items(
+            tuple(item.model_dump() if isinstance(item, BaseModel) else item for item in output_items)
+        )
+        annotations: Final = [
+            _offset_annotation(annotation, sum(len(prior.message.content or "") for prior in choices[:position]))
+            for position, choice in enumerate(choices)
+            for annotation in getattr(choice.message, "annotations", None) or ()
+        ]
+        merged_message: Final = Message(
+            role=choices[0].message.role,
+            content="".join(content_parts) if content_parts else None,
+            tool_calls=[call for choice in choices for call in choice.message.tool_calls or ()] or None,
+            reasoning_content=" ".join(
+                summary["text"] for item in all_reasoning for summary in item["summary"] if summary.get("text")
+            )
+            or None,
+            reasoning_items=_as_chat_reasoning_items(all_reasoning),
+            annotations=annotations or None,
+        )
+        return [
+            Choices(message=merged_message, finish_reason="tool_calls" if accumulated_tool_calls else "stop", index=0)
+        ]
 
     @staticmethod
     def _build_empty_incomplete_choice(

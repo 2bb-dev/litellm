@@ -7405,12 +7405,15 @@ class Router:
         if include_fallback_errors:
             input_kwargs["include_fallback_errors"] = True
 
-        # ORDER-BASED FALLBACKS: prepend higher order levels to the fallback list
-        # Skip for error types that have their own dedicated fallback handlers
+        # ORDER-BASED FALLBACKS: prepend higher order levels to the fallback list.
+        # An invalid request cannot succeed against another deployment and must
+        # not silently spend against a higher-order paid provider.
+        _status_code: Final = getattr(e, "status_code", None)
         _skip_order_fallback: Final = isinstance(
             e,
             (litellm.ContextWindowExceededError, litellm.ContentPolicyViolationError),
-        )
+        ) or (_status_code is not None and _status_code not in (401, 403)
+              and not litellm._should_retry(_status_code))
         _request_team_id: Final[str | None] = (kwargs.get("metadata", {}) or {}).get("user_api_key_team_id")
         # Use wildcard-aware lookup so order-based fallback also works for model
         # groups resolved via pattern routing (e.g. `openai/*` -> `openai/gpt-4.1-mini`).
@@ -13589,6 +13592,28 @@ class Router:
         )
         return registered_model_name
 
+    async def async_callback_pre_routing_hook(
+        self,
+        model: str,
+        request_kwargs: dict[str, object],  # mutable-ok: CustomLogger hooks share the native mutable request
+        messages: list[dict[str, object]] | None = None,  # mutable-ok: native CustomLogger input contract
+        input: str | list[object] | None = None,  # mutable-ok: preserve the existing CustomLogger input contract
+        specific_deployment: bool | None = False,
+    ) -> PreRoutingHookResponse | None:
+        for callback in litellm.callbacks:
+            if not isinstance(callback, CustomLogger):
+                continue
+            response: Final = await callback.async_pre_routing_hook(
+                model=model,
+                request_kwargs=request_kwargs,
+                messages=messages,
+                input=input,
+                specific_deployment=specific_deployment,
+            )
+            if response is not None:
+                return response
+        return None
+
     async def async_pre_routing_hook(
         self,
         model: str,
@@ -13626,6 +13651,27 @@ class Router:
             await self._run_routing_plugins(
                 model=registered_model_name, request_kwargs=request_kwargs, messages=messages
             )
+
+        callback_response: Final = await self.async_callback_pre_routing_hook(
+            model=registered_model_name,
+            request_kwargs=request_kwargs,
+            messages=messages,
+            input=input,
+            specific_deployment=specific_deployment,
+        )
+        if callback_response is not None:
+            self._record_routing_decision(
+                request_kwargs=request_kwargs, routing_decision=callback_response.routing_decision
+            )
+            self._stamp_or_clear_metadata_key(
+                request_kwargs=request_kwargs,
+                key=SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY,
+                value=callback_response.session_affinity_ttl_seconds,
+            )
+            self._stamp_or_clear_metadata_key(
+                request_kwargs=request_kwargs, key=CONSUMED_REQUEST_TAGS_METADATA_KEY, value=None
+            )
+            return callback_response
 
         selected_strategy: Final = self._select_pre_routing_strategy(
             model=registered_model_name, request_kwargs=request_kwargs

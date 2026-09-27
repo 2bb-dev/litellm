@@ -44,7 +44,7 @@ from litellm.router import (
     _is_retriable_anthropic_status,
 )
 from litellm.router_strategy import simple_shuffle
-from litellm.types.router import Deployment, DeploymentTypedDict, LiteLLM_Params, ModelInfo, RetryPolicy
+from litellm.types.router import Deployment, DeploymentTypedDict, LiteLLM_Params, ModelInfo, PreRoutingHookResponse, RetryPolicy
 
 
 def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():
@@ -16428,3 +16428,65 @@ async def test_continuation_affinity_keeps_account_boundary_when_upstream_strips
             assert request["input"] == [{"role": "user", "content": "synthetic readable history"}]
     finally:
         router.reset()
+
+
+class _RegisteredPreRoutingCallback(CustomLogger):
+    def __init__(self, response: PreRoutingHookResponse | None = None, failure: bool = False) -> None:
+        super().__init__()
+        self.response = response
+        self.failure = failure
+
+    async def async_pre_routing_hook(
+        self,
+        model: str,
+        request_kwargs: dict[str, object],
+        messages: list[dict[str, object]] | None = None,
+        input: str | list[object] | None = None,
+        specific_deployment: bool | None = False,
+    ) -> PreRoutingHookResponse | None:
+        if model != "callback-route":
+            return None
+        if self.failure:
+            raise PermissionError("route denied")
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_registered_pre_routing_callback_preserves_native_result_and_clears_on_fallback():
+    from litellm.types.router import PreRoutingHookResponse
+    from litellm.router_utils.pre_call_checks.deployment_affinity_check import (
+        SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY,
+    )
+    from litellm.router import CONSUMED_REQUEST_TAGS_METADATA_KEY
+
+    response: Final = PreRoutingHookResponse(
+        model="selected-tier",
+        messages=[{"role": "user", "content": "unchanged"}],
+        litellm_params={"max_tokens": 17},
+        session_affinity_ttl_seconds=300,
+        routing_decision={"router_model_name": "private-pool", "router_type": "complexity", "tier": "SIMPLE"},
+    )
+    router: Final = Router(model_list=[])
+    kwargs: Final = {"metadata": {CONSUMED_REQUEST_TAGS_METADATA_KEY: "stale"}}
+    with patch.object(  # test-quality-ok: router reads this global
+        litellm, "callbacks",
+        [CustomLogger(), _RegisteredPreRoutingCallback(response), _RegisteredPreRoutingCallback(failure=True)],
+    ):
+        result: Final = await router.async_pre_routing_hook(model="callback-route", request_kwargs=kwargs)
+        assert result is response
+        assert result.messages == [{"role": "user", "content": "unchanged"}]
+        assert result.litellm_params == {"max_tokens": 17}
+        assert kwargs["metadata"]["routing_decision"] == response.routing_decision
+        assert kwargs["metadata"][SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY] == 300
+        assert CONSUMED_REQUEST_TAGS_METADATA_KEY not in kwargs["metadata"]
+        assert await router.async_pre_routing_hook(model="ordinary-route", request_kwargs=kwargs) is None
+        assert "routing_decision" not in kwargs["metadata"]
+        assert SESSION_DEPLOYMENT_AFFINITY_TTL_METADATA_KEY not in kwargs["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_registered_pre_routing_callback_denial_stops_routing():
+    router: Final = Router(model_list=[])
+    with patch.object(litellm, "callbacks", [_RegisteredPreRoutingCallback(failure=True)]):  # test-quality-ok: router reads this global
+        with pytest.raises(PermissionError, match="route denied"):
+            await router.async_pre_routing_hook(model="callback-route", request_kwargs={})
