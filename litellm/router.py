@@ -2871,11 +2871,6 @@ class Router:
                     if e.original_exception is not None:
                         raise e.original_exception from e
                     raise
-                if model_response.custom_llm_provider == "anthropic":
-                    self._cooldown_retriable_anthropic_stream_error(
-                        model_response, e, cast(str, initial_kwargs.get("model"))
-                    )
-
                 from litellm.main import stream_chunk_builder
 
                 complete_response_object: Final = stream_chunk_builder(chunks=model_response.chunks)

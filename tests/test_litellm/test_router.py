@@ -12868,6 +12868,64 @@ async def test_anthropic_messages_pre_content_sse_rate_limit_cools_selected_depl
 
 
 @pytest.mark.asyncio
+async def test_anthropic_chat_pre_content_sse_error_records_one_failure(monkeypatch: pytest.MonkeyPatch):
+    """The chat stream wrapper already reports a pre-content SSE error to the failure callback; the
+    router must not record it a second time, or allowed_fails would be reached at half the rate."""
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router = Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": "anthropic/claude-sonnet-4-5", "api_key": "synthetic",
+                                   "api_base": "https://anthropic.chat.invalid"},
+                "model_info": {"id": deployment_id},
+            }
+            for deployment_id in ("slot-a", "slot-b")
+        ],
+        allowed_fails=1,
+        cooldown_time=300,
+        num_retries=0,
+    )
+    stream = (
+        b'event: message_start\ndata: {"type": "message_start", "message": {"id": "msg_1", "type": "message", '
+        b'"role": "assistant", "content": [], "model": "claude-sonnet-4-5", "stop_reason": null, '
+        b'"usage": {"input_tokens": 1, "output_tokens": 0}}}\n\n'
+        b'event: error\ndata: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}\n\n'
+    )
+    try:
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post("https://anthropic.chat.invalid/v1/messages").mock(
+                return_value=httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream)
+            )
+            with pytest.raises(Exception):
+                response = await router.acompletion(
+                    model="primary", messages=[{"role": "user", "content": "hi"}], max_tokens=10, stream=True
+                )
+                async for _ in response:
+                    pass
+        from litellm.router_utils.cooldown_handlers import _async_get_cooldown_deployments
+        from litellm.router_utils.router_callbacks.track_deployment_metrics import (
+            get_deployment_failures_for_current_minute,
+        )
+
+        def failures() -> int:
+            return sum(
+                get_deployment_failures_for_current_minute(litellm_router_instance=router, deployment_id=deployment_id)
+                for deployment_id in ("slot-a", "slot-b")
+            )
+
+        for _ in range(40):
+            if failures():
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.3)
+        assert failures() == 1
+        assert await _async_get_cooldown_deployments(router, None) == []
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_messages_fallback_merges_fallback_hidden_params():
     """Bugbot regression: after a successful mid-stream fallback, the
     wrapper's _hidden_params must reflect the FALLBACK deployment's own
