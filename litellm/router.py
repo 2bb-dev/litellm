@@ -7436,15 +7436,12 @@ class Router:
         if include_fallback_errors:
             input_kwargs["include_fallback_errors"] = True
 
-        # ORDER-BASED FALLBACKS: prepend higher order levels to the fallback list.
-        # An invalid request cannot succeed against another deployment and must
-        # not silently spend against a higher-order paid provider.
-        _status_code: Final = getattr(e, "status_code", None)
+        # ORDER-BASED FALLBACKS: prepend higher order levels to the fallback list
+        # Skip for error types that have their own dedicated fallback handlers
         _skip_order_fallback: Final = isinstance(
             e,
             (litellm.ContextWindowExceededError, litellm.ContentPolicyViolationError),
-        ) or (_status_code is not None and _status_code not in (401, 403)
-              and not litellm._should_retry(_status_code))
+        )
         _request_team_id: Final[str | None] = (kwargs.get("metadata", {}) or {}).get("user_api_key_team_id")
         # Use wildcard-aware lookup so order-based fallback also works for model
         # groups resolved via pattern routing (e.g. `openai/*` -> `openai/gpt-4.1-mini`).

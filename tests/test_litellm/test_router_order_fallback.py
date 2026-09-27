@@ -7,8 +7,6 @@ when lower order deployments fail.
 """
 
 import json
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Final, Optional
 
 import httpx
@@ -208,53 +206,6 @@ async def test_router_order_fallback_on_failure():
         messages=[{"role": "user", "content": "hi"}],
     )
     assert response._hidden_params["model_id"] == "2"
-
-
-@pytest.mark.asyncio
-async def test_router_order_does_not_fallback_on_invalid_request():
-    seen = []
-
-    class Backend(BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            pass
-
-        def do_POST(self):
-            route = self.path.split("/")[1]
-            seen.append(route)
-            self.rfile.read(int(self.headers["Content-Length"]))
-            self.send_response(400 if route == "subscription" else 200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            if route == "subscription":
-                self.wfile.write(json.dumps({
-                    "type": "error", "error": {"type": "invalid_request_error", "message": "synthetic invalid request"},
-                }).encode())
-            else:
-                self.wfile.write(json.dumps({
-                    "id": "msg_paid", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
-                    "content": [{"type": "text", "text": "paid fallback"}], "stop_reason": "end_turn",
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                }).encode())
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Backend)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    router = Router(model_list=[{
-        "model_name": "test-model",
-        "litellm_params": {"model": "anthropic/claude-opus-5-5", "api_key": "synthetic",
-                           "api_base": f"http://127.0.0.1:{server.server_port}/{route}",
-                           "order": order, "num_retries": 0},
-        "model_info": {"id": route},
-    } for order, route in [(1, "subscription"), (2, "paid-api")]], num_retries=0)
-    try:
-        with pytest.raises(litellm.BadRequestError, match="synthetic invalid request"):
-            await router.acompletion(model="test-model", messages=[{"role": "user", "content": "hi"}], max_tokens=16)
-        assert seen == ["subscription"]
-    finally:
-        router.reset()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
 
 
 @pytest.mark.asyncio
