@@ -5342,6 +5342,41 @@ class TestTypeSafePassthroughRoute:
             assert sent.headers["authorization"] == "Bearer typesafe-test-key"
             assert json.loads(sent.content or b"{}") == (body or {})
 
+    @pytest.mark.parametrize(
+        "sent_model, upstream_model, alias",
+        [
+            ("openorange/jev-router", "jev-1.13.0", "openorange/jev-router"),
+            ("jev-1.13.0", "jev-1.13.0", None),
+        ],
+    )
+    def test_configured_alias_runs_its_typesafe_model_and_is_logged_as_the_alias(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        sent_model: str,
+        upstream_model: str,
+        alias: str | None,
+    ) -> None:
+        from litellm.proxy import proxy_server
+        from litellm.proxy.pass_through_endpoints import pass_through_endpoints
+
+        aliases: Final = {"openorange/jev-router": "jev-1.13.0"}
+        monkeypatch.setitem(proxy_server.general_settings, "typesafe_model_aliases", aliases)
+        success = AsyncMock()
+        monkeypatch.setattr(
+            pass_through_endpoints.pass_through_endpoint_logging, "pass_through_async_success_handler", success
+        )
+        with respx.mock(assert_all_called=True) as upstream:
+            route = upstream.post("https://typesafe.example/base/v1/systemone").mock(
+                return_value=httpx.Response(200, json={"model": "jev-1.13.0", "usage": {"input_tokens": 3}})
+            )
+            response = client.post("/typesafe/v1/systemone", json={"model": sent_model, "state": "x"})
+
+            assert response.status_code == 200
+            assert json.loads(route.calls.last.request.content) == {"model": upstream_model, "state": "x"}
+        payload: Final = success.call_args.kwargs["logging_obj"].model_call_details["passthrough_logging_payload"]
+        assert payload.get("model_alias") == alias
+
     @pytest.mark.asyncio
     async def test_forwards_target_auth_headers_provider_and_query(self, monkeypatch):
         monkeypatch.setenv("TYPESAFE_API_KEY", "typesafe-test-key")
@@ -5378,6 +5413,7 @@ class TestTypeSafePassthroughRoute:
             },
             custom_llm_provider="typesafe",
             is_streaming_request=False,
+            model_aliases={},
         )
 
 

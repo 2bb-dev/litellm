@@ -926,6 +926,7 @@ async def pass_through_request(
     custom_llm_provider: str | None = None,
     guardrails_config: dict | None = None,
     timeout: float | None = None,
+    model_aliases: Mapping[str, str] | None = None,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -946,6 +947,7 @@ async def pass_through_request(
         guardrails_config: Optional field - guardrails configuration for passthrough endpoint
         timeout: Optional per-endpoint timeout in seconds. Falls back to
             general_settings.pass_through_request_timeout, then 600s.
+        model_aliases: Optional map of a body `model` the caller may send to the upstream model sent instead
     """
     from litellm.exceptions import ModifyResponseException
     from litellm.litellm_core_utils.litellm_logging import Logging
@@ -1008,6 +1010,12 @@ async def pass_through_request(
             _parsed_body = {}
         else:
             _parsed_body = await _read_request_body(request)
+        requested_model: Final = _parsed_body.get("model") if isinstance(_parsed_body, dict) else None
+        model_alias: Final = (
+            requested_model if isinstance(requested_model, str) and requested_model in (model_aliases or {}) else None
+        )
+        if model_alias is not None and model_aliases is not None and _parsed_body is not None:
+            _parsed_body = {**_parsed_body, "model": model_aliases[model_alias]}  # rebind-ok: later steps send it
         verbose_proxy_logger.debug(
             "Pass through endpoint sending request to \nURL %s\nheaders: %s\nbody: %s\n",
             url,
@@ -1080,6 +1088,7 @@ async def pass_through_request(
             request_body=_parsed_body,
             request_method=getattr(request, "method", None),
             cost_per_request=cost_per_request,
+            **({"model_alias": model_alias} if model_alias is not None else {}),
         )
         kwargs = HttpPassThroughEndpointHelpers._init_kwargs_for_pass_through_endpoint(
             user_api_key_dict=user_api_key_dict,
@@ -1857,6 +1866,7 @@ def create_pass_through_route(
     guardrails: dict[str, object] | None = None,
     config_file_path: str | None = None,
     timeout: float | None = None,
+    model_aliases: Mapping[str, str] | None = None,
 ):
     # check if target is an adapter.py or a url
     from litellm._uuid import uuid
@@ -1996,6 +2006,7 @@ def create_pass_through_route(
                         custom_llm_provider=custom_llm_provider,
                         guardrails_config=cast(dict | None, param_guardrails),
                         timeout=cast(float | None, param_timeout),
+                        model_aliases=model_aliases,
                     )
                 finally:
                     if hasattr(request.state, LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY):
