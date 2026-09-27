@@ -3,7 +3,7 @@ Unified /v1/messages endpoint - (Anthropic Spec)
 """
 
 from collections.abc import Mapping
-from typing import Any, Dict, Final, Optional
+from typing import Any, Final
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -61,7 +61,7 @@ _DISABLE_CACHE_CONTROL_MARKER = "_litellm_disable_cache_control"
 
 
 def _mark_explicit_cache_control_opt_out(
-    data: Dict[str, Any], request_headers: Optional[Mapping[str, str]] = None
+    data: dict[str, Any], request_headers: Mapping[str, str] | None = None
 ) -> None:
     data.pop(_DISABLE_CACHE_CONTROL_MARKER, None)
     if "cache_control" in data and data["cache_control"] is None:
