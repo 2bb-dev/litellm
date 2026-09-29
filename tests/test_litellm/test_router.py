@@ -12868,6 +12868,56 @@ async def test_anthropic_messages_pre_content_sse_rate_limit_cools_selected_depl
 
 
 @pytest.mark.asyncio
+async def test_native_anthropic_messages_pre_content_429_cools_selected_deployment(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router = Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {
+                    "model": "anthropic/claude-sonnet-4-5",
+                    "api_key": "synthetic",
+                    "api_base": f"https://{deployment_id}.anthropic.invalid",
+                    "order": order,
+                },
+                "model_info": {"id": deployment_id},
+            }
+            for order, deployment_id in enumerate(("subscription", "paid-api"), start=1)
+        ],
+        allowed_fails=0,
+        cooldown_time=300,
+        num_retries=0,
+    )
+    fallback_stream = (
+        _anthropic_messages_message_start_chunk()
+        + _anthropic_messages_content_chunk("fallback answer")
+        + b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
+    )
+    try:
+        with respx.mock(assert_all_called=False) as mock:
+            primary_route = mock.post("https://subscription.anthropic.invalid/v1/messages").mock(
+                return_value=httpx.Response(
+                    200, headers={"content-type": "text/event-stream"},
+                    content=_anthropic_messages_rate_limit_error_chunk(),
+                )
+            )
+            fallback_route = mock.post("https://paid-api.anthropic.invalid/v1/messages").mock(
+                return_value=httpx.Response(200, headers={"content-type": "text/event-stream"}, content=fallback_stream)
+            )
+            response = await router.aanthropic_messages(
+                model="primary", messages=[{"role": "user", "content": "hi"}], max_tokens=10, stream=True
+            )
+            chunks = [chunk async for chunk in response]
+            assert primary_route.call_count == 1
+            assert fallback_route.call_count == 1
+        assert b"fallback answer" in b"".join(chunks)
+        key = router.cooldown_cache.get_cooldown_cache_key("subscription")
+        assert router.cooldown_cache.cooldown_store.get_cache(key=key)["cooldown_time"] == 300
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_chat_pre_content_sse_error_records_one_failure(monkeypatch: pytest.MonkeyPatch):
     """The chat stream wrapper already reports a pre-content SSE error to the failure callback; the
     router must not record it a second time, or allowed_fails would be reached at half the rate."""
