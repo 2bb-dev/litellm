@@ -24,7 +24,6 @@ export interface PreparedCall {
   context: Context;
   options: SimpleStreamOptions;
   stream: boolean;
-  includeUsage: boolean;
 }
 
 export interface WireEvent {

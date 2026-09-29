@@ -27,68 +27,50 @@ const stub = createServer(async (req, res) => {
   receivedBetas.push(req.headers["anthropic-beta"] ?? "");
   const toolName = body.tools?.[0]?.name;
   res.writeHead(200, { "content-type": "text/event-stream" });
-  if (new URL(req.url, "http://stub.invalid").pathname === "/v1/messages") {
-    for (const ev of [
-      {
-        type: "message_start",
-        message: {
-          id: "msg_stub",
-          type: "message",
-          role: "assistant",
-          model: body.model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 10, output_tokens: 0 },
-        },
+  assert.equal(
+    new URL(req.url, "http://stub.invalid").pathname,
+    "/v1/messages",
+  );
+  for (const ev of [
+    {
+      type: "message_start",
+      message: {
+        id: "msg_stub",
+        type: "message",
+        role: "assistant",
+        model: body.model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 10, output_tokens: 0 },
       },
-      {
-        type: "content_block_start",
-        index: 0,
-        content_block: toolName
-          ? { type: "tool_use", id: "tool_fixture", name: toolName, input: {} }
-          : { type: "text", text: "" },
+    },
+    {
+      type: "content_block_start",
+      index: 0,
+      content_block: toolName
+        ? { type: "tool_use", id: "tool_fixture", name: toolName, input: {} }
+        : { type: "text", text: "" },
+    },
+    {
+      type: "content_block_delta",
+      index: 0,
+      delta: toolName
+        ? { type: "input_json_delta", partial_json: '{"city":"Vienna"}' }
+        : { type: "text_delta", text: "local routing works" },
+    },
+    { type: "content_block_stop", index: 0 },
+    {
+      type: "message_delta",
+      delta: {
+        stop_reason: toolName ? "tool_use" : "end_turn",
+        stop_sequence: null,
       },
-      {
-        type: "content_block_delta",
-        index: 0,
-        delta: toolName
-          ? { type: "input_json_delta", partial_json: '{"city":"Vienna"}' }
-          : { type: "text_delta", text: "local routing works" },
-      },
-      { type: "content_block_stop", index: 0 },
-      {
-        type: "message_delta",
-        delta: {
-          stop_reason: toolName ? "tool_use" : "end_turn",
-          stop_sequence: null,
-        },
-        usage: { output_tokens: 3 },
-      },
-      { type: "message_stop" },
-    ])
-      res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
-  } else {
-    for (const ev of [
-      {
-        choices: [
-          {
-            index: 0,
-            delta: { role: "assistant", content: "local routing works" },
-            finish_reason: null,
-          },
-        ],
-      },
-      {
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
-      },
-    ])
-      res.write(
-        `data: ${JSON.stringify({ id: "chat_stub", object: "chat.completion.chunk", model: body.model, created: 0, ...ev })}\n\n`,
-      );
-    res.write("data: [DONE]\n\n");
-  }
+      usage: { output_tokens: 3 },
+    },
+    { type: "message_stop" },
+  ])
+    res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
   res.end();
 });
 const stubUrl = await listen(stub);
@@ -103,13 +85,6 @@ const metadata = (api) => ({
 const runtime = loadRuntime(
   {
     models: [
-      {
-        alias: "chat",
-        provider: "stub-chat",
-        model: "stub",
-        baseUrl: stubUrl + "/v1",
-        metadata: metadata("openai-completions"),
-      },
       {
         alias: "claude-haiku-4-5",
         provider: "anthropic",
@@ -128,11 +103,7 @@ const runtime = loadRuntime(
   {
     authContext: {
       env: async (name) =>
-        name === "ANTHROPIC_API_KEY"
-          ? "sk-ant-oat-fixture"
-          : name === "STUB_CHAT_API_KEY"
-            ? "upstream-fixture-key"
-            : undefined,
+        name === "ANTHROPIC_API_KEY" ? "sk-ant-oat-fixture" : undefined,
       fileExists: async () => false,
     },
   },
@@ -151,14 +122,14 @@ from litellm.anthropic_interface import acreate
 async def main():
   base=os.environ['CHECK_BASE']; key=os.environ['CHECK_KEY']
   for stream in (False,True):
-    r=await litellm.acompletion(model='litellm_proxy/chat',api_base=base+'/v1',api_key=key,messages=[{'role':'user','content':'hello'}],stream=stream,**({'stream_options':{'include_usage':True}} if stream else {}))
+    r=await litellm.acompletion(model='anthropic/claude-haiku-4-5',api_base=base,api_key=key,max_tokens=128,messages=[{'role':'user','content':'hello'}],stream=stream,**({'stream_options':{'include_usage':True}} if stream else {}))
     if stream:
       chunks=[x async for x in r]
       assert ''.join(x.choices[0].delta.content or '' for x in chunks if x.choices)=='local routing works'
     else:
       assert r.choices[0].message.content=='local routing works'
       assert r.usage.total_tokens==13
-    print('LiteLLM chat stream='+str(stream)+' PASS')
+    print('LiteLLM Chat client via native Messages stream='+str(stream)+' PASS')
   for stream in (False,True):
     r=await acreate(model='anthropic/claude-haiku-4-5',api_base=base,api_key=key,max_tokens=128,messages=[{'role':'user','content':'hello'}],stream=stream)
     if stream:
@@ -174,7 +145,7 @@ async def main():
   schema={'type':'object','properties':{'city':{'type':'string'}}}
   messages=[{'role':'user','content':'pi itself is user text'}]
   for stream in (False,True):
-    r=await litellm.acompletion(model='litellm_proxy/claude-haiku-4-5',api_base=base+'/v1',api_key=key,messages=[{'role':'system','content':'pi itself and pi packages'},*messages],tools=[{'type':'function','function':{'name':'lookup_weather','parameters':schema}}],stream=stream)
+    r=await litellm.acompletion(model='anthropic/claude-haiku-4-5',api_base=base,api_key=key,max_tokens=128,messages=[{'role':'system','content':'pi itself and pi packages'},*messages],tools=[{'type':'function','function':{'name':'lookup_weather','parameters':schema}}],stream=stream)
     if stream:
       chunks=[x async for x in r]
       calls=[c for x in chunks if x.choices for c in (x.choices[0].delta.tool_calls or [])]
@@ -184,7 +155,7 @@ async def main():
       call=r.choices[0].message.tool_calls[0]
       assert call.function.name=='lookup_weather',r
       assert json.loads(call.function.arguments)=={'city':'Vienna'},r
-    print('LiteLLM OAuth tools Chat stream='+str(stream)+' PASS')
+    print('LiteLLM OAuth tools Chat client via native Messages stream='+str(stream)+' PASS')
     r=await acreate(model='anthropic/claude-haiku-4-5',api_base=base,api_key=key,max_tokens=128,messages=messages,system='pi itself and pi packages',tools=[{'name':'lookup_weather','input_schema':schema}],tool_choice={'type':'tool','name':'lookup_weather'},stream=stream)
     if stream:
       chunks=[x async for x in r]

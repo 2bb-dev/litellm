@@ -60,6 +60,25 @@ test("prepares native text without accepting lossy cross-protocol routing", asyn
   assert.equal(rejected.ok, false);
 });
 
+test("accepts the Anthropic custom tool type that LiteLLM sends for Chat clients", () => {
+  const tool = {
+    name: "lookup_weather",
+    input_schema: { type: "object", properties: { city: { type: "string" } } },
+  };
+  assert.ok(prepareMessages({ ...request, tools: [tool] }, model).ok);
+  assert.ok(
+    prepareMessages({ ...request, tools: [{ ...tool, type: "custom" }] }, model)
+      .ok,
+  );
+  assert.equal(
+    prepareMessages(
+      { ...request, tools: [{ ...tool, type: "web_search_20250305" }] },
+      model,
+    ).ok,
+    false,
+  );
+});
+
 test("rejects tool additions that cannot be mapped to a stable declaration", () => {
   const addition = {
     role: "system",

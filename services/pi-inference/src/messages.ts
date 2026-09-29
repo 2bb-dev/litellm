@@ -123,6 +123,7 @@ const requestSchema = z.strictObject({
   tools: z
     .array(
       z.strictObject({
+        type: z.literal("custom").optional(),
         name,
         description: text.optional(),
         input_schema: z
@@ -591,7 +592,6 @@ export function prepareMessages(
         onPayload: (payload) => nativePayload(payload, input, context),
       },
       stream: input.stream ?? false,
-      includeUsage: true,
     },
   };
 }
