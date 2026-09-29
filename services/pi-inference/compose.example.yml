@@ -1,0 +1,68 @@
+name: pi-inference-example
+
+services:
+  pi-inference:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pi-inference:local
+    user: "1000:1000"
+    read_only: true
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    environment:
+      PI_INFERENCE_API_KEY: ${PI_INFERENCE_API_KEY:?Set a distinct internal backend key}
+      PI_INFERENCE_CONFIG: /config/models.json
+      PI_INFERENCE_AUTH_FILE: ${PI_INFERENCE_AUTH_FILE:-}
+      PI_INFERENCE_HOST: 0.0.0.0
+      PI_INFERENCE_SLOT_ID: slot1
+      PI_INFERENCE_PORT: "4001"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set an Anthropic API key for this example}
+    volumes:
+      - type: bind
+        source: ./config.example.json
+        target: /config/models.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - pi-inference-auth-slot1:/data
+    networks: [inference]
+
+  litellm:
+    image: ${LITELLM_IMAGE:?Set the separately built OSS fork image}
+    command:
+      [
+        "--config",
+        "/config/litellm.yaml",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "4000",
+      ]
+    ports:
+      - "127.0.0.1:4000:4000"
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?Set the front LiteLLM master key}
+      PI_INFERENCE_API_KEY: ${PI_INFERENCE_API_KEY:?Set a distinct internal backend key}
+    volumes:
+      - type: bind
+        source: ./litellm.example.yaml
+        target: /config/litellm.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      pi-inference:
+        condition: service_healthy
+    networks: [inference]
+
+networks:
+  inference:
+    driver: bridge
+
+volumes:
+  pi-inference-auth-slot1:

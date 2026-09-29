@@ -1,0 +1,68 @@
+model_list:
+  - model_name: anthropic/claude-haiku-4-5/pi
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_base: http://pi-inference:4001
+      api_key: os.environ/PI_INFERENCE_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+      cache_read_input_token_cost: 0.0000001
+      cache_creation_input_token_cost: 0.00000125
+    model_info:
+      pi_api: anthropic-messages
+      mode: chat
+      custom_pricing: true
+      max_input_tokens: 200000
+      max_output_tokens: 64000
+      pricing_label: "Example Anthropic API USD/token rates; verify your contract"
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+      cache_read_input_token_cost: 0.0000001
+      cache_creation_input_token_cost: 0.00000125
+
+  - model_name: pi/claude-chat
+    litellm_params:
+      model: litellm_proxy/claude-haiku-4-5
+      api_base: http://pi-inference:4001/v1
+      api_key: os.environ/PI_INFERENCE_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+      cache_read_input_token_cost: 0.0000001
+      cache_creation_input_token_cost: 0.00000125
+    model_info:
+      pi_api: openai-completions
+      mode: chat
+      custom_pricing: true
+      max_input_tokens: 200000
+      max_output_tokens: 64000
+      pricing_label: "Example Anthropic API USD/token rates; verify your contract"
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+      cache_read_input_token_cost: 0.0000001
+      cache_creation_input_token_cost: 0.00000125
+
+  - model_name: anthropic/claude-opus-5-5/pi
+    litellm_params:
+      model: anthropic/claude-opus-5-5
+      api_base: http://pi-inference:4001
+      api_key: os.environ/PI_INFERENCE_API_KEY
+      input_cost_per_token: 0.000004
+      output_cost_per_token: 0.00002
+      cache_read_input_token_cost: 0.0000002
+      cache_creation_input_token_cost: 0.000005
+      cache_creation_input_token_cost_above_1hr: 0.000008
+    model_info:
+      pi_api: anthropic-messages
+      mode: chat
+      custom_pricing: true
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      pricing_label: "Example Anthropic API USD/token rates; verify your contract"
+      input_cost_per_token: 0.000004
+      output_cost_per_token: 0.00002
+      cache_read_input_token_cost: 0.0000002
+      cache_creation_input_token_cost: 0.000005
+      cache_creation_input_token_cost_above_1hr: 0.000008
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
