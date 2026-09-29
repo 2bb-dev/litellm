@@ -33,10 +33,23 @@ _IDENTITY_FIELDS = frozenset(
     "openclaw_conversation_id openclaw_parent_session_id openclaw_cron_id openclaw_cron_run_id "
     "openclaw_source_session_id openclaw_target_session_id openclaw_child_session_id "
     "openclaw_subagent_session_id openclaw_conversation_topic_id openclaw_conversation_message_id "
-    "openclaw_mattermost_user_id openorange_code_session_id openorange_code_project_id".split()
+    "openclaw_mattermost_user_id openorange_code_session_id openorange_code_project_id "
+    "openorange_pool openorange_pool_member openorange_pool_request_call_id".split()
 )
 _ENUM_FIELDS = {
     "status": {"success", "failure"},
+    "openorange_pool_tier": {"SIMPLE", "MEDIUM", "COMPLEX", "REASONING"},
+    "openorange_pool_cause": {
+        "classified",
+        "pinned",
+        "escalated",
+        "classifier_failed",
+        "local_rule",
+        "failover",
+        "default",
+        "other",
+    },
+    "openorange_pool_component": {"completion", "classifier"},
     "openclaw_actor_type": {"human", "bot", "agent", "subagent", "system", "user"},
     "openclaw_execution_type": {"direct", "subagent", "sub_agent", "heartbeat", "cron", "bot", "human"},
     "openorange_request_kind": {

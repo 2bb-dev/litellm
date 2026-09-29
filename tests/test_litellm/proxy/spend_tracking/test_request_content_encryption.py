@@ -216,6 +216,26 @@ def test_metadata_allowlist_drops_nested_content_and_arbitrary_numeric_keys():
     assert safe["status"] == "failure"
 
 
+def test_routing_pool_tags_stay_plaintext_only_as_identifiers_and_known_values():
+    tags = {
+        "openorange_pool": "team/auto-pool",
+        "openorange_pool_member": "zai/glm-5.3-flash",
+        "openorange_pool_request_call_id": "call-1",
+        "openorange_pool_tier": "COMPLEX",
+        "openorange_pool_cause": "classified",
+        "openorange_pool_component": "classifier",
+    }
+    assert safe_metadata({**tags, "spend_logs_metadata": tags}) == {**tags, "spend_logs_metadata": tags}
+    forged = {
+        "openorange_pool": CANARY,
+        "openorange_pool_member": {"name": "zai/glm-5.3"},
+        "openorange_pool_tier": "ULTRA",
+        "openorange_pool_cause": CANARY,
+        "openorange_pool_component": "completion ",
+    }
+    assert safe_metadata({"spend_logs_metadata": forged}) == {"spend_logs_metadata": {}}
+
+
 def test_usage_allowlist_preserves_only_billing_modality_facts() -> None:
     usage = {
         "prompt_tokens_details": {

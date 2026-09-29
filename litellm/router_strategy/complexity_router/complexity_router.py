@@ -1249,7 +1249,7 @@ class ComplexityRouter(CustomLogger):
             jev_client
             if jev_client is not None
             else self._build_jev_client(jev_config)
-            if self.config.classifier_type == "jev" and jev_config is not None
+            if self.config.classifier_type == "jev" and jev_config is not None and not jev_config.runtime_client
             else None
         )
 

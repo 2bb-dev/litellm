@@ -1517,6 +1517,146 @@ def test_multiple_tool_calls_in_single_choice():
     print("✓ Multiple tool calls are correctly grouped in a single choice")
 
 
+@pytest.mark.parametrize("content", [None, "", "Checking the ticket."])
+def test_chat_tool_response_survives_responses_roundtrip(content: str | None) -> None:
+    from litellm.responses.litellm_completion_transformation.transformation import LiteLLMCompletionResponsesConfig
+
+    handler = LiteLLMResponsesTransformationHandler()
+    request = {
+        "tools": [{"type": "function", "name": "lookup_status", "parameters": {"type": "object"}}],
+        "tool_choice": {"type": "function", "name": "lookup_status"},
+        "reasoning": {"effort": "none"},
+        "max_output_tokens": 128,
+    }
+    provider_request = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model="deepseek/deepseek-flash",
+        input="Check T1",
+        responses_api_request=request,
+        custom_llm_provider="deepseek",
+    )
+    assert provider_request["tool_choice"] == {"type": "function", "function": {"name": "lookup_status"}}
+    assert provider_request["reasoning_effort"] == "none"
+    response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        request_input="Check T1",
+        responses_api_request=request,
+        chat_completion_response={
+            "id": "synthetic-tool",
+            "model": "deepseek-flash",
+            "created": 0,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": [
+                            {
+                                "id": "call_ticket",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup_status",
+                                    "arguments": '{"ticket_id":"T1"}',
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 304, "completion_tokens": 36, "total_tokens": 340},
+        },
+    )
+    result = handler.transform_response(
+        model="pool",
+        raw_response=response,
+        model_response=litellm.ModelResponse(),
+        logging_obj=Mock(),
+        request_data={},
+        messages=[],
+        optional_params={},
+        litellm_params={},
+        encoding=Mock(),
+    )
+    assert len(result.choices) == 1
+    choice = result.choices[0]
+    assert choice.index == 0 and choice.finish_reason == "tool_calls"
+    assert choice.message.content == content
+    assert choice.message.tool_calls[0].id == "call_ticket"
+    assert choice.message.tool_calls[0].function.name == "lookup_status"
+    assert choice.message.tool_calls[0].function.arguments == '{"ticket_id":"T1"}'
+    followup, _ = handler.convert_chat_completion_messages_to_responses_api(
+        [
+            choice.message.model_dump(exclude_none=True),
+            {"role": "tool", "tool_call_id": "call_ticket", "content": "complete"},
+        ]
+    )
+    assert any(item.get("type") == "function_call" and item.get("call_id") == "call_ticket" for item in followup)
+    assert followup[-1]["type"] == "function_call_output"
+    assert followup[-1]["call_id"] == "call_ticket"
+    assert result.usage.total_tokens == 340
+
+
+@pytest.mark.parametrize("with_tool", [False, True])
+def test_one_responses_generation_retains_ordered_text_reasoning_and_annotations(with_tool: bool) -> None:
+    from openai.types.responses import ResponseOutputMessage, ResponseReasoningItem
+
+    handler = LiteLLMResponsesTransformationHandler()
+    items = [
+        ResponseReasoningItem(
+            id="rs_first",
+            type="reasoning",
+            summary=[{"type": "summary_text", "text": "First"}],
+            encrypted_content="opaque-first",
+        ),
+        ResponseOutputMessage(
+            id="msg_first",
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[{"type": "output_text", "text": "Hello ", "annotations": []}],
+        ),
+        {
+            "id": "rs_second",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Second"}],
+            "encrypted_content": "opaque-second",
+        },
+        {
+            "id": "msg_second",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "world",
+                    "annotations": [
+                        {
+                            "type": "url_citation",
+                            "url": "https://example.com",
+                            "title": "Source",
+                            "start_index": 0,
+                            "end_index": 5,
+                        }
+                    ],
+                }
+            ],
+        },
+    ]
+    if with_tool:
+        items.append({"type": "function_call", "call_id": "call_ticket", "name": "lookup_status", "arguments": "{}"})
+    choices = handler._convert_response_output_to_choices(items, handler._handle_raw_dict_response_item)
+    assert len(choices) == 1
+    assert choices[0].index == 0
+    assert choices[0].finish_reason == ("tool_calls" if with_tool else "stop")
+    message = choices[0].message
+    assert message.content == "Hello world"
+    assert message.reasoning_content == "First Second"
+    assert [item["id"] for item in message.reasoning_items] == ["rs_first", "rs_second"]
+    assert [item["encrypted_content"] for item in message.reasoning_items] == ["opaque-first", "opaque-second"]
+    assert message.annotations[0]["start_index"] == 6
+    assert message.annotations[0]["end_index"] == 11
+
+
 def test_map_reasoning_effort_adds_summary_detailed(monkeypatch):
     """
     Test that _map_reasoning_effort behavior with reasoning_auto_summary flag.

@@ -147,6 +147,36 @@ def test_actual_proxy_and_usage_router_callbacks_fit_the_protected_profile(prote
     assert protected_profile_failure() is None
 
 
+def test_a_pinning_complexity_router_keeps_the_protected_profile_ready(protected_runtime, monkeypatch):
+    from litellm.proxy import proxy_server
+    from litellm.router_utils.pre_call_checks.deployment_affinity_check import DeploymentAffinityCheck
+
+    monkeypatch.setenv("LITELLM_COLLECTOR_ENABLED", "false")
+    monkeypatch.setattr(proxy_server, "spend_event_producer", None)
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    proxy_server.cost_tracking()
+    tiers = {"SIMPLE": "test", "MEDIUM": "test", "COMPLEX": "test", "REASONING": "test"}
+    router = litellm.Router(
+        model_list=[
+            {"model_name": "test", "litellm_params": {"model": "openai/test-model", "api_key": "synthetic"}},
+            {
+                "model_name": "pool",
+                "litellm_params": {
+                    "model": "auto_router/complexity_router",
+                    "complexity_router_default_model": "test",
+                    "complexity_router_config": {"tiers": tiers, "session_affinity": True, "deployment_affinity": True},
+                },
+            },
+        ],
+        routing_strategy="usage-based-routing",
+    )
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    proxy_server.proxy_logging_obj._init_litellm_callbacks(llm_router=router)
+    assert any(isinstance(callback, DeploymentAffinityCheck) for callback in litellm.callbacks)
+    assert protected_profile_failure() is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "module_name,class_name",

@@ -52,6 +52,7 @@ _APPROVED_CALLBACKS = frozenset(
         "litellm.router_strategy.lowest_cost.LowestCostLoggingHandler",
         "litellm.router_strategy.least_busy.LeastBusyLoggingHandler",
         "litellm.router_utils.pre_call_checks.encrypted_content_affinity_check.EncryptedContentAffinityCheck",
+        "litellm.router_utils.pre_call_checks.deployment_affinity_check.DeploymentAffinityCheck",
     }
 )
 _ROUTER_METHODS = frozenset(
