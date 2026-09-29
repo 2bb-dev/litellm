@@ -12837,6 +12837,145 @@ def test_anthropic_stream_commits_now_direct_call():
 
 
 @pytest.mark.asyncio
+async def test_anthropic_messages_pre_content_sse_rate_limit_cools_selected_deployment():
+    router = Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": "anthropic/claude-sonnet-4-5", "api_key": "synthetic", "order": 1},
+                "model_info": {"id": "subscription"},
+            },
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": "anthropic/claude-sonnet-4-5", "api_key": "synthetic", "order": 2},
+                "model_info": {"id": "paid-api"},
+            },
+        ],
+        allowed_fails=0,
+        cooldown_time=300,
+    )
+    source = _AnthropicMessagesFakeByteStream([_anthropic_messages_rate_limit_error_chunk()])
+    source._hidden_params["model_id"] = "subscription"
+    fallback = _AnthropicMessagesFallbackByteStream([_anthropic_messages_content_chunk("paid")])
+    try:
+        with patch.object(router, "async_function_with_fallbacks_common_utils", new=AsyncMock(return_value=fallback)):
+            wrapped = await router._aanthropic_messages_streaming_iterator(source, {"model": "primary"})
+            assert [chunk async for chunk in wrapped] == [_anthropic_messages_content_chunk("paid")]
+        key = router.cooldown_cache.get_cooldown_cache_key("subscription")
+        assert router.cooldown_cache.cooldown_store.get_cache(key=key)["cooldown_time"] == 300
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+async def test_native_anthropic_messages_pre_content_429_cools_selected_deployment(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router = Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {
+                    "model": "anthropic/claude-sonnet-4-5",
+                    "api_key": "synthetic",
+                    "api_base": f"https://{deployment_id}.anthropic.invalid",
+                    "order": order,
+                },
+                "model_info": {"id": deployment_id},
+            }
+            for order, deployment_id in enumerate(("subscription", "paid-api"), start=1)
+        ],
+        allowed_fails=0,
+        cooldown_time=300,
+        num_retries=0,
+    )
+    fallback_stream = (
+        _anthropic_messages_message_start_chunk()
+        + _anthropic_messages_content_chunk("fallback answer")
+        + b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
+    )
+    try:
+        with respx.mock(assert_all_called=False) as mock:
+            primary_route = mock.post("https://subscription.anthropic.invalid/v1/messages").mock(
+                return_value=httpx.Response(
+                    200, headers={"content-type": "text/event-stream"},
+                    content=_anthropic_messages_rate_limit_error_chunk(),
+                )
+            )
+            fallback_route = mock.post("https://paid-api.anthropic.invalid/v1/messages").mock(
+                return_value=httpx.Response(200, headers={"content-type": "text/event-stream"}, content=fallback_stream)
+            )
+            response = await router.aanthropic_messages(
+                model="primary", messages=[{"role": "user", "content": "hi"}], max_tokens=10, stream=True
+            )
+            chunks = [chunk async for chunk in response]
+            assert primary_route.call_count == 1
+            assert fallback_route.call_count == 1
+        assert b"fallback answer" in b"".join(chunks)
+        key = router.cooldown_cache.get_cooldown_cache_key("subscription")
+        assert router.cooldown_cache.cooldown_store.get_cache(key=key)["cooldown_time"] == 300
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_pre_content_sse_error_records_one_failure(monkeypatch: pytest.MonkeyPatch):
+    """The chat stream wrapper already reports a pre-content SSE error to the failure callback; the
+    router must not record it a second time, or allowed_fails would be reached at half the rate."""
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router = Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": "anthropic/claude-sonnet-4-5", "api_key": "synthetic",
+                                   "api_base": "https://anthropic.chat.invalid"},
+                "model_info": {"id": deployment_id},
+            }
+            for deployment_id in ("slot-a", "slot-b")
+        ],
+        allowed_fails=1,
+        cooldown_time=300,
+        num_retries=0,
+    )
+    stream = (
+        b'event: message_start\ndata: {"type": "message_start", "message": {"id": "msg_1", "type": "message", '
+        b'"role": "assistant", "content": [], "model": "claude-sonnet-4-5", "stop_reason": null, '
+        b'"usage": {"input_tokens": 1, "output_tokens": 0}}}\n\n'
+        b'event: error\ndata: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}\n\n'
+    )
+    try:
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post("https://anthropic.chat.invalid/v1/messages").mock(
+                return_value=httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream)
+            )
+            with pytest.raises(Exception):
+                response = await router.acompletion(
+                    model="primary", messages=[{"role": "user", "content": "hi"}], max_tokens=10, stream=True
+                )
+                async for _ in response:
+                    pass
+        from litellm.router_utils.cooldown_handlers import _async_get_cooldown_deployments
+        from litellm.router_utils.router_callbacks.track_deployment_metrics import (
+            get_deployment_failures_for_current_minute,
+        )
+
+        def failures() -> int:
+            return sum(
+                get_deployment_failures_for_current_minute(litellm_router_instance=router, deployment_id=deployment_id)
+                for deployment_id in ("slot-a", "slot-b")
+            )
+
+        for _ in range(40):
+            if failures():
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.3)
+        assert failures() == 1
+        assert await _async_get_cooldown_deployments(router, None) == []
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_messages_fallback_merges_fallback_hidden_params():
     """Bugbot regression: after a successful mid-stream fallback, the
     wrapper's _hidden_params must reflect the FALLBACK deployment's own

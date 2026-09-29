@@ -3072,7 +3072,7 @@ def test_anthropic_fast_multiplier_only_on_models_with_fast_mode(_local_model_co
 
 @pytest.mark.parametrize(
     "model",
-    ["claude-sonnet-4-6", "claude-mythos-5", "claude-mythos-preview"],
+    ["claude-sonnet-4-6", "claude-mythos-5", "claude-mythos-preview", "claude-opus-5-5", "claude-sonnet-5-5"],
 )
 def test_anthropic_us_data_residency_uplift_on_claude_4_6_and_later_models(
     _local_model_cost_map, monkeypatch, model

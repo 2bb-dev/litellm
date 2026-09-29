@@ -2774,6 +2774,34 @@ class Router:
             "additional_headers": {**item_headers, **fallback_headers},
         }
 
+    def _cooldown_retriable_anthropic_stream_error(self, response: object, error: Exception, model_group: str) -> None:
+        """Record a pre-content SSE provider failure that bypassed the normal failure callback."""
+        provider_error: Final = getattr(error, "original_exception", None) or error
+        status_code: Final = getattr(provider_error, "status_code", None)
+        if not isinstance(status_code, int) or not _is_retriable_anthropic_status(status_code):
+            return
+        model_id: Final = (getattr(response, "_hidden_params", None) or {}).get("model_id")
+        if not isinstance(model_id, str):
+            return
+        deployment: Final = next(
+            (row for row in self.model_list if (row.get("model_info") or {}).get("id") == model_id), None
+        )
+        if deployment is None:
+            return
+        self.deployment_callback_on_failure(
+            kwargs={
+                "exception": provider_error,
+                "litellm_params": {
+                    **deployment["litellm_params"],
+                    "model_info": deployment["model_info"],
+                    "litellm_metadata": {"model_group": model_group},
+                },
+            },
+            completion_response=None,
+            start_time=None,
+            end_time=None,
+        )
+
     async def _acompletion_streaming_iterator(
         self,
         model_response: CustomStreamWrapper,
@@ -2843,7 +2871,6 @@ class Router:
                     if e.original_exception is not None:
                         raise e.original_exception from e
                     raise
-
                 from litellm.main import stream_chunk_builder
 
                 complete_response_object: Final = stream_chunk_builder(chunks=model_response.chunks)
@@ -5583,16 +5610,14 @@ class Router:
                     if retriable_pending_error:
                         assert error_event is not None  # guard-ok: retriable_pending_error implies this
                         _error_type, message, status_code = error_event
+                        provider_error = litellm.exceptions.APIError(  # rebind-ok: one exception per SSE error event
+                            status_code=status_code, message=message, llm_provider="anthropic", model=model
+                        )
                         raise MidStreamFallbackError(
                             message=message,
                             model=model,
                             llm_provider="anthropic",
-                            original_exception=litellm.exceptions.APIError(
-                                status_code=status_code,
-                                message=message,
-                                llm_provider="anthropic",
-                                model=model,
-                            ),
+                            original_exception=provider_error,
                             is_pre_first_chunk=True,
                         )
                     for buffered_chunk in buffered_lifecycle_chunks:
@@ -5648,6 +5673,7 @@ class Router:
         )
         if fallback_error is None:
             raise stream_error
+        self._cooldown_retriable_anthropic_stream_error(wrapper, fallback_error, model)
         async for item in self._aanthropic_messages_fallback_attempt(fallback_error, initial_kwargs, wrapper):
             yield item
 
