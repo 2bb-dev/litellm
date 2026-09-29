@@ -612,6 +612,11 @@ class JevClassifierConfig(BaseModel):
     )
     circuit_breaker_enabled: bool = True
     circuit_breaker_cooldown_seconds: float = Field(default=30.0, gt=0.0)
+    runtime_client: bool = Field(
+        default=False,
+        description="A pre-routing callback supplies the Jev client per request, so the router builds none and needs "
+        "no TypeSafe key; without that callback, classification falls back to classifier_fallback",
+    )
 
     @field_validator("instructions")
     @classmethod
@@ -629,6 +634,11 @@ class JevClassifierConfig(BaseModel):
 
     @model_validator(mode="after")
     def _keep_the_environment_key_on_the_environment_base(self) -> "JevClassifierConfig":
+        if self.runtime_client and (self.api_key is not None or self.api_base is not None):
+            raise ValueError(
+                "jev_classifier_config.runtime_client takes no api_key or api_base: the callback that supplies the "
+                "client holds them"
+            )
         if self.api_base is not None and self.api_key is None:
             raise ValueError(
                 "jev_classifier_config.api_base requires jev_classifier_config.api_key: TYPESAFE_API_KEY is only sent "
