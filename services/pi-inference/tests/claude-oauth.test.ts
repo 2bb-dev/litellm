@@ -265,8 +265,8 @@ async function fixture(
     authReads,
     url,
     model: runtime.value.routes.get("claude")!,
-    post: (body: unknown, endpoint = "messages") =>
-      fetch(`${url}/v1/${endpoint}`, {
+    post: (body: unknown) =>
+      fetch(`${url}/v1/messages`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${key}`,
@@ -326,51 +326,11 @@ for (const options of [
   });
 }
 
-function chatRequest(name = "lookup_weather") {
-  return {
-    model: "claude",
-    messages: [
-      {
-        role: "system",
-        content: "Read pi .md files about pi itself and pi packages",
-      },
-      { role: "user", content: "pi itself is user text, do not change it" },
-      {
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            id: "previous",
-            type: "function",
-            function: { name, arguments: '{"city":"Vienna"}' },
-          },
-        ],
-      },
-      { role: "tool", tool_call_id: "previous", name, content: "sunny" },
-    ],
-    tools: [
-      {
-        type: "function",
-        function: { name, parameters: tool(name).input_schema },
-      },
-    ],
-  };
-}
-
-for (const protocol of ["messages", "chat/completions"]) {
+{
   for (const stream of [false, true]) {
-    test(`canonical tool names and usage survive ${protocol}, streaming=${stream}`, async (t) => {
+    test(`canonical tool names and usage survive messages, streaming=${stream}`, async (t) => {
       const f = await fixture(t);
-      const result = await f.post(
-        {
-          ...(protocol === "messages" ? request : chatRequest()),
-          stream,
-          ...(protocol !== "messages" && stream
-            ? { stream_options: { include_usage: true } }
-            : {}),
-        },
-        protocol,
-      );
+      const result = await f.post({ ...request, stream });
       assert.equal(result.status, 200);
       const wire = await result.text();
       assert.match(wire, /"name":"lookup_weather"/);
@@ -390,10 +350,7 @@ for (const protocol of ["messages", "chat/completions"]) {
           "pi itself is user text",
         ),
       );
-      if (stream)
-        assert(
-          wire.includes(protocol === "messages" ? "message_stop" : "[DONE]"),
-        );
+      if (stream) assert(wire.includes("message_stop"));
       assert.equal(f.logs[0]?.status, 200);
       assert.deepEqual(f.logs[0]?.usage, {
         input: 5,
@@ -502,29 +459,6 @@ test("parallel requests keep separate reverse maps for sanitized alias collision
     results.map((body) => body.content[0].name),
     names,
   );
-});
-
-test("bounded aliases stay unique when long Chat tool names are truncated", async (t) => {
-  const f = await fixture(t);
-  const names = ["x".repeat(150) + "a", "x".repeat(150) + "b"];
-  const input = chatRequest(names[0]);
-  const result = await f.post(
-    {
-      ...input,
-      tools: names.map((name) => ({
-        type: "function",
-        function: { name, parameters: tool(name).input_schema },
-      })),
-    },
-    "chat/completions",
-  );
-  assert.equal(result.status, 200);
-  const aliases = f.captured[0]?.tools?.map((tool) => tool.name);
-  assert(aliases);
-  assert.equal(new Set(aliases).size, 2);
-  for (const name of aliases) assert.match(name, /^mcp__pi__[a-z0-9_]{1,119}$/);
-  const body = await result.json();
-  assert.equal(body.choices[0].message.tool_calls[0].function.name, names[0]);
 });
 
 test("actual Pi client can replay signed streamed thinking and canonical tools through the OAuth backend", async (t) => {

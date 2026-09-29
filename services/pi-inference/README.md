@@ -71,8 +71,9 @@ request deadline, 1000–3600000; streams get a `ping` or keep-alive comment aft
 15–30 seconds of silence). The image entrypoint is
 `node dist/main.js`. Restart after changing the enabled model configuration
 
-All Pi built-in providers are available, but the explicit `models` allowlist
-controls inference. Each entry has `alias`, `provider`, and `model`. Advanced
+All Pi built-in providers are in the catalog, but the explicit `models` allowlist
+controls inference, and only models whose provider API is Anthropic Messages
+can be called. Each entry has `alias`, `provider`, and `model`. Advanced
 entries may override `baseUrl`; unknown models require complete `metadata`
 (`api`, `contextWindow`, `maxTokens`, `reasoning`, `input`, and `cost` with
 `input`, `output`, `cacheRead`, `cacheWrite`). Unknown providers additionally
@@ -136,16 +137,17 @@ quota, and billing must be checked separately; no new runtime package is install
 
 Unauthenticated `GET /health/liveliness` and `/health/readiness` report local
 process/configuration readiness, not provider credential validity or quota.
-Authenticated routes are `GET /v1/models`, `GET /v1/providers`,
-`POST /v1/chat/completions`, and `POST /v1/messages`. Only enabled aliases appear
-in model discovery; provider discovery describes supported integrations, not
-authorization to call every model. `POST /v1/responses` is explicitly **501**
+Authenticated routes are `GET /v1/models`, `GET /v1/providers`, and
+`POST /v1/messages`. Only enabled aliases appear in model discovery; provider
+discovery describes supported integrations, not authorization to call every
+model. `POST /v1/chat/completions` and `POST /v1/responses` are explicitly **501**.
+Anthropic Messages is the only inference protocol: LiteLLM translates Chat
+Completions clients once, on its native route, so there is a single request
+shape to keep in parity with the Anthropic API
 
 In `litellm.example.yaml`, client alias `anthropic/claude-haiku-4-5/pi` uses
-`model: anthropic/claude-haiku-4-5` with root `api_base: http://pi-inference:4001`
-for native Messages. Chat alias `pi/claude-chat` uses
-`model: litellm_proxy/claude-haiku-4-5` with
-`api_base: http://pi-inference:4001/v1`. Keep these prefixes distinct. The sidecar
+`model: anthropic/claude-haiku-4-5` with root `api_base: http://pi-inference:4001`.
+The same route serves native Messages and Chat Completions clients. The sidecar
 alias matches the built-in model ID so native LiteLLM logging can resolve the
 model instead of reporting an unmapped generic alias
 
@@ -156,15 +158,12 @@ These rates and `pricing_label` are operator-owned **examples**, not authoritati
 catalog or subscription prices; verify your contract before accounting against
 them
 
-Both APIs return terminal usage and support text streaming. Native Messages
-with an Anthropic API key forwards the upstream JSON or SSE response body;
-subscription OAuth responses still use the Pi adapter. Native Messages
-retains supported thinking/tool blocks and refusal stop reasons; tool definitions
-are data, never locally executed. `stop_sequences` is explicitly unsupported.
-The generic Chat bridge does not preserve opaque/signed reasoning round-trips;
-use native Messages for Claude. Chat tool choice supports only `auto` and `none`,
-and strict tool schemas are unsupported on that bridge. Other unsupported request
-fields/features are explicitly rejected. This is not a complete drop-in
+Messages returns terminal usage and supports text streaming. With an Anthropic
+API key it forwards the upstream JSON or SSE response body; subscription OAuth
+responses still use the Pi adapter. It retains supported thinking/tool blocks,
+signed thinking round-trips and refusal stop reasons; tool definitions are data,
+never locally executed. `stop_sequences` is explicitly unsupported. Other
+unsupported request fields/features are explicitly rejected. This is not a complete drop-in
 implementation of every upstream API
 
 Structured stdout traces correlate request/trace IDs with slot, route/provider,
@@ -183,13 +182,10 @@ keys or response bodies
 ```bash
 export INFERENCE_API_BASE=http://127.0.0.1:4000
 export INFERENCE_API_KEY="$LITELLM_MASTER_KEY"
-export INFERENCE_PROTOCOL=chat
-export INFERENCE_MODEL=pi/claude-chat
+export INFERENCE_MODEL=anthropic/claude-haiku-4-5/pi
 node tests/smoke.mjs
 INFERENCE_CONFIRM_PAID=1 node tests/smoke.mjs
-INFERENCE_PROTOCOL=messages \
-  INFERENCE_MODEL=anthropic/claude-haiku-4-5/pi \
-  INFERENCE_CONFIRM_PAID=1 node tests/smoke.mjs
+INFERENCE_PROTOCOL=messages INFERENCE_CONFIRM_PAID=1 node tests/smoke.mjs
 ```
 
 Each confirmed run makes **two billable requests** (non-streaming and streaming)
@@ -198,8 +194,8 @@ parsing. CI runs offline tests, formatting/type checks, production license guard
 and a Docker build; it neither calls live providers nor pushes images
 
 The fork regression job also exercises real Python LiteLLM transport through a
-local sidecar and provider stub for Chat and native Messages, each streaming and
-non-streaming. It also verifies Anthropic OAuth tool aliases and system rewriting
+local sidecar and provider stub for Chat Completions and native Messages clients,
+both over the sidecar's native Messages route, each streaming and non-streaming. It also verifies Anthropic OAuth tool aliases and system rewriting
 with fake credentials, including client-name restoration through real LiteLLM
 transport. With the fork's uv test dependencies already synced and this service
 built, reproduce that non-billable check from the fork root:

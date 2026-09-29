@@ -191,9 +191,7 @@ async function main() {
   );
   const key = process.env.INFERENCE_API_KEY;
   check(hasText(key), "INFERENCE_API_KEY must be a front LiteLLM key");
-  const model =
-    process.env.INFERENCE_MODEL ??
-    (protocol === "chat" ? "pi/claude-chat" : "anthropic/claude-haiku-4-5/pi");
+  const model = process.env.INFERENCE_MODEL ?? "anthropic/claude-haiku-4-5/pi";
   check(hasText(model), "INFERENCE_MODEL must be a front LiteLLM alias");
   const request = async (path, body, authenticated = true) => {
     const response = await fetch(new URL(`/v1/${path}`, base), {

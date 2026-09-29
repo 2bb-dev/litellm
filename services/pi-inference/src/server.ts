@@ -14,7 +14,6 @@ import type {
   Api,
 } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
-import { chatResponse, createChatEncoder, prepareChat } from "./chat.js";
 import { renameClaudeOAuthResponse } from "./claude-oauth.js";
 import {
   createMessagesEncoder,
@@ -59,7 +58,7 @@ const pathOf = (req: IncomingMessage): string =>
   URL.canParse(req.url ?? "", "http://backend.invalid")
     ? new URL(req.url ?? "", "http://backend.invalid").pathname
     : "";
-// Added by pi-ai from its model metadata; on the native route only the client enables them.
+// Added by pi-ai from its model metadata; only the client enables them.
 const derivedFeatureBetas = new Set([
   "fine-grained-tool-streaming-2025-05-14",
   "interleaved-thinking-2025-05-14",
@@ -111,28 +110,25 @@ function redactParsed(value: unknown, credentials: string[]): unknown {
 
 function upstreamFetch(
   upstream: Upstream,
-  clientBetas: string[] | undefined,
-  native: boolean,
+  clientBetas: string[],
   clientStream: boolean,
   transformResponse?: (value: unknown) => unknown,
 ): typeof fetch {
   return async (input, init) => {
     const headers = new Headers(init?.headers);
-    if (clientBetas) {
-      const merged = [
-        ...new Set([
-          ...betaList(headers.get("anthropic-beta")).filter(
-            (beta) => !derivedFeatureBetas.has(beta),
-          ),
-          ...clientBetas,
-        ]),
-      ];
-      if (merged.length) headers.set("anthropic-beta", merged.join(","));
-      else headers.delete("anthropic-beta");
-    }
-    const direct = native;
-    upstream.oauth =
-      direct && Boolean(headers.get("authorization")?.includes("sk-ant-oat"));
+    const merged = [
+      ...new Set([
+        ...betaList(headers.get("anthropic-beta")).filter(
+          (beta) => !derivedFeatureBetas.has(beta),
+        ),
+        ...clientBetas,
+      ]),
+    ];
+    if (merged.length) headers.set("anthropic-beta", merged.join(","));
+    else headers.delete("anthropic-beta");
+    upstream.oauth = Boolean(
+      headers.get("authorization")?.includes("sk-ant-oat"),
+    );
     upstream.credentials = [
       headers.get("x-api-key"),
       headers.get("authorization")?.replace(/^Bearer\s+/i, ""),
@@ -140,7 +136,7 @@ function upstreamFetch(
       Boolean(credential && credential.length >= 8),
     );
     let request: Request | undefined;
-    if (direct && !clientStream) {
+    if (!clientStream) {
       const original = new Request(input, { ...init, headers });
       const body = (await original.clone().json()) as Record<string, unknown>;
       const requestHeaders = new Headers(original.headers);
@@ -184,7 +180,7 @@ function upstreamFetch(
         };
       }
     }
-    if (direct && response.ok) {
+    if (response.ok) {
       if (clientStream) {
         upstream.rawStream = response.clone();
       } else if (
@@ -240,8 +236,7 @@ export function createInferenceServer(options: ServerOptions) {
   const active = new Set<AbortController>();
   const server = createServer((req, res) => {
     void handle(req, res).catch(() => {
-      if (!res.headersSent)
-        sendError(res, genericFailure, pathOf(req) === "/v1/messages");
+      if (!res.headersSent) sendError(res, genericFailure);
       else res.destroy();
     });
   });
@@ -254,7 +249,6 @@ export function createInferenceServer(options: ServerOptions) {
     res: ServerResponse,
   ): Promise<void> {
     const path = pathOf(req);
-    const native = path === "/v1/messages";
     if (
       req.method === "GET" &&
       ["/health/liveliness", "/health/readiness"].includes(path)
@@ -263,15 +257,11 @@ export function createInferenceServer(options: ServerOptions) {
       return;
     }
     if (!authorized(req, options.apiKey)) {
-      sendError(
-        res,
-        {
-          status: 401,
-          type: "authentication_error",
-          message: "Invalid backend credential",
-        },
-        native,
-      );
+      sendError(res, {
+        status: 401,
+        type: "authentication_error",
+        message: "Invalid backend credential",
+      });
       return;
     }
     if (req.method === "GET" && path === "/v1/models") {
@@ -282,10 +272,7 @@ export function createInferenceServer(options: ServerOptions) {
           object: "model",
           created: 0,
           owned_by: model.provider,
-          pi_api:
-            model.api === "anthropic-messages"
-              ? "anthropic-messages"
-              : "openai-completions",
+          pi_api: "anthropic-messages",
           pi_provider_api: model.api,
           context_window: model.contextWindow,
           max_output_tokens: model.maxTokens,
@@ -305,33 +292,23 @@ export function createInferenceServer(options: ServerOptions) {
       });
       return;
     }
-    if (
-      req.method !== "POST" ||
-      !["/v1/chat/completions", "/v1/messages"].includes(path)
-    ) {
-      sendError(
-        res,
-        {
-          status: path === "/v1/responses" ? 501 : 404,
-          type: "invalid_request_error",
-          message:
-            "Endpoint not supported; use Chat Completions or native Messages",
-        },
-        native,
-      );
+    if (req.method !== "POST" || path !== "/v1/messages") {
+      sendError(res, {
+        status: ["/v1/chat/completions", "/v1/responses"].includes(path)
+          ? 501
+          : 404,
+        type: "invalid_request_error",
+        message: "Endpoint not supported; use native Messages",
+      });
       return;
     }
     if (active.size >= (options.maxInflight ?? 16)) {
       res.setHeader("retry-after", "1");
-      sendError(
-        res,
-        {
-          status: 429,
-          type: "rate_limit_error",
-          message: "Backend concurrency limit reached",
-        },
-        native,
-      );
+      sendError(res, {
+        status: 429,
+        type: "rate_limit_error",
+        message: "Backend concurrency limit reached",
+      });
       return;
     }
     const controller = new AbortController();
@@ -362,11 +339,7 @@ export function createInferenceServer(options: ServerOptions) {
       keepAlive = setInterval(() => {
         if (res.writableEnded || performance.now() - lastWrite < keepAliveMs)
           return;
-        res.write(
-          native
-            ? formatEvent({ event: "ping", data: { type: "ping" } })
-            : ": keepalive\n\n",
-        );
+        res.write(formatEvent({ event: "ping", data: { type: "ping" } }));
         lastWrite = performance.now();
       }, keepAliveMs);
       keepAlive.unref();
@@ -385,7 +358,7 @@ export function createInferenceServer(options: ServerOptions) {
       );
       if (!body.ok) {
         result.error = body.error;
-        sendError(res, body.error, native);
+        sendError(res, body.error);
         return;
       }
       const selected = modelRequest.safeParse(body.value);
@@ -395,7 +368,7 @@ export function createInferenceServer(options: ServerOptions) {
           type: "invalid_request_error",
           message: "model is required",
         };
-        sendError(res, result.error, native);
+        sendError(res, result.error);
         return;
       }
       const alias = selected.data.model;
@@ -406,7 +379,7 @@ export function createInferenceServer(options: ServerOptions) {
           type: "not_found_error",
           message: "Model is not enabled on this backend",
         };
-        sendError(res, result.error, native);
+        sendError(res, result.error);
         return;
       }
       Object.assign(result, {
@@ -415,17 +388,15 @@ export function createInferenceServer(options: ServerOptions) {
         model: model.id,
         api: model.api,
       });
-      const prepared = native
-        ? prepareMessages(body.value, model)
-        : prepareChat(body.value, model);
+      const prepared = prepareMessages(body.value, model);
       if (!prepared.ok) {
         result.error = prepared.error;
-        sendError(res, prepared.error, native);
+        sendError(res, prepared.error);
         return;
       }
       const call = prepared.value;
       const responseContext =
-        native && model.provider === "anthropic"
+        model.provider === "anthropic"
           ? normalizeContext(call.context)
           : undefined;
       const transformResponse = responseContext
@@ -442,8 +413,7 @@ export function createInferenceServer(options: ServerOptions) {
           ? {
               fetch: upstreamFetch(
                 upstream,
-                native ? betaList(req.headers["anthropic-beta"]) : undefined,
-                native,
+                betaList(req.headers["anthropic-beta"]),
                 call.stream,
                 transformResponse,
               ),
@@ -466,11 +436,9 @@ export function createInferenceServer(options: ServerOptions) {
             : undefined;
         },
       });
-      const encode = native
-        ? createMessagesEncoder(alias, id)
-        : createChatEncoder(alias, id, call.includeUsage);
+      const encode = createMessagesEncoder(alias, id);
       for await (const update of withDeadline(stream, signal)) {
-        if (native && call.stream && upstream.rawStream && !rawForward) {
+        if (call.stream && upstream.rawStream && !rawForward) {
           rawForward = forwardNativeStream(
             upstream.rawStream,
             res,
@@ -506,21 +474,15 @@ export function createInferenceServer(options: ServerOptions) {
           result.message = event.error;
           result.error = deadline.aborted
             ? timeoutFailure
-            : providerFailure(
-                upstream,
-                native && model.provider === "anthropic",
-              );
+            : providerFailure(upstream, model.provider === "anthropic");
           if (rawForward || upstream.rawJson !== undefined) continue;
           if (call.stream && res.headersSent)
             await writeEvent(
               res,
-              {
-                event: native ? "error" : undefined,
-                data: errorBody(result.error, native),
-              },
+              { event: "error", data: errorBody(result.error) },
               signal,
             );
-          else sendError(res, result.error, native);
+          else sendError(res, result.error);
           return;
         }
         if (event.type === "done") result.message = event.message;
@@ -547,11 +509,11 @@ export function createInferenceServer(options: ServerOptions) {
       if (rawForward) {
         if (!(await rawForward) && !res.destroyed) {
           result.error = genericFailure;
-          if (!res.headersSent) sendError(res, result.error, native);
+          if (!res.headersSent) sendError(res, result.error);
           else
             await writeEvent(
               res,
-              { event: "error", data: errorBody(result.error, native) },
+              { event: "error", data: errorBody(result.error) },
               signal,
             );
         }
@@ -564,26 +526,17 @@ export function createInferenceServer(options: ServerOptions) {
       }
       if (!result.message || failed(result.message)) {
         result.error = genericFailure;
-        if (!res.headersSent) sendError(res, result.error, native);
+        if (!res.headersSent) sendError(res, result.error);
         else
           await writeEvent(
             res,
-            {
-              event: native ? "error" : undefined,
-              data: errorBody(result.error, native),
-            },
+            { event: "error", data: errorBody(result.error) },
             signal,
           );
         return;
       }
       if (!call.stream)
-        sendJson(
-          res,
-          200,
-          native
-            ? messagesResponse(result.message, alias, id)
-            : chatResponse(result.message, alias, id),
-        );
+        sendJson(res, 200, messagesResponse(result.message, alias, id));
     } catch {
       result.error = deadline.aborted
         ? timeoutFailure
@@ -591,13 +544,10 @@ export function createInferenceServer(options: ServerOptions) {
           ? { status: 499, type: "aborted", message: "Client disconnected" }
           : genericFailure;
       if (!res.destroyed) {
-        if (!res.headersSent) sendError(res, result.error, native);
+        if (!res.headersSent) sendError(res, result.error);
         else
           res.write(
-            formatEvent({
-              event: native ? "error" : undefined,
-              data: errorBody(result.error, native),
-            }),
+            formatEvent({ event: "error", data: errorBody(result.error) }),
           );
       }
     } finally {
@@ -615,7 +565,7 @@ export function createInferenceServer(options: ServerOptions) {
         trace_id: trace.traceId,
         span_id: trace.spanId,
         parent_span_id: trace.parentSpanId,
-        protocol: native ? "anthropic-messages" : "openai-completions",
+        protocol: "anthropic-messages",
         alias: result.alias,
         provider: result.provider,
         model: result.model,
@@ -854,20 +804,16 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-function errorBody(error: ApiError, native: boolean): unknown {
+function errorBody(error: ApiError): unknown {
   return {
-    ...(native ? { type: "error" } : {}),
+    type: "error",
     error: { type: error.type, message: error.message },
   };
 }
 
-function sendError(
-  res: ServerResponse,
-  error: ApiError,
-  native: boolean,
-): void {
+function sendError(res: ServerResponse, error: ApiError): void {
   if (error.retryAfter) res.setHeader("retry-after", error.retryAfter);
-  sendJson(res, error.status, errorBody(error, native));
+  sendJson(res, error.status, errorBody(error));
 }
 
 const statusTypes: Record<number, string> = {

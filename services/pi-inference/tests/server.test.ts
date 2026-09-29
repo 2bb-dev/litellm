@@ -12,7 +12,6 @@ import {
   type StreamOptions,
   type Model,
 } from "@earendil-works/pi-ai";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import {
   builtinModels,
@@ -38,7 +37,7 @@ async function close(server: Server) {
   );
 }
 
-test("Google Chat reaches its provider without an unsupported custom fetch", async (t) => {
+test("models without the Anthropic Messages API are rejected before reaching their provider", async (t) => {
   const originalFetch = globalThis.fetch;
   let calls = 0;
   globalThis.fetch = async () => {
@@ -69,7 +68,7 @@ test("Google Chat reaches its provider without an unsupported custom fetch", asy
       {
         port,
         method: "POST",
-        path: "/v1/chat/completions",
+        path: "/v1/messages",
         headers: {
           authorization: `Bearer ${internalKey}`,
           "content-type": "application/json",
@@ -83,12 +82,13 @@ test("Google Chat reaches its provider without an unsupported custom fetch", asy
     client.end(
       JSON.stringify({
         model: "gemini",
+        max_tokens: 64,
         messages: [{ role: "user", content: "hi" }],
       }),
     );
   });
-  assert.equal(status, 502);
-  assert(calls > 0, "Google adapter should reach the provider transport");
+  assert.equal(status, 400);
+  assert.equal(calls, 0);
 });
 
 test("provider errors never return provider credentials to clients", async (t) => {
@@ -132,19 +132,6 @@ test("provider errors never return provider credentials to clients", async (t) =
   });
   const url = await listen(backend.server);
   t.after(() => close(backend.server));
-  const response = await fetch(`${url}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${internalKey}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude",
-      messages: [{ role: "user", content: "hi" }],
-    }),
-  });
-  assert.equal(response.status, 401);
-  assert.doesNotMatch(await response.text(), new RegExp(providerKey));
   const native = await fetch(`${url}/v1/messages`, {
     method: "POST",
     headers: {
@@ -165,7 +152,7 @@ test("provider errors never return provider credentials to clients", async (t) =
 
 test("HTTP ingress crosses real Pi adapter with streaming, isolated auth, usage and correlated traces", async (t) => {
   const captured: {
-    authorization?: string;
+    apiKey?: string;
     trace?: string;
     body?: Record<string, unknown>;
   } = {};
@@ -176,50 +163,80 @@ test("HTTP ingress crosses real Pi adapter with streaming, isolated auth, usage 
       string,
       unknown
     >;
-    captured.authorization = req.headers.authorization;
+    captured.apiKey = req.headers["x-api-key"] as string;
     captured.trace = req.headers.traceparent as string;
+    const usage = {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_read_input_tokens: 20,
+      cache_creation_input_tokens: 0,
+    };
+    const message = {
+      id: "provider-response-1",
+      type: "message",
+      role: "assistant",
+      model: "stub-model",
+      content: [{ type: "text", text: "Hello world" }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage,
+    };
+    if (!captured.body.stream) {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "x-request-id": "upstream-1",
+      });
+      res.end(JSON.stringify(message));
+      return;
+    }
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "x-request-id": "upstream-1",
     });
-    for (const chunk of [
+    for (const data of [
       {
-        choices: [
-          {
-            index: 0,
-            delta: { role: "assistant", content: "Hello " },
-            finish_reason: null,
-          },
-        ],
-      },
-      {
-        choices: [
-          { index: 0, delta: { content: "world" }, finish_reason: null },
-        ],
-      },
-      {
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        usage: {
-          prompt_tokens: 30,
-          completion_tokens: 5,
-          total_tokens: 35,
-          prompt_tokens_details: { cached_tokens: 20 },
+        type: "message_start",
+        message: {
+          ...message,
+          content: [],
+          stop_reason: null,
+          usage: { ...usage, output_tokens: 1 },
         },
       },
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Hello " },
+      },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "world" },
+      },
+      { type: "content_block_stop", index: 0 },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage,
+      },
+      { type: "message_stop" },
     ])
-      res.write(
-        `data: ${JSON.stringify({ id: "provider-response-1", object: "chat.completion.chunk", created: 0, model: "stub-model", ...chunk })}\n\n`,
-      );
-    res.end("data: [DONE]\n\n");
+      res.write(`event: ${data.type}\ndata: ${JSON.stringify(data)}\n\n`);
+    res.end();
   });
   const upstreamUrl = await listen(upstream);
   t.after(() => close(upstream));
-  const model: Model<"openai-completions"> = {
+  const model: Model<"anthropic-messages"> = {
     id: "stub-model",
     name: "Stub",
     provider: "stub",
-    api: "openai-completions",
-    baseUrl: `${upstreamUrl}/v1`,
+    api: "anthropic-messages",
+    baseUrl: upstreamUrl,
     reasoning: false,
     input: ["text"],
     contextWindow: 4096,
@@ -237,7 +254,7 @@ test("HTTP ingress crosses real Pi adapter with streaming, isolated auth, usage 
       id: "stub",
       auth: { apiKey: envApiKeyAuth("Stub", ["STUB_KEY"]) },
       models: [model],
-      api: openAICompletionsApi(),
+      api: anthropicMessagesApi(),
     }),
   );
   const logs: Record<string, unknown>[] = [];
@@ -249,7 +266,7 @@ test("HTTP ingress crosses real Pi adapter with streaming, isolated auth, usage 
   const url = await listen(backend.server);
   t.after(() => close(backend.server));
   const traceId = "1234567890abcdef1234567890abcdef";
-  const response = await fetch(`${url}/v1/chat/completions`, {
+  const response = await fetch(`${url}/v1/messages`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${internalKey}`,
@@ -259,9 +276,9 @@ test("HTTP ingress crosses real Pi adapter with streaming, isolated auth, usage 
     },
     body: JSON.stringify({
       model: "public-model",
+      max_tokens: 64,
       messages: [{ role: "user", content: "private prompt do not log" }],
       stream: true,
-      stream_options: { include_usage: true },
     }),
   });
   assert.equal(response.status, 200);
@@ -269,20 +286,22 @@ test("HTTP ingress crosses real Pi adapter with streaming, isolated auth, usage 
   const events = wire
     .split("\n\n")
     .filter(Boolean)
-    .map((line) => line.slice("data: ".length));
-  assert.equal(events.at(-1), "[DONE]");
-  const chunks = events.slice(0, -1).map((value) => JSON.parse(value));
+    .map((frame) => JSON.parse(frame.slice(frame.indexOf("data: ") + 6)));
+  assert.equal(events.at(-1).type, "message_stop");
   assert.equal(
-    chunks
-      .flatMap((chunk) => chunk.choices)
-      .map((choice) => choice.delta.content ?? "")
+    events
+      .filter((event) => event.type === "content_block_delta")
+      .map((event) => event.delta.text ?? "")
       .join(""),
     "Hello world",
   );
-  assert.equal(chunks.at(-1).usage.prompt_tokens, 30);
-  assert.equal(chunks.at(-1).usage.completion_tokens, 5);
-  assert.equal(chunks.at(-1).usage.prompt_tokens_details.cached_tokens, 20);
-  assert.equal(captured.authorization, `Bearer ${providerKey}`);
+  const finalUsage = events
+    .filter((event: { type: string }) => event.type === "message_delta")
+    .at(-1).usage;
+  assert.equal(finalUsage.input_tokens, 10);
+  assert.equal(finalUsage.output_tokens, 5);
+  assert.equal(finalUsage.cache_read_input_tokens, 20);
+  assert.equal(captured.apiKey, providerKey);
   assert.equal(captured.body?.model, "stub-model");
   assert.equal(captured.body?.stream, true);
   assert.match(
@@ -298,13 +317,13 @@ test("HTTP ingress crosses real Pi adapter with streaming, isolated auth, usage 
     output: 5,
     cache_read: 20,
     cache_write: 0,
-    reasoning: 0,
+    reasoning: undefined,
   });
   assert(!JSON.stringify(logs).includes(providerKey));
   assert(!JSON.stringify(logs).includes("private prompt"));
   assert(!wire.includes(providerKey));
 
-  const nonstream = await fetch(`${url}/v1/chat/completions`, {
+  const nonstream = await fetch(`${url}/v1/messages`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${internalKey}`,
@@ -312,16 +331,18 @@ test("HTTP ingress crosses real Pi adapter with streaming, isolated auth, usage 
     },
     body: JSON.stringify({
       model: "public-model",
+      max_tokens: 64,
       messages: [{ role: "user", content: "hi" }],
     }),
   });
   assert.equal(nonstream.status, 200);
   const complete = (await nonstream.json()) as {
-    choices: { message: { content: string } }[];
-    usage: { total_tokens: number };
+    content: { type: string; text: string }[];
+    usage: { input_tokens: number; output_tokens: number };
   };
-  assert.equal(complete.choices[0]?.message.content, "Hello world");
-  assert.equal(complete.usage.total_tokens, 35);
+  assert.equal(complete.content[0]?.text, "Hello world");
+  assert.equal(complete.usage.input_tokens, 10);
+  assert.equal(complete.usage.output_tokens, 5);
 });
 
 test("health is local; catalog and inference require backend auth, allowlisted models and supported endpoints", async (t) => {
@@ -352,7 +373,16 @@ test("health is local; catalog and inference require backend auth, allowlisted m
     ).status,
     501,
   );
-  const unknown = await fetch(`${url}/v1/chat/completions`, {
+  assert.equal(
+    (
+      await fetch(`${url}/v1/chat/completions`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${internalKey}` },
+      })
+    ).status,
+    501,
+  );
+  const unknown = await fetch(`${url}/v1/messages`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${internalKey}`,
@@ -360,6 +390,7 @@ test("health is local; catalog and inference require backend auth, allowlisted m
     },
     body: JSON.stringify({
       model: "not-enabled",
+      max_tokens: 64,
       messages: [{ role: "user", content: "hi" }],
     }),
   });
@@ -381,14 +412,14 @@ test("request validation bounds bodies and rejects malformed JSON without dispat
     authorization: `Bearer ${internalKey}`,
     "content-type": "application/json",
   };
-  const huge = await fetch(`${url}/v1/chat/completions`, {
+  const huge = await fetch(`${url}/v1/messages`, {
     method: "POST",
     headers,
     body: JSON.stringify({ model: "x", messages: "a".repeat(100) }),
   });
   assert.equal(huge.status, 413);
   await huge.text();
-  const malformed = await fetch(`${url}/v1/chat/completions`, {
+  const malformed = await fetch(`${url}/v1/messages`, {
     method: "POST",
     headers,
     body: "{",
@@ -405,12 +436,17 @@ test("provider setup errors are HTTP failures, never successful completion bodie
   const logs: Record<string, unknown>[] = [];
   const backend = createInferenceServer({
     apiKey: internalKey,
-    runtime: { models, routes: new Map([["empty", faux.getModel()]]) },
+    runtime: {
+      models,
+      routes: new Map([
+        ["empty", { ...faux.getModel(), api: "anthropic-messages" }],
+      ]),
+    },
     log: (record) => logs.push(record),
   });
   const url = await listen(backend.server);
   t.after(() => close(backend.server));
-  const response = await fetch(`${url}/v1/chat/completions`, {
+  const response = await fetch(`${url}/v1/messages`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${internalKey}`,
@@ -418,11 +454,12 @@ test("provider setup errors are HTTP failures, never successful completion bodie
     },
     body: JSON.stringify({
       model: "empty",
+      max_tokens: 64,
       messages: [{ role: "user", content: "hi" }],
     }),
   });
   assert.equal(response.status, 502);
-  assert(!(await response.text()).includes("choices"));
+  assert.equal(((await response.json()) as { type: string }).type, "error");
   assert.equal(logs[0]?.status, 502);
 });
 
@@ -500,7 +537,7 @@ test(
   { timeout: 2000 },
   async (t) => {
     const models = createModels();
-    const model = fauxProvider().getModel();
+    const model = { ...fauxProvider().getModel(), api: "anthropic-messages" };
     const calls: StreamOptions[] = [];
     const hang = (
       _model: Model<Api>,
@@ -529,7 +566,7 @@ test(
     const url = await listen(backend.server);
     t.after(() => close(backend.server));
     for (const attempt of [1, 2]) {
-      const response = await fetch(`${url}/v1/chat/completions`, {
+      const response = await fetch(`${url}/v1/messages`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${internalKey}`,
@@ -537,6 +574,7 @@ test(
         },
         body: JSON.stringify({
           model: "slow",
+          max_tokens: 64,
           messages: [{ role: "user", content: `attempt ${attempt}` }],
         }),
       });
@@ -554,7 +592,7 @@ test(
   { timeout: 3000 },
   async (t) => {
     const models = createModels();
-    const model = fauxProvider().getModel();
+    const model = { ...fauxProvider().getModel(), api: "anthropic-messages" };
     const events = new EventEmitter();
     const hang = (
       _model: Model<Api>,
@@ -594,16 +632,17 @@ test(
       },
       body: JSON.stringify({
         model: "slow",
+        max_tokens: 64,
         messages: [{ role: "user", content: "hi" }],
       }),
     };
-    const first = fetch(`${url}/v1/chat/completions`, {
+    const first = fetch(`${url}/v1/messages`, {
       ...request,
       signal: client.signal,
     });
     const rejected = assert.rejects(first, /abort/i);
     await started;
-    const excess = await fetch(`${url}/v1/chat/completions`, request);
+    const excess = await fetch(`${url}/v1/messages`, request);
     assert.equal(excess.status, 429);
     const aborted = once(events, "aborted");
     client.abort();
