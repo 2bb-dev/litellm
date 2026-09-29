@@ -2675,7 +2675,8 @@ def test_transform_request_respects_user_max_tokens():
     assert result["max_tokens"] == 1000
 
 
-def test_claude_opus_5_5_chat_transform(local_model_cost_map):
+@pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"])
+def test_always_thinking_claude_chat_transform(local_model_cost_map, model):
     config = AnthropicConfig()
 
     mapped = config.map_openai_params(
@@ -2685,7 +2686,7 @@ def test_claude_opus_5_5_chat_transform(local_model_cost_map):
             "top_p": 0.9,
         },
         optional_params={},
-        model="claude-opus-5-5",
+        model=model,
         drop_params=True,
     )
     assert mapped["tool_choice"] == {"type": "auto"}
@@ -2693,7 +2694,7 @@ def test_claude_opus_5_5_chat_transform(local_model_cost_map):
     assert "top_p" not in mapped
 
     request = config.transform_request(
-        model="claude-opus-5-5",
+        model=model,
         messages=[{"role": "user", "content": "hi"}],
         optional_params={"thinking": {"type": "disabled"}, "top_k": 40},
         litellm_params={"drop_params": True},
