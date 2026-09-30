@@ -302,6 +302,23 @@ def test_can_object_call_model_denials_return_forbidden(object_type, expected_er
     assert int(exc_info.value.code) == status.HTTP_403_FORBIDDEN
 
 
+@pytest.mark.parametrize("object_type", ["key", "team", "user", "org", "project"])
+@pytest.mark.parametrize("allowed", [True, False])
+def test_transport_access_alias_preserves_the_canonical_model_scope(
+    monkeypatch: pytest.MonkeyPatch, object_type: Literal["key", "team", "user", "org", "project"], allowed: bool
+):
+    canonical: Final = "anthropic/claude-opus-5-5"
+    transport: Final = f"{canonical}/pi"
+    monkeypatch.setattr(litellm, "model_access_alias_map", {transport: canonical}, raising=False)
+    models = [canonical] if allowed else ["anthropic/claude-haiku-4-5"]
+    if allowed:
+        assert _can_object_call_model(model=transport, llm_router=None, models=models, object_type=object_type) is True
+    else:
+        with pytest.raises(ProxyException) as rejected:
+            _can_object_call_model(model=transport, llm_router=None, models=models, object_type=object_type)
+        assert int(rejected.value.code) == 403
+
+
 @pytest.mark.asyncio
 async def test_can_user_call_model_no_default_models_returns_forbidden():
     from litellm.proxy._types import SpecialModelNames

@@ -1,6 +1,7 @@
 import asyncio
 import sys
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn
 
 from pydantic import BaseModel
@@ -16,6 +17,7 @@ from litellm.proxy._types import CommonProxyErrors, CurrentItemRateLimit, UserAP
 from litellm.proxy.auth.auth_utils import (
     get_key_model_rpm_limit,
     get_key_model_tpm_limit,
+    get_model_rate_limit_scopes,
 )
 from litellm.proxy.auth.budget_throttle import throttled_limit
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
@@ -76,6 +78,7 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
         request_count_api_key: str,
         rate_limit_type: Literal["key", "model_per_key", "user", "customer", "team"],
         values_to_update_in_cache: list[tuple[Any, Any]],
+        write_to_local_cache: bool = True,
     ) -> dict:
         verbose_proxy_logger.info("Current Usage of %s in this minute: %s", rate_limit_type, current)
         if current is None:
@@ -136,12 +139,13 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
                 llm_provider=llm_provider,
             )
 
-        await self.internal_usage_cache.async_batch_set_cache(
-            cache_list=values_to_update_in_cache,
-            ttl=60,
-            litellm_parent_otel_span=user_api_key_dict.parent_otel_span,
-            local_only=True,
-        )
+        if write_to_local_cache:
+            await self.internal_usage_cache.async_batch_set_cache(
+                cache_list=values_to_update_in_cache,
+                ttl=60,
+                litellm_parent_otel_span=user_api_key_dict.parent_otel_span,
+                local_only=True,
+            )
         return new_val
 
     def time_to_next_minute(self) -> float:
@@ -350,52 +354,55 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
                 values_to_update_in_cache=values_to_update_in_cache,
             )
 
-        # Check if request under RPM/TPM per model for a given API Key
-        _model = data.get("model", None)
-        _tpm_limit_for_key_model: Final = get_key_model_tpm_limit(user_api_key_dict, model_name=_model)
-        _rpm_limit_for_key_model: Final = get_key_model_rpm_limit(user_api_key_dict, model_name=_model)
-        if _tpm_limit_for_key_model is not None or _rpm_limit_for_key_model is not None:
-            request_count_api_key = f"{api_key}::{_model}::{precise_minute}::request_count"
-            tpm_limit_for_model = None
-            rpm_limit_for_model = None
-
-            if _model is not None:
-                if _tpm_limit_for_key_model:
-                    tpm_limit_for_model = _tpm_limit_for_key_model.get(_model)
-
-                if _rpm_limit_for_key_model:
-                    rpm_limit_for_model = _rpm_limit_for_key_model.get(_model)
-
-            new_val = await self.check_key_in_limits(
-                user_api_key_dict=user_api_key_dict,
-                cache=cache,
-                data=data,
-                call_type=call_type,
-                max_parallel_requests=sys.maxsize,  # TODO: Support max parallel requests for a model
-                current=cache_objects["request_count_api_key_model"],
-                request_count_api_key=request_count_api_key,
-                tpm_limit=tpm_limit_for_model or sys.maxsize,
-                rpm_limit=rpm_limit_for_model or sys.maxsize,
-                rate_limit_type="model_per_key",
-                values_to_update_in_cache=values_to_update_in_cache,
+        model_scopes: Final = get_model_rate_limit_scopes(_model)
+        async for model_scope, model_counts, tpm_limit_for_model, rpm_limit_for_model in (
+            (
+                scope,
+                await self.check_key_in_limits(
+                    user_api_key_dict=user_api_key_dict,
+                    cache=cache,
+                    data=data,
+                    call_type=call_type,
+                    max_parallel_requests=sys.maxsize,
+                    current=cache_objects["request_count_api_key_model"] if scope == _model else
+                    await self.internal_usage_cache.async_get_cache(
+                        key=counter_key, litellm_parent_otel_span=user_api_key_dict.parent_otel_span,
+                    ),
+                    request_count_api_key=counter_key,
+                    tpm_limit=tpm_cap if tpm_cap is not None else sys.maxsize,
+                    rpm_limit=rpm_cap if rpm_cap is not None else sys.maxsize,
+                    rate_limit_type="model_per_key",
+                    values_to_update_in_cache=values_to_update_in_cache,
+                    write_to_local_cache=len(model_scopes) == 1,
+                ),
+                tpm_cap,
+                rpm_cap,
             )
-            _remaining_tokens = None
-            _remaining_requests = None
-            # Add remaining tokens, requests to metadata
-            if new_val:
-                if tpm_limit_for_model is not None:
-                    _remaining_tokens = tpm_limit_for_model - new_val["current_tpm"]
-                if rpm_limit_for_model is not None:
-                    _remaining_requests = rpm_limit_for_model - new_val["current_rpm"]
-
-            _remaining_limits_data: Final = {
-                f"litellm-key-remaining-tokens-{_model}": _remaining_tokens,
-                f"litellm-key-remaining-requests-{_model}": _remaining_requests,
-            }
-
+            for scope in model_scopes
+            for tpm_limits in (get_key_model_tpm_limit(user_api_key_dict, scope),)
+            for rpm_limits in (get_key_model_rpm_limit(user_api_key_dict, scope),)
+            if tpm_limits is not None or rpm_limits is not None
+            for counter_key, tpm_cap, rpm_cap in ((
+                f"{api_key}::{scope}::{precise_minute}::request_count",
+                tpm_limits.get(scope) if tpm_limits else None,
+                rpm_limits.get(scope) if rpm_limits else None,
+            ),)
+        ):
             if "metadata" not in data:
                 data["metadata"] = {}
-            data["metadata"].update(_remaining_limits_data)
+            data["metadata"].update(MappingProxyType({
+                f"litellm-key-remaining-tokens-{model_scope}":
+                    tpm_limit_for_model - model_counts["current_tpm"] if tpm_limit_for_model is not None else None,
+                f"litellm-key-remaining-requests-{model_scope}":
+                    rpm_limit_for_model - model_counts["current_rpm"] if rpm_limit_for_model is not None else None,
+            }))
+        if len(model_scopes) > 1 and values_to_update_in_cache:
+            await self.internal_usage_cache.async_batch_set_cache(
+                cache_list=values_to_update_in_cache,
+                ttl=60,
+                litellm_parent_otel_span=user_api_key_dict.parent_otel_span,
+                local_only=True,
+            )
 
         # check if REQUEST ALLOWED for user_id
         user_id: Final = user_api_key_dict.user_id
@@ -570,25 +577,18 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
             # Update usage - model group + API Key
             # ------------
             model_group: Final = get_model_group_from_litellm_kwargs(kwargs)
-            _success_tpm_limit: Final = (
-                get_key_model_tpm_limit(user_api_key_dict, model_name=model_group) if model_group is not None else None
-            )
-            _success_rpm_limit: Final = (
-                get_key_model_rpm_limit(user_api_key_dict, model_name=model_group) if model_group is not None else None
-            )
-            if (
-                user_api_key is not None
-                and model_group is not None
-                and (
-                    "model_rpm_limit" in user_api_key_metadata
-                    or "model_tpm_limit" in user_api_key_metadata
-                    or user_api_key_model_max_budget is not None
-                    or _success_tpm_limit is not None
-                    or _success_rpm_limit is not None
-                )
+            for model_scope, success_tpm_limit, success_rpm_limit in (
+                (scope, get_key_model_tpm_limit(user_api_key_dict, scope), get_key_model_rpm_limit(user_api_key_dict, scope))
+                for scope in get_model_rate_limit_scopes(model_group)
             ):
-                request_count_api_key = f"{user_api_key}::{model_group}::{precise_minute}::request_count"
-
+                if user_api_key is None or (
+                    success_tpm_limit is None and success_rpm_limit is None
+                    and "model_rpm_limit" not in user_api_key_metadata
+                    and "model_tpm_limit" not in user_api_key_metadata
+                    and user_api_key_model_max_budget is None
+                ):
+                    continue
+                request_count_api_key = f"{user_api_key}::{model_scope}::{precise_minute}::request_count"
                 current = await self.internal_usage_cache.async_get_cache(
                     key=request_count_api_key,
                     litellm_parent_otel_span=litellm_parent_otel_span,
@@ -597,13 +597,11 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
                     "current_tpm": 0,
                     "current_rpm": 0,
                 }
-
                 new_val = {
                     "current_requests": max(current["current_requests"] - 1, 0),
                     "current_tpm": current["current_tpm"] + total_tokens,
                     "current_rpm": current["current_rpm"],
                 }
-
                 self.print_verbose(f"updated_value in success call: {new_val}, precise_minute: {precise_minute}")
                 values_to_update_in_cache.append((request_count_api_key, new_val))
 

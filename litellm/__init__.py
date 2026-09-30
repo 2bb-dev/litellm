@@ -30,6 +30,7 @@ if os.getenv("LITELLM_MODE", "DEV") == "DEV":
     _dotenv.load_dotenv(override=_dev_env_hot_reload_enabled())
 
 from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from typing import (
     Any,
     Callable,
@@ -401,6 +402,7 @@ default_in_memory_ttl: Optional[float] = None
 default_redis_ttl: Optional[float] = None
 default_redis_batch_cache_expiry: Optional[float] = None
 model_alias_map: Dict[str, str] = {}
+model_access_alias_map: Final[Mapping[str, str]] = MappingProxyType({})
 model_group_settings: Optional["ModelGroupSettings"] = None
 max_budget: float = 0.0  # set the max budget across all providers
 budget_duration: Optional[str] = (

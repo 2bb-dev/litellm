@@ -4027,6 +4027,9 @@ def _can_object_call_model(
         return True
 
     potential_models: Final = [model]
+    access_alias: Final = litellm.model_access_alias_map.get(model)
+    if access_alias:
+        potential_models.append(access_alias)
     if model in litellm.model_alias_map:
         potential_models.append(litellm.model_alias_map[model])
     elif llm_router and model in llm_router.model_group_alias:

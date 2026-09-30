@@ -213,6 +213,7 @@ class ModelInfo(MirroredPricingParams):
     # (requested model group, selected model + provider, router correlation id)
     # in the spend log row's metadata. Set it on every deployment of the group.
     internal_router_model: bool | None = None
+    order_fallback_on_rate_limit_only: bool | None = None
 
     def __init__(self, id: str | int | None = None, **params) -> None:
         if id is None:

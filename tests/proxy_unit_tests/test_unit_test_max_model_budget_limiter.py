@@ -1,5 +1,6 @@
 import asyncio
 from types import MappingProxyType
+from typing import Final
 from unittest.mock import AsyncMock, patch
 
 
@@ -143,35 +144,17 @@ async def test_is_key_within_model_budget(budget_limiter):
     assert await budget_limiter.is_key_within_model_budget(user_api_key, "non-existent") is True
 
 
-# Test _get_spend_for_model_budget
 @pytest.mark.asyncio
-async def test_get_spend_for_model_budget_reads_the_configured_model_key(
-    budget_limiter,
-):
-    from litellm.proxy.hooks.model_max_budget_limiter import (
-        VIRTUAL_KEY_SPEND_CACHE_KEY_PREFIX,
+async def test_key_admission_reads_the_configured_model_spend_key(budget_limiter):
+    budgets: Final = {"gpt-4": {"budget_limit": 50.0, "time_period": "1d"}}
+    key: Final = UserAPIKeyAuth(token="test-key", model_max_budget=budgets)
+    assert await budget_limiter.is_key_within_model_budget(key, "openai/gpt-4")
+    await budget_limiter.dual_cache.async_set_cache(
+        key="virtual_key_spend:test-key:gpt-4:1d", value=50.0, ttl=86400
     )
-
-    model_max_budget = {"gpt-4": {"budget_limit": 100.0, "time_period": "1d"}}
-    # openai/gpt-4 resolves to the configured "gpt-4" entry, so the lookup must
-    # hit the same key async_log_success_event writes.
-    resolved = resolve_model_budget(model="openai/gpt-4", model_max_budget=model_max_budget)
-
-    async def _spend(key):
-        return 50.0 if key == f"{VIRTUAL_KEY_SPEND_CACHE_KEY_PREFIX}:test-key:gpt-4:1d" else None
-
-    with patch.object(budget_limiter.dual_cache, "async_get_cache", side_effect=_spend) as mock_get:
-        spend = await budget_limiter._get_spend_for_model_budget(
-            entity_type=Litellm_EntityType.KEY,
-            entity_id="test-key",
-            model="openai/gpt-4",
-            resolved=resolved,
-        )
-        assert spend == 50.0
-        assert [call.kwargs["key"] for call in mock_get.call_args_list] == [
-            f"{VIRTUAL_KEY_SPEND_CACHE_KEY_PREFIX}:test-key:gpt-4:1d",
-            f"{VIRTUAL_KEY_SPEND_CACHE_KEY_PREFIX}:test-key:openai/gpt-4:1d",
-        ]
+    with pytest.raises(litellm.BudgetExceededError) as rejected:
+        await budget_limiter.is_key_within_model_budget(key, "openai/gpt-4")
+    assert rejected.value.current_cost == 50.0
 
 
 @pytest.mark.asyncio
@@ -247,31 +230,16 @@ async def test_is_end_user_within_model_budget(budget_limiter):
     )
 
 
-# Test _get_spend_for_model_budget for the end-user scope
 @pytest.mark.asyncio
-async def test_get_spend_for_end_user_model_budget(budget_limiter):
-    from litellm.proxy.hooks.model_max_budget_limiter import (
-        END_USER_SPEND_CACHE_KEY_PREFIX,
+async def test_end_user_admission_reads_the_configured_model_spend_key(budget_limiter):
+    budgets: Final = {"gpt-4": {"budget_limit": 50.0, "time_period": "1d"}}
+    assert await budget_limiter.is_end_user_within_model_budget("test-user", budgets, "openai/gpt-4")
+    await budget_limiter.dual_cache.async_set_cache(
+        key="end_user_model_spend:test-user:gpt-4:1d", value=50.0, ttl=86400
     )
-
-    model_max_budget = {"gpt-4": {"budget_limit": 100.0, "time_period": "1d"}}
-    resolved = resolve_model_budget(model="openai/gpt-4", model_max_budget=model_max_budget)
-
-    async def _spend(key):
-        return 50.0 if key == f"{END_USER_SPEND_CACHE_KEY_PREFIX}:test-user:gpt-4:1d" else None
-
-    with patch.object(budget_limiter.dual_cache, "async_get_cache", side_effect=_spend) as mock_get:
-        spend = await budget_limiter._get_spend_for_model_budget(
-            entity_type=Litellm_EntityType.END_USER,
-            entity_id="test-user",
-            model="openai/gpt-4",
-            resolved=resolved,
-        )
-        assert spend == 50.0
-        assert [call.kwargs["key"] for call in mock_get.call_args_list] == [
-            f"{END_USER_SPEND_CACHE_KEY_PREFIX}:test-user:gpt-4:1d",
-            f"{END_USER_SPEND_CACHE_KEY_PREFIX}:test-user:openai/gpt-4:1d",
-        ]
+    with pytest.raises(litellm.BudgetExceededError) as rejected:
+        await budget_limiter.is_end_user_within_model_budget("test-user", budgets, "openai/gpt-4")
+    assert rejected.value.current_cost == 50.0
 
 
 @pytest.mark.asyncio
@@ -522,15 +490,13 @@ async def test_get_fallback_model_within_budget_skips_exhausted_fallback(
         budget_fallbacks={"gpt-4": ["gpt-4o-mini", "claude-haiku"]},
     )
 
-    async def _spend_for_model(entity_type, entity_id, model, resolved):
-        return 150.0 if resolved.budget_model == "gpt-4o-mini" else 1.0
-
-    with patch.object(
-        budget_limiter,
-        "_get_spend_for_model_budget",
-        side_effect=_spend_for_model,
-    ):
-        result = await budget_limiter.get_fallback_model_within_budget(user_api_key, "gpt-4")
+    await budget_limiter.dual_cache.async_set_cache(
+        key="virtual_key_spend:test-key:gpt-4o-mini:1d", value=150.0, ttl=86400
+    )
+    await budget_limiter.dual_cache.async_set_cache(
+        key="virtual_key_spend:test-key:claude-haiku:1d", value=1.0, ttl=86400
+    )
+    result: Final = await budget_limiter.get_fallback_model_within_budget(user_api_key, "gpt-4")
     assert result == "claude-haiku"
 
 
@@ -942,6 +908,97 @@ async def test_user_model_budget_window_resets_when_the_period_elapses():
         model_max_budget=user_model_max_budget,
         cache=dual_cache,
     ) == {"gpt-4": {"current_spend": 1.5, "budget_limit": 1.0, "time_period": "1mo"}}
+
+
+@pytest.mark.parametrize("budget_model", ["anthropic/claude-opus-5-5", "claude-opus-5-5"])
+@pytest.mark.parametrize("explicit_transport_budget", [False, True])
+@pytest.mark.parametrize("pi_first", [False, True])
+@pytest.mark.asyncio
+async def test_transport_alias_spend_shares_existing_model_budgets_and_windows(
+    monkeypatch: pytest.MonkeyPatch, budget_model: str, explicit_transport_budget: bool, pi_first: bool
+):
+    canonical: Final = "anthropic/claude-opus-5-5"
+    transport: Final = f"{canonical}/pi"
+    monkeypatch.setattr(litellm, "model_access_alias_map", {transport: canonical}, raising=False)
+    cache: Final = DualCache()
+    limiter: Final = _PROXY_VirtualKeyModelMaxBudgetLimiter(dual_cache=cache)
+    budgets: Final = {
+        budget_model: {"budget_limit": 1.0, "time_period": "1d"},
+        **({transport: {"budget_limit": 100.0, "time_period": "1d"}} if explicit_transport_budget else {}),
+    }
+    key: Final = UserAPIKeyAuth(token="transport-key", model_max_budget=budgets)
+    for index, model in enumerate((transport, canonical) if pi_first else (canonical, transport)):
+        assert await limiter.is_key_within_model_budget(key, model)
+        await limiter.async_log_success_event(
+            _success_kwargs(
+                model_group=model,
+                response_cost=0.5,
+                key_hash="transport-key",
+                key_model_max_budget=budgets,
+                user_id="transport-user",
+                user_model_max_budget=budgets,
+                end_user_id="transport-end-user",
+                end_user_model_max_budget=budgets,
+            ),
+            response_obj=None,
+            start_time=None,
+            end_time=None,
+        )
+        if index == 0:
+            for next_model in (canonical, transport):
+                assert await limiter.is_key_within_model_budget(key, next_model)
+                assert await limiter.is_user_within_model_budget("transport-user", budgets, next_model)
+                assert await limiter.is_end_user_within_model_budget("transport-end-user", budgets, next_model)
+    for entity_type, entity_id in (
+        (Litellm_EntityType.KEY, "transport-key"),
+        (Litellm_EntityType.USER, "transport-user"),
+        (Litellm_EntityType.END_USER, "transport-end-user"),
+    ):
+        usage: Final = await build_model_max_budget_usage(entity_type, entity_id, budgets, cache)
+        assert usage[budget_model] == {"current_spend": 1.0, "budget_limit": 1.0, "time_period": "1d"}
+        if explicit_transport_budget:
+            assert usage[transport]["current_spend"] == 0.5
+    for model in (canonical, transport):
+        with pytest.raises(litellm.BudgetExceededError):
+            await limiter.is_key_within_model_budget(key, model)
+        with pytest.raises(litellm.BudgetExceededError):
+            await limiter.is_user_within_model_budget("transport-user", budgets, model)
+        with pytest.raises(litellm.BudgetExceededError):
+            await limiter.is_end_user_within_model_budget("transport-end-user", budgets, model)
+
+
+@pytest.mark.asyncio
+async def test_transport_alias_keeps_an_explicit_transport_zero_cap(monkeypatch: pytest.MonkeyPatch):
+    canonical: Final = "anthropic/claude-opus-5-5"
+    transport: Final = f"{canonical}/pi"
+    monkeypatch.setattr(litellm, "model_access_alias_map", {transport: canonical}, raising=False)
+    limiter: Final = _PROXY_VirtualKeyModelMaxBudgetLimiter(dual_cache=DualCache())
+    key: Final = UserAPIKeyAuth(
+        token="transport-zero",
+        model_max_budget={
+            canonical: {"budget_limit": 100.0, "time_period": "1d"},
+            transport: {"budget_limit": 0, "time_period": "1d"},
+        },
+    )
+    assert await limiter.is_key_within_model_budget(key, canonical)
+    with pytest.raises(litellm.BudgetExceededError) as rejected:
+        await limiter.is_key_within_model_budget(key, transport)
+    assert rejected.value.max_budget == 0
+
+
+@pytest.mark.asyncio
+async def test_transport_alias_keeps_the_pre_upgrade_canonical_budget_spend(monkeypatch: pytest.MonkeyPatch):
+    canonical: Final = "anthropic/claude-opus-5-5"
+    transport: Final = f"{canonical}/pi"
+    monkeypatch.setattr(litellm, "model_access_alias_map", {transport: canonical}, raising=False)
+    cache: Final = DualCache()
+    limiter: Final = _PROXY_VirtualKeyModelMaxBudgetLimiter(dual_cache=cache)
+    key: Final = UserAPIKeyAuth(
+        token="transport-legacy", model_max_budget={"claude-opus-5-5": {"budget_limit": 1.0, "time_period": "1d"}}
+    )
+    await cache.async_set_cache(key=f"virtual_key_spend:transport-legacy:{canonical}:1d", value=1.0, ttl=86400)
+    with pytest.raises(litellm.BudgetExceededError):
+        await limiter.is_key_within_model_budget(key, transport)
 
 
 @pytest.mark.asyncio

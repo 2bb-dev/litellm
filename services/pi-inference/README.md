@@ -158,6 +158,21 @@ These rates and `pricing_label` are operator-owned **examples**, not authoritati
 catalog or subscription prices; verify your contract before accounting against
 them
 
+Async Router groups can opt into a Pi-first policy with
+`model_info.order_fallback_on_rate_limit_only: true` on their ordered deployments
+and `litellm_params.num_retries: 0` on each hop. The policy also rejects caller
+retry overrides. Higher-order routes are allowed only after a pre-content 429,
+including explicit rate-limit SSE errors. Authentication, request errors, unknown
+transport failures and errors after content do not permit a paid hop
+
+For a shared proxy, `litellm_settings.model_access_alias_map` can map the exact
+Pi transport name to its canonical model name. This affects scope checks and
+per-model budget resolution only. Both transports retain their route and spend
+identities while sharing existing canonical budget counters and windows. An
+explicit transport budget remains enforced alongside the canonical budget;
+no extra allowance is created. This map does not enable fallback on the shared
+proxy
+
 Messages returns terminal usage and supports text streaming. With an Anthropic
 API key it forwards the upstream JSON or SSE response body; subscription OAuth
 responses still use the Pi adapter. It retains supported thinking/tool blocks,

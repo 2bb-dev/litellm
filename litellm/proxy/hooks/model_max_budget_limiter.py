@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -148,7 +149,23 @@ def _budget_model_candidates(model: str) -> tuple[str, ...]:
     cross-region ``us.anthropic.claude-opus-4-8``), or on the bare family name
     that Bedrock id shares with its direct-provider twin (``claude-opus-4-8``).
     """
-    return tuple(dict.fromkeys((model, model.split("/")[-1], *_bedrock_candidates(model))))
+    access_alias: Final = litellm.model_access_alias_map.get(model)
+    alias_candidates: Final = (
+        (access_alias, access_alias.split("/")[-1], *_bedrock_candidates(access_alias)) if access_alias else ()
+    )
+    return tuple(dict.fromkeys((model, model.split("/")[-1], *_bedrock_candidates(model), *alias_candidates)))
+
+
+def _resolve_model_budgets(model: str, model_max_budget: Mapping[str, object]) -> tuple[ResolvedModelBudget, ...]:
+    access_alias: Final = litellm.model_access_alias_map.get(model)
+    names: Final = (model, access_alias) if access_alias else (model,)
+    by_budget_model: Final = MappingProxyType({
+        resolved.budget_model: resolved
+        for name in names
+        for resolved in (resolve_model_budget(name, model_max_budget),)
+        if resolved is not None
+    })
+    return tuple(by_budget_model.values())
 
 
 def _bedrock_candidates(model: str) -> tuple[str, ...]:
@@ -253,8 +270,8 @@ def _resolve_entity_model_budgets(
         (entity_type, entity_id, resolved)
         for entity_type, entity_id, model_max_budget in entity_budgets
         if entity_id is not None and isinstance(model_max_budget, Mapping) and model_max_budget
-        for resolved in (resolve_model_budget(model=model, model_max_budget=model_max_budget),)
-        if resolved is not None and resolved.budget_config.budget_duration is not None
+        for resolved in _resolve_model_budgets(model=model, model_max_budget=model_max_budget)
+        if resolved.budget_config.budget_duration is not None
     )
 
 
@@ -356,20 +373,31 @@ class _PROXY_VirtualKeyModelMaxBudgetLimiter(RouterBudgetLimiting):
     ) -> bool:
         if not model_max_budget:
             return True
-        resolved: Final = resolve_model_budget(model=model, model_max_budget=model_max_budget)
-        if resolved is None:
-            verbose_proxy_logger.debug("Model %s not found in %s model_max_budget", model, entity_type.value)
-            return True
+        resolved_budgets: Final = _resolve_model_budgets(model=model, model_max_budget=model_max_budget)
+        active_spend_keys: Final = frozenset(
+            model_budget_spend_cache_key(entity_type, entity_id, budget.budget_model, budget.budget_config.budget_duration)
+            for budget in resolved_budgets
+        )
+        for resolved in resolved_budgets:
+            await self._check_resolved_model_budget(
+                entity_type, entity_id, model, resolved, exceeded_message, active_spend_keys
+            )
+        return True
 
+    async def _check_resolved_model_budget(
+        self,
+        entity_type: Litellm_EntityType,
+        entity_id: str | None,
+        model: str,
+        resolved: ResolvedModelBudget,
+        exceeded_message: str,
+        active_spend_keys: frozenset[str],
+    ) -> None:
         max_budget: Final = resolved.budget_config.max_budget
         if max_budget is None or max_budget < 0:
-            return True
-
+            return
         current_spend: Final = await self._get_spend_for_model_budget(
-            entity_type=entity_type,
-            entity_id=entity_id,
-            model=model,
-            resolved=resolved,
+            entity_type, entity_id, model, resolved, active_spend_keys
         )
         if current_spend >= max_budget:
             raise litellm.BudgetExceededError(
@@ -379,7 +407,6 @@ class _PROXY_VirtualKeyModelMaxBudgetLimiter(RouterBudgetLimiting):
                 entity_type=entity_type.value,
                 entity_id=entity_id,
             )
-        return True
 
     async def _get_spend_for_model_budget(
         self,
@@ -387,6 +414,7 @@ class _PROXY_VirtualKeyModelMaxBudgetLimiter(RouterBudgetLimiting):
         entity_id: str | None,
         model: str,
         resolved: ResolvedModelBudget,
+        active_spend_keys: frozenset[str],
     ) -> float:
         """Spend charged to this budget in the current window, legacy counter included.
 
@@ -400,16 +428,23 @@ class _PROXY_VirtualKeyModelMaxBudgetLimiter(RouterBudgetLimiting):
             budget_model=resolved.budget_model,
             budget_duration=resolved.budget_config.budget_duration,
         )
-        legacy_spend_key: Final = _legacy_request_model_spend_cache_key(
-            entity_type=entity_type,
-            entity_id=entity_id,
-            model=model,
-            resolved=resolved,
+        access_alias: Final = litellm.model_access_alias_map.get(model)
+        legacy_models: Final = (
+            (model, access_alias)
+            if access_alias and resolved.budget_model in _budget_model_candidates(access_alias)
+            else (model,)
+        )
+        legacy_spend_keys: Final = frozenset(
+            key
+            for legacy_model in legacy_models
+            for key in (_legacy_request_model_spend_cache_key(entity_type, entity_id, legacy_model, resolved),)
+            if key is not None and key not in active_spend_keys
         )
         current_spend: Final = _as_spend(await self._cached_spend(spend_key))
-        if legacy_spend_key is None or legacy_spend_key == spend_key:
-            return current_spend
-        return current_spend + _as_spend(await self._cached_spend(legacy_spend_key))
+        legacy_spends: Final = tuple(
+            _as_spend(spend) for spend in await asyncio.gather(*(self._cached_spend(key) for key in legacy_spend_keys))
+        )
+        return current_spend + sum(legacy_spends)
 
     async def _cached_spend(self, spend_key: str) -> float | None:
         redis_cache: Final = self.dual_cache.redis_cache

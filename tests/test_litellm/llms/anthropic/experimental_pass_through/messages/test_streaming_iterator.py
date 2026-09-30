@@ -18,7 +18,7 @@ from litellm.llms.anthropic.experimental_pass_through.messages.streaming_iterato
     _is_message_stop_chunk,
     _is_provider_error_chunk,
     anthropic_messages_response_as_sse_events,
-    is_anthropic_content_delta_chunk,
+    is_anthropic_content_chunk,
     parse_anthropic_error_event,
 )
 
@@ -231,22 +231,22 @@ def test_decoded_sse_data_line_swallows_invalid_json():
     assert _is_provider_error_chunk(malformed_frame) is False
 
 
-class TestIsAnthropicContentDeltaChunk:
+class TestIsAnthropicContentChunk:
     def test_dict_content_block_delta(self):
-        assert is_anthropic_content_delta_chunk({"type": "content_block_delta"}) is True
+        assert is_anthropic_content_chunk({"type": "content_block_delta"}) is True
 
     def test_dict_other_type(self):
-        assert is_anthropic_content_delta_chunk({"type": "message_start"}) is False
+        assert is_anthropic_content_chunk({"type": "message_start"}) is False
 
     def test_bytes_content_block_delta(self):
-        assert is_anthropic_content_delta_chunk(b"event: content_block_delta\ndata: {}\n\n") is True
+        assert is_anthropic_content_chunk(b"event: content_block_delta\ndata: {}\n\n") is True
 
     def test_bytes_other_event(self):
-        assert is_anthropic_content_delta_chunk(b"event: message_start\ndata: {}\n\n") is False
+        assert is_anthropic_content_chunk(b"event: message_start\ndata: {}\n\n") is False
 
     def test_neither_dict_nor_bytes(self):
-        assert is_anthropic_content_delta_chunk("content_block_delta") is False
-        assert is_anthropic_content_delta_chunk(None) is False
+        assert is_anthropic_content_chunk("content_block_delta") is False
+        assert is_anthropic_content_chunk(None) is False
 
 
 @pytest.mark.parametrize(
