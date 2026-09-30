@@ -4,6 +4,46 @@ import openai
 import pytest
 
 import litellm
+from openai import APIError, AsyncOpenAI, OpenAI
+
+
+@pytest.mark.parametrize("provider", ["veniceai", "publicai"])
+@pytest.mark.parametrize("status", [400, 401, 429, 503])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.asyncio
+async def test_json_provider_sdk_error_status(provider: str, status: int, stream: bool):
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status,
+            json={"error": {"message": "synthetic supplier rejection"}},
+            headers={"retry-after": "7"},
+        )
+
+    async with AsyncOpenAI(
+        api_key="synthetic", base_url="https://supplier.invalid/v1", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+    ) as client:
+        with pytest.raises(APIError) as error:
+            await litellm.acompletion(
+                model=f"{provider}/test-model", api_key="synthetic", client=client,
+                messages=[{"role": "user", "content": "test"}], stream=stream, num_retries=0,
+            )
+        assert error.value.status_code == status
+        if status == 429:
+            assert error.value.litellm_response_headers["retry-after"] == "7"
+
+    with OpenAI(
+        api_key="synthetic", base_url="https://supplier.invalid/v1", max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(respond)),
+    ) as client:
+        with pytest.raises(APIError) as error:
+            litellm.completion(
+                model=f"{provider}/test-model", api_key="synthetic", client=client,
+                messages=[{"role": "user", "content": "test"}], stream=stream, num_retries=0,
+            )
+        assert error.value.status_code == status
+        if status == 429:
+            assert error.value.litellm_response_headers["retry-after"] == "7"
 
 
 from litellm.litellm_core_utils.exception_mapping_utils import (
