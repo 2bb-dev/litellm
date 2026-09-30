@@ -2681,7 +2681,7 @@ def test_always_thinking_claude_chat_transform(local_model_cost_map, model):
 
     mapped = config.map_openai_params(
         non_default_params={
-            "tool_choice": "required",
+            "tool_choice": "auto",
             "temperature": 0.5,
             "top_p": 0.9,
         },
@@ -6265,58 +6265,28 @@ def test_disabled_thinking_omitted_only_for_always_on_models(
         assert request["thinking"] == {"type": "disabled"}
 
 
+@pytest.mark.parametrize("drop_params", [False, True])
+@pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"])
 @pytest.mark.parametrize(
     "tool_choice",
     ["required", {"type": "required"}, {"type": "function", "function": {"name": "get_weather"}}],
 )
-def test_forced_tool_choice_raises_clean_error_on_fable_5_1_without_drop_params(
-    local_model_cost_map, tool_choice, monkeypatch
+def test_forced_tool_choice_raises_clean_error_on_always_thinking_models(
+    local_model_cost_map, tool_choice, model, drop_params, monkeypatch
 ):
-    """Fable 5.1 400s on tool_choice type any/tool (thinking is always on and a
-    forced call would skip it); without drop_params the caller gets a clean
-    client-side 400 that explains the workaround, not a provider error."""
-    monkeypatch.setattr(litellm, "drop_params", False)
+    """These models 400 on tool_choice type any/tool (thinking is always on and a
+    forced call would skip it). The caller gets a clean client-side 400 even with
+    drop_params: silently downgrading to auto would drop the forced-call contract."""
+    monkeypatch.setattr(litellm, "drop_params", drop_params)
     config = AnthropicConfig()
 
     with pytest.raises(litellm.utils.UnsupportedParamsError, match="forced tool use"):
         config.map_openai_params(
-            non_default_params={"tool_choice": tool_choice},
+            non_default_params={"tool_choice": tool_choice, "parallel_tool_calls": False},
             optional_params={},
-            model="claude-fable-5-1",
-            drop_params=False,
+            model=model,
+            drop_params=drop_params,
         )
-
-
-@pytest.mark.parametrize(
-    "tool_choice",
-    ["required", {"type": "required"}, {"type": "function", "function": {"name": "get_weather"}}],
-)
-def test_forced_tool_choice_downgraded_to_auto_on_fable_5_1_with_drop_params(
-    local_model_cost_map, tool_choice
-):
-    config = AnthropicConfig()
-
-    result = config.map_openai_params(
-        non_default_params={"tool_choice": tool_choice},
-        optional_params={},
-        model="claude-fable-5-1",
-        drop_params=True,
-    )
-
-    assert result["tool_choice"] == {"type": "auto"}
-
-
-def test_forced_tool_choice_downgrade_keeps_parallel_tool_calls_flag(local_model_cost_map):
-    config = AnthropicConfig()
-
-    result = config.map_openai_params(
-        non_default_params={"tool_choice": "required", "parallel_tool_calls": False},
-        optional_params={},
-        model="claude-fable-5-1",
-        drop_params=True,
-    )
-
-    assert result["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
 
 
 @pytest.mark.parametrize("tool_choice, expected_type", [("auto", "auto"), ("none", "none")])
@@ -6359,14 +6329,13 @@ def test_forced_tool_choice_gating_driven_by_model_map_flag(local_model_cost_map
     monkeypatch.setitem(litellm.model_cost, "claude-zeta-9", {"supports_forced_tool_use": False})
     config = AnthropicConfig()
 
-    result = config.map_openai_params(
-        non_default_params={"tool_choice": "required"},
-        optional_params={},
-        model="claude-zeta-9",
-        drop_params=True,
-    )
-
-    assert result["tool_choice"] == {"type": "auto"}
+    with pytest.raises(litellm.utils.UnsupportedParamsError, match="forced tool use"):
+        config.map_openai_params(
+            non_default_params={"tool_choice": "required"},
+            optional_params={},
+            model="claude-zeta-9",
+            drop_params=True,
+        )
 
 
 def test_anthropic_drop_params_keeps_format_only_output_config(monkeypatch):

@@ -25,7 +25,9 @@ const stub = createServer(async (req, res) => {
   const body = JSON.parse(Buffer.concat(parts));
   received.push(body);
   receivedBetas.push(req.headers["anthropic-beta"] ?? "");
-  const toolName = body.tools?.[0]?.name;
+  const toolName = body.tools?.find(
+    (tool) => !tool.type || tool.type === "custom",
+  )?.name;
   res.writeHead(200, { "content-type": "text/event-stream" });
   assert.equal(
     new URL(req.url, "http://stub.invalid").pathname,
@@ -96,6 +98,12 @@ const runtime = loadRuntime(
         alias: "claude-opus-5-5",
         provider: "anthropic",
         model: "claude-opus-5-5",
+        baseUrl: stubUrl,
+      },
+      {
+        alias: "claude-sonnet-5-5",
+        provider: "anthropic",
+        model: "claude-sonnet-5-5",
         baseUrl: stubUrl,
       },
     ],
@@ -177,6 +185,24 @@ async def main():
     else:
       assert r['content'][0]['text']=='local routing works',r
     print('LiteLLM Opus 5.5 Messages stream='+str(stream)+' PASS')
+  sonnet_messages=[{'role':'user','content':[{'type':'document','source':{'type':'text','media_type':'text/plain','data':'forecast'},'citations':{'enabled':True}},{'type':'text','text':'hello'}]}]
+  for stream in (False,True):
+    r=await acreate(model='anthropic/claude-sonnet-5-5',api_base=base,api_key=key,max_tokens=1024,messages=sonnet_messages,stop_sequences=['END'],tools=[{'type':'web_search_20250305','name':'web_search','max_uses':1}],stream=stream)
+    if stream:
+      chunks=[x async for x in r]
+      wire=''.join(x.decode() if isinstance(x,bytes) else x if isinstance(x,str) else json.dumps(x) for x in chunks)
+      assert 'local routing works' in wire and 'message_stop' in wire,wire
+    else:
+      assert r['content'][0]['text']=='local routing works',r
+    print('LiteLLM Sonnet 5.5 Messages with a document, hosted tool and stop sequence stream='+str(stream)+' PASS')
+  for tool_choice in ('required',{'type':'function','function':{'name':'lookup_weather'}}):
+    try:
+      await litellm.acompletion(model='anthropic/claude-sonnet-5-5',api_base=base,api_key=key,max_tokens=128,messages=messages,tools=[{'type':'function','function':{'name':'lookup_weather','parameters':schema}}],tool_choice=tool_choice,drop_params=True)
+    except litellm.BadRequestError as error:
+      assert 'forced tool use' in str(error),error
+    else:
+      raise AssertionError('forced tool choice reached the backend')
+  print('LiteLLM Chat forced tool choice on Sonnet 5.5 fails closed with drop_params PASS')
   await asyncio.sleep(0.1)
 asyncio.run(main())`;
 try {
@@ -221,7 +247,24 @@ try {
     ])
       assert(betas.split(",").includes(beta), betas);
   }
-  const toolRequests = received.filter((payload) => payload.tools?.length);
+  const sonnet = received.filter(
+    (payload) => payload.model === "claude-sonnet-5-5",
+  );
+  assert.equal(sonnet.length, 2);
+  for (const payload of sonnet) {
+    assert.deepEqual(payload.stop_sequences, ["END"]);
+    assert.deepEqual(payload.tools, [
+      { type: "web_search_20250305", name: "web_search", max_uses: 1 },
+    ]);
+    assert.deepEqual(payload.messages[0].content[0], {
+      type: "document",
+      source: { type: "text", media_type: "text/plain", data: "forecast" },
+      citations: { enabled: true },
+    });
+  }
+  const toolRequests = received.filter(
+    (payload) => payload.model === "claude-haiku-4-5" && payload.tools?.length,
+  );
   assert.equal(toolRequests.length, 4);
   for (const payload of toolRequests) {
     assert.equal(payload.tools[0].name, "mcp__pi__lookup_weather");

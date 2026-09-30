@@ -637,14 +637,12 @@ class AmazonConverseConfig(BaseConfig):
                     status_code=400,
                 )
         elif tool_choice == "required":
-            if AnthropicModelInfo.forced_tool_use_downgraded(model, drop_params):
-                return self._auto_tool_choice()
+            AnthropicModelInfo.reject_unsupported_forced_tool_use(model)
             return ToolChoiceValuesBlock(any={})
         elif tool_choice == "auto":
             return self._auto_tool_choice()
         elif isinstance(tool_choice, dict):
-            if AnthropicModelInfo.forced_tool_use_downgraded(model, drop_params):
-                return self._auto_tool_choice()
+            AnthropicModelInfo.reject_unsupported_forced_tool_use(model)
             # only supported for anthropic + mistral models - https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolChoice.html
             specific_tool: Final = SpecificToolChoiceBlock(
                 name=make_valid_bedrock_tool_name(tool_choice.get("function", {}).get("name", ""))

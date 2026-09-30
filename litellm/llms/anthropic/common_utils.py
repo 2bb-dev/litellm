@@ -39,10 +39,6 @@ from litellm.types.llms.anthropic import (
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.proxy.model_listing import ModelInfoResponse
 
-DROP_FORCED_TOOL_CHOICE_WARNING: Final = (
-    "Downgrading forced tool_choice to 'auto' for model=%s (drop_params=True): this model rejects tool_choice type "
-    "'any'/'tool' with a 400 because thinking is always on and a forced call would skip it."
-)
 DROP_DISABLED_THINKING_WARNING: Final = (
     "Dropping `thinking={'type': 'disabled'}` for model=%s: thinking is always on for this model and cannot be "
     "disabled (the alternative is a provider 400). The model will still think adaptively, its response can contain "
@@ -431,39 +427,28 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         return AnthropicModelInfo._get_model_capability(model, "supports_forced_tool_use") is False
 
     @staticmethod
-    def forced_tool_use_downgraded(model: str, drop_params: bool) -> bool:
-        """True when the model map flags the model with
-        ``supports_forced_tool_use: false`` (Fable 5.1 / Mythos 5.1 400 on
-        ``any``/``tool``) and ``drop_params`` asks for the ``auto`` downgrade;
-        raises a clean client-side 400 for such models without ``drop_params``."""
-        if not AnthropicModelInfo.forced_tool_use_unsupported(model):
-            return False
-        if not (litellm.drop_params or drop_params):
+    def reject_unsupported_forced_tool_use(model: str) -> None:
+        """Raise a client-side 400 for a forced tool choice on a model the model map flags with
+        ``supports_forced_tool_use: false`` (always-thinking Claude models 400 on ``any``/``tool``).
+        ``drop_params`` does not downgrade it to ``auto``: the forced call is the caller's contract."""
+        if AnthropicModelInfo.forced_tool_use_unsupported(model):
             raise litellm.utils.UnsupportedParamsError(
                 message=(
-                    f"{model} does not support forced tool use (tool_choice='required' or a named tool). "
-                    "Use tool_choice='auto' and tell the model in the prompt when to call the tool, or set "
-                    "`litellm.drop_params = True` to downgrade to 'auto' automatically."
+                    f"{model} does not support forced tool use (tool_choice='required' or a named tool) because "
+                    "thinking is always on. Use tool_choice='auto' and tell the model in the prompt when to call "
+                    "the tool."
                 ),
                 status_code=400,
             )
-        litellm.verbose_logger.warning(DROP_FORCED_TOOL_CHOICE_WARNING, model)
-        return True
 
     @staticmethod
     def _apply_forced_tool_choice(
         model: str,
         tool_choice: AnthropicMessagesToolChoice,
-        drop_params: bool,
     ) -> AnthropicMessagesToolChoice:
-        if tool_choice["type"] not in ("any", "tool"):
-            return tool_choice
-        if not AnthropicModelInfo.forced_tool_use_downgraded(model, drop_params):
-            return tool_choice
-        disable_parallel: Final = tool_choice.get("disable_parallel_tool_use")
-        if disable_parallel is None:
-            return AnthropicMessagesToolChoice(type="auto")
-        return AnthropicMessagesToolChoice(type="auto", disable_parallel_tool_use=disable_parallel)
+        if tool_choice["type"] in ("any", "tool"):
+            AnthropicModelInfo.reject_unsupported_forced_tool_use(model)
+        return tool_choice
 
     @staticmethod
     def _strip_version_suffix(model: str) -> str:
