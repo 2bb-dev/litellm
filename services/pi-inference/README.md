@@ -119,7 +119,8 @@ and refresh remain owned by Pi and the existing credential store
 
 Custom flat tool names become bounded, collision-safe `mcp__pi__…` aliases for
 upstream requests. Claude Code core names and existing `mcp__` names retain Pi's
-normal handling. Definitions, forced native tool choice, and history use the
+normal handling. Anthropic-defined and server tools, which are declared by a
+versioned `type`, keep their names. Definitions, forced native tool choice, and history use the
 same per-request map; responses, including streaming, restore client names.
 There is no shared tool registry or tool execution. IDs, arguments, schemas,
 cache metadata, and signed/redacted thinking are not rewritten
@@ -174,13 +175,15 @@ explicit transport budget remains enforced alongside the canonical budget;
 no extra allowance is created. This map does not enable fallback on the shared
 proxy
 
-Messages returns terminal usage and supports text streaming. With an Anthropic
-API key it forwards the upstream JSON or SSE response body; subscription OAuth
-responses still use the Pi adapter. It retains supported thinking/tool blocks,
-signed thinking round-trips and refusal stop reasons; tool definitions are data,
-never locally executed. `stop_sequences` is explicitly unsupported. Other
-unsupported request fields/features are explicitly rejected. This is not a complete drop-in
-implementation of every upstream API
+Messages returns terminal usage and supports text streaming. It forwards the
+upstream JSON or SSE response body in API-key and OAuth modes; OAuth only restores
+client tool names. The backend validates the fields it reads: model and output
+limits, thinking and sampling constraints, tool choice, custom tool definitions,
+and text, tool and thinking blocks. Every other field and block reaches Anthropic
+unchanged, including `stop_sequences`, documents, search results, citations,
+server and Anthropic-defined tools and their result blocks, `container`,
+`mcp_servers` and `context_management`; Anthropic validates them. Tool
+definitions are data, never locally executed
 
 Structured stdout traces correlate request/trace IDs with slot, route/provider,
 latency, status, and usage, without logging prompts, responses, or secrets.

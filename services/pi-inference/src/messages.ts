@@ -4,7 +4,6 @@ import type {
   Api,
   AssistantMessage,
   Context,
-  ImageContent,
   Message,
   Model,
   TextContent,
@@ -22,86 +21,95 @@ import {
 
 const text = z.string().max(32 * 1024 * 1024);
 const name = z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/);
-const cache = z.strictObject({
-  type: z.literal("ephemeral"),
-  ttl: z.enum(["5m", "1h"]).optional(),
-});
-const textBlock = z.strictObject({
-  type: z.literal("text"),
-  text,
-  cache_control: cache.optional(),
-});
-const imageBlock = z.strictObject({
-  type: z.literal("image"),
-  source: z.strictObject({
-    type: z.literal("base64"),
-    media_type: z.enum(["image/jpeg", "image/png", "image/gif", "image/webp"]),
-    data: z
-      .string()
-      .min(4)
-      .max(7_000_000)
-      .regex(
-        /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/,
-      ),
-  }),
-  cache_control: cache.optional(),
-});
-const toolResult = z.strictObject({
+const typeName = z.string().regex(/^[a-z][a-z0-9_]{0,63}$/);
+// The backend reads these blocks; every other block reaches Anthropic unchanged.
+const interpretedBlocks = new Set([
+  "text",
+  "tool_use",
+  "tool_result",
+  "thinking",
+  "redacted_thinking",
+  "tool_addition",
+  "tool_removal",
+]);
+const forwardedBlock = z
+  .looseObject({ type: typeName })
+  .refine((block) => !interpretedBlocks.has(block.type));
+const textBlock = z.looseObject({ type: z.literal("text"), text });
+const inputBlocks = z.union([textBlock, forwardedBlock]);
+const toolResult = z.looseObject({
   type: z.literal("tool_result"),
   tool_use_id: name,
-  content: z
-    .union([text, z.array(z.union([textBlock, imageBlock])).max(256)])
-    .optional(),
+  content: z.union([text, z.array(inputBlocks).max(256)]).optional(),
   is_error: z.boolean().optional(),
-  cache_control: cache.optional(),
 });
-const assistantBlock = z.discriminatedUnion("type", [
+const assistantBlock = z.union([
   textBlock,
-  z.strictObject({
+  z.looseObject({
     type: z.literal("tool_use"),
     id: name,
     name,
     input: z.record(z.string(), z.json()),
-    cache_control: cache.optional(),
   }),
-  z.strictObject({
+  z.looseObject({
     type: z.literal("thinking"),
     thinking: text,
     signature: text.min(1),
   }),
-  z.strictObject({ type: z.literal("redacted_thinking"), data: text.min(1) }),
+  z.looseObject({ type: z.literal("redacted_thinking"), data: text.min(1) }),
+  forwardedBlock,
 ]);
-const effort = z.enum(["low", "medium", "high", "xhigh", "max"]);
-const toolChange = z.strictObject({
-  type: z.enum(["tool_addition", "tool_removal"]),
-  tool: z.strictObject({ type: z.literal("tool_reference"), name }),
-});
-const systemMessage = z.strictObject({
+const toolChange = <T extends "tool_addition" | "tool_removal">(type: T) =>
+  z.looseObject({
+    type: z.literal(type),
+    tool: z.looseObject({ type: z.literal("tool_reference"), name }),
+  });
+const systemMessage = z.looseObject({
   role: z.literal("system"),
-  content: z.union([text, z.array(z.union([textBlock, toolChange])).max(4096)]),
-  output_config: z.strictObject({ effort }).optional(),
-  clear_at: z.literal("next_user_message").optional(),
+  content: z.union([
+    text,
+    z
+      .array(
+        z.union([
+          textBlock,
+          toolChange("tool_addition"),
+          toolChange("tool_removal"),
+          forwardedBlock,
+        ]),
+      )
+      .max(4096),
+  ]),
 });
-const natural = z.number().int().nonnegative();
-const requestSchema = z.strictObject({
+const customTool = z.looseObject({
+  type: z.literal("custom").optional(),
+  name,
+  description: text.optional(),
+  input_schema: z
+    .record(z.string(), z.json())
+    .refine((value) => value.type === "object"),
+});
+// Anthropic-defined client and server tools are declared by their versioned type.
+const anthropicTool = z
+  .looseObject({ type: typeName, name: name.optional() })
+  .refine((tool) => tool.type !== "custom");
+const requestSchema = z.looseObject({
   model: z.string().min(1).max(256),
   max_tokens: z.number().int().positive(),
   stream: z.boolean().optional(),
-  cache_control: cache.nullable().optional(),
   messages: z
     .array(
       z.discriminatedUnion("role", [
-        z.strictObject({
+        z.looseObject({
           role: z.literal("user"),
           content: z.union([
             text.min(1),
             z
-              .array(z.union([textBlock, imageBlock, toolResult]))
+              .array(z.union([textBlock, toolResult, forwardedBlock]))
               .min(1)
               .max(4096),
           ]),
         }),
-        z.strictObject({
+        z.looseObject({
           role: z.literal("assistant"),
           content: z.union([
             text.min(1),
@@ -121,110 +129,69 @@ const requestSchema = z.strictObject({
     ),
   system: z.union([text, z.array(textBlock).max(256)]).optional(),
   tools: z
-    .array(
-      z.strictObject({
-        type: z.literal("custom").optional(),
-        name,
-        description: text.optional(),
-        input_schema: z
-          .record(z.string(), z.json())
-          .refine((value) => value.type === "object"),
-        eager_input_streaming: z.boolean().optional(),
-        strict: z.boolean().optional(),
-        defer_loading: z.boolean().optional(),
-        cache_control: cache.optional(),
-      }),
-    )
+    .array(z.union([customTool, anthropicTool]))
     .max(1000)
     .optional(),
   thinking: z
     .discriminatedUnion("type", [
-      z.strictObject({
+      z.looseObject({
         type: z.literal("enabled"),
         budget_tokens: z.number().int().min(1024),
-        display: z.enum(["summarized", "omitted"]).optional(),
       }),
-      z.strictObject({
-        type: z.literal("adaptive"),
-        display: z.enum(["summarized", "omitted", "updates"]).optional(),
-        block_binding: z
-          .strictObject({
-            prefix_mismatch_behavior: z.enum(["error", "drop_block"]),
-          })
-          .optional(),
-      }),
-      z.strictObject({ type: z.literal("disabled") }),
+      z.looseObject({ type: z.literal("adaptive") }),
+      z.looseObject({ type: z.literal("disabled") }),
     ])
     .optional(),
-  output_config: z
-    .strictObject({
-      effort: effort.optional(),
-      task_budget: z
-        .strictObject({
-          type: z.literal("tokens"),
-          total: z.number().int().positive(),
-          remaining: natural.optional(),
-        })
-        .optional(),
-      format: z
-        .strictObject({
-          type: z.literal("json_schema"),
-          schema: z.record(z.string(), z.json()),
-        })
-        .optional(),
-    })
-    .optional(),
+  output_config: z.looseObject({ effort: z.string().optional() }).optional(),
   tool_choice: z
     .discriminatedUnion("type", [
-      z.strictObject({
-        type: z.literal("auto"),
-        disable_parallel_tool_use: z.boolean().optional(),
-      }),
-      z.strictObject({
-        type: z.literal("any"),
-        disable_parallel_tool_use: z.boolean().optional(),
-      }),
-      z.strictObject({
-        type: z.literal("tool"),
-        name,
-        disable_parallel_tool_use: z.boolean().optional(),
-      }),
-      z.strictObject({ type: z.literal("none") }),
+      z.looseObject({ type: z.literal("auto") }),
+      z.looseObject({ type: z.literal("any") }),
+      z.looseObject({ type: z.literal("tool"), name }),
+      z.looseObject({ type: z.literal("none") }),
     ])
     .optional(),
-  temperature: z.number().min(0).max(1).optional(),
-  top_p: z.number().min(0).max(1).optional(),
-  top_k: natural.optional(),
-  stop_sequences: z.array(text.min(1)).max(64).optional(),
-  metadata: z
-    .strictObject({ user_id: z.string().max(256).optional() })
-    .optional(),
+  temperature: z.number().optional(),
+  top_p: z.number().optional(),
+  top_k: z.number().optional(),
 });
 type NativeRequest = z.infer<typeof requestSchema>;
-type InputBlock = z.infer<typeof textBlock> | z.infer<typeof imageBlock>;
-const inputBlock = (block: InputBlock): TextContent | ImageContent =>
-  block.type === "text"
-    ? { type: "text", text: block.text }
-    : {
-        type: "image",
-        data: block.source.data,
-        mimeType: block.source.media_type,
-      };
+type Tool = NonNullable<NativeRequest["tools"]>[number];
+type CustomTool = z.infer<typeof customTool>;
+const isCustomTool = (tool: Tool): tool is CustomTool =>
+  tool.type === undefined || tool.type === "custom";
+const is =
+  <T extends string>(type: T) =>
+  <B extends { type: string }>(block: B): block is Extract<B, { type: T }> =>
+    block.type === type;
+// Pi's context never reaches Anthropic: the upstream body carries the client's blocks.
+const forwardedText = (block: { type: string }): TextContent => ({
+  type: "text",
+  text: `[${block.type}]`,
+});
+const inputBlock = (block: z.infer<typeof inputBlocks>): TextContent =>
+  is("text")(block) ? { type: "text", text: block.text } : forwardedText(block);
 
 function toContext(input: NativeRequest, model: Model<Api>): Context {
-  const declaredTools = new Map(input.tools?.map((tool) => [tool.name, tool]));
+  const customTools = input.tools?.filter(isCustomTool) ?? [];
+  const declaredTools = new Map(customTools.map((tool) => [tool.name, tool]));
+  const anthropicTools = new Set(
+    input.tools?.flatMap((tool) =>
+      !isCustomTool(tool) && tool.name ? [tool.name] : [],
+    ),
+  );
   const lateNames = new Set(
     input.messages.flatMap((message) =>
       message.role === "system" && Array.isArray(message.content)
-        ? message.content.flatMap((block) =>
-            block.type === "tool_addition" ? [block.tool.name] : [],
-          )
+        ? message.content
+            .filter(is("tool_addition"))
+            .map((block) => block.tool.name)
         : [],
     ),
   );
   const calls = input.messages.flatMap((message) =>
     message.role === "assistant" && Array.isArray(message.content)
-      ? message.content.filter((block) => block.type === "tool_use")
+      ? message.content.filter(is("tool_use"))
       : [],
   );
   const messages = input.messages.flatMap((message): Message[] => {
@@ -237,11 +204,10 @@ function toContext(input: NativeRequest, model: Model<Api>): Context {
             typeof message.content === "string"
               ? message.content
               : blocks
-                  .filter((block) => block.type === "text")
+                  .filter(is("text"))
                   .map((block) => block.text)
                   .join("\n\n"),
-          toolsAdded: blocks.flatMap((block) => {
-            if (block.type !== "tool_addition") return [];
+          toolsAdded: blocks.filter(is("tool_addition")).flatMap((block) => {
             const tool = declaredTools.get(block.tool.name);
             return tool
               ? [
@@ -253,9 +219,9 @@ function toContext(input: NativeRequest, model: Model<Api>): Context {
                 ]
               : [];
           }),
-          toolsRemoved: blocks.flatMap((block) =>
-            block.type === "tool_removal" ? [{ name: block.tool.name }] : [],
-          ),
+          toolsRemoved: blocks
+            .filter(is("tool_removal"))
+            .map((block) => ({ name: block.tool.name })),
           timestamp: 0,
         },
       ];
@@ -265,27 +231,28 @@ function toContext(input: NativeRequest, model: Model<Api>): Context {
         typeof message.content === "string"
           ? [{ type: "text", text: message.content }]
           : message.content.map((block) => {
-              if (block.type === "text")
-                return { type: "text", text: block.text };
-              if (block.type === "tool_use")
+              if (is("text")(block)) return { type: "text", text: block.text };
+              if (is("tool_use")(block) && !anthropicTools.has(block.name))
                 return {
                   type: "toolCall",
                   id: block.id,
                   name: block.name,
                   arguments: block.input,
                 };
-              if (block.type === "thinking")
+              if (is("thinking")(block))
                 return {
                   type: "thinking",
                   thinking: block.thinking,
                   thinkingSignature: block.signature,
                 };
-              return {
-                type: "thinking",
-                thinking: "",
-                thinkingSignature: block.data,
-                redacted: true,
-              };
+              if (is("redacted_thinking")(block))
+                return {
+                  type: "thinking",
+                  thinking: "",
+                  thinkingSignature: block.data,
+                  redacted: true,
+                };
+              return forwardedText(block);
             });
       return [
         {
@@ -304,7 +271,7 @@ function toContext(input: NativeRequest, model: Model<Api>): Context {
       return [{ ...message, content: message.content, timestamp: 0 }];
     return message.content.map(
       (block): Message =>
-        block.type !== "tool_result"
+        !is("tool_result")(block)
           ? { role: "user", content: [inputBlock(block)], timestamp: 0 }
           : {
               role: "toolResult",
@@ -326,17 +293,19 @@ function toContext(input: NativeRequest, model: Model<Api>): Context {
       typeof input.system === "string"
         ? input.system
         : input.system?.map((block) => block.text).join("\n\n"),
-    tools: input.tools
-      ?.filter(
-        (tool) =>
-          tool.name !== "__pi_deferred_placeholder__" &&
-          !lateNames.has(tool.name),
-      )
-      .map((tool) => ({
-        name: tool.name,
-        description: tool.description ?? "",
-        parameters: tool.input_schema,
-      })),
+    tools:
+      input.tools &&
+      customTools
+        .filter(
+          (tool) =>
+            tool.name !== "__pi_deferred_placeholder__" &&
+            !lateNames.has(tool.name),
+        )
+        .map((tool) => ({
+          name: tool.name,
+          description: tool.description ?? "",
+          parameters: tool.input_schema,
+        })),
   };
 }
 
@@ -415,12 +384,16 @@ function nativePayload(
   );
   const nativeOutputTools: Record<string, unknown>[] | undefined =
     nativeTools?.map((tool) => {
-      const converted = convertedByName.get(tool.name);
-      return {
-        ...tool,
-        name: converted?.name ?? tool.name,
-        ...(converted?.defer_loading ? { defer_loading: true } : {}),
-      };
+      const converted = isCustomTool(tool)
+        ? convertedByName.get(tool.name)
+        : undefined;
+      return converted
+        ? {
+            ...tool,
+            name: converted.name,
+            ...(converted.defer_loading ? { defer_loading: true } : {}),
+          }
+        : tool;
     });
   const placeholder = tools?.find(
     (tool) => tool.name === "__pi_deferred_placeholder__",
@@ -448,7 +421,7 @@ function nativePayload(
         : {
             ...message,
             content: message.content.map((block) =>
-              block.type === "tool_use"
+              is("tool_use")(block)
                 ? { ...block, name: names.get(block.id) ?? block.name }
                 : block,
             ),
@@ -503,7 +476,7 @@ export function prepareMessages(
   for (const message of input.messages) {
     if (message.role !== "system" || !Array.isArray(message.content)) continue;
     for (const block of message.content) {
-      if (block.type === "text") continue;
+      if (!is("tool_addition")(block) && !is("tool_removal")(block)) continue;
       if (
         block.type === "tool_addition" &&
         (changedTools.has(block.tool.name) ||
@@ -513,10 +486,6 @@ export function prepareMessages(
       changedTools.add(block.tool.name);
     }
   }
-  if (input.stop_sequences !== undefined)
-    return invalid(
-      "stop_sequences is unsupported: Pi does not preserve the matched stop sequence",
-    );
   const alwaysThinks =
     model.compat?.forceAdaptiveThinking === true &&
     model.thinkingLevelMap?.off === null;
@@ -566,22 +535,29 @@ export function prepareMessages(
     !input.tools?.some((tool) => tool.name === choice.name)
   )
     return invalid("tool_choice names an unknown tool");
-  if (
-    new Set(input.tools?.map((tool) => tool.name.toLowerCase())).size !==
-    (input.tools?.length ?? 0)
-  )
+  const toolNames =
+    input.tools?.flatMap((tool) =>
+      tool.name ? [tool.name.toLowerCase()] : [],
+    ) ?? [];
+  if (new Set(toolNames).size !== toolNames.length)
     return invalid("Tool names must be unique ignoring case");
-  const context = toContext(input, model);
   if (
     !model.input.includes("image") &&
-    context.messages.some(
+    input.messages.some(
       (message) =>
-        message.role !== "assistant" &&
+        message.role === "user" &&
         Array.isArray(message.content) &&
-        message.content.some((block) => block.type === "image"),
+        message.content.some(
+          (block) =>
+            block.type === "image" ||
+            (is("tool_result")(block) &&
+              Array.isArray(block.content) &&
+              block.content.some((item) => item.type === "image")),
+        ),
     )
   )
     return invalid("Model does not support images");
+  const context = toContext(input, model);
   return {
     ok: true,
     value: {

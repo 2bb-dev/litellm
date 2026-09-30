@@ -443,7 +443,7 @@ async function sidecar(
   };
 }
 
-test("API-key native JSON preserves upstream response fields and unknown blocks", async () => {
+test("API-key native JSON forwards stop sequences and preserves the matched one", async () => {
   const original = {
     id: "msg_original",
     type: "message",
@@ -455,16 +455,20 @@ test("API-key native JSON preserves upstream response fields and unknown blocks"
     stop_details: { reason: "matched" },
     usage: { input_tokens: 4, output_tokens: 2 },
   };
-  let requestStream: unknown;
+  let received: Record<string, unknown> = {};
   const backend = await sidecar((res, body) => {
-    requestStream = body.stream;
+    received = body;
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(original));
   });
   try {
-    const response = await backend.call({ stream: false });
+    const response = await backend.call({
+      stream: false,
+      stop_sequences: ["END"],
+    });
     assert.equal(response.status, 200);
-    assert.equal(requestStream, false);
+    assert.equal(received.stream, false);
+    assert.deepEqual(received.stop_sequences, ["END"]);
     assert.deepEqual(await response.json(), original);
   } finally {
     await backend.close();
