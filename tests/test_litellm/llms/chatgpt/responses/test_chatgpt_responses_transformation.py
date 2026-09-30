@@ -4,20 +4,23 @@ Tests for ChatGPT subscription Responses API transformation
 Source: litellm/llms/chatgpt/responses/transformation.py
 """
 
+import hashlib
 import json
 import os
 import sys
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import httpx
 import pytest
 
 import litellm
 from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
+from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
 from litellm.llms.openai.common_utils import OpenAIError
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
-from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
-from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
 from litellm.main import responses_api_bridge_check
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
@@ -25,6 +28,348 @@ from litellm.utils import ProviderConfigManager
 
 
 class TestChatGPTResponsesAPITransformation:
+    @pytest.mark.parametrize("is_async,prompt_swap", [(False, False), (True, False), (False, True)])
+    @pytest.mark.asyncio
+    async def test_public_responses_ignores_chat_bridge_for_chatgpt(
+        self, tmp_path, monkeypatch, is_async, prompt_swap, respx_mock
+    ):
+        monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+        monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(tmp_path))
+        monkeypatch.setenv("CHATGPT_API_BASE", "https://chatgpt.fixture")
+        (tmp_path / "auth.json").write_text(
+            json.dumps({"access_token": "fixture-token", "account_id": "fixture-account", "expires_at": 4102444800})
+        )
+        captured: Final = []
+        payload: Final = {
+            "id": "resp_fixture",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "model": "gpt-6-sol",
+            "output": [],
+        }
+
+        def backend(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path.endswith("/chat/completions"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "chatcmpl_fixture",
+                        "object": "chat.completion",
+                        "created": 1700000000,
+                        "model": "gpt-6-sol",
+                        "choices": [
+                            {"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    },
+                )
+
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=f"data: {json.dumps({'type': 'response.completed', 'response': payload})}\n\n",
+            )
+
+        kwargs: Final = dict(
+            model="chatgpt/gpt-6-sol",
+            input="hello",
+            use_chat_completions_api=True,
+            extra_headers={"Authorization": "caller", "ChatGPT-Account-Id": "caller"},
+            extra_body={"model": "caller-model", "store": True, "service_tier": "caller"},
+            num_retries=0,
+        )
+        from litellm.litellm_core_utils.litellm_logging import Logging
+
+        logging_obj: Final = MagicMock(spec=Logging)
+        logging_obj.model_call_details = {}
+        logging_obj.caching_details = None
+        logging_obj.completion_start_time = None
+        logging_obj.dynamic_success_callbacks = []
+        logging_obj.should_run_prompt_management_hooks.return_value = True
+        logging_obj.get_chat_completion_prompt.return_value = (
+            "chatgpt/gpt-6-sol",
+            [{"role": "user", "content": "hello"}],
+            {},
+        )
+        request_kwargs: Final = {
+            **kwargs,
+            **(
+                {"model": "openai/gpt-6-sol", "prompt_id": "fixture-prompt", "litellm_logging_obj": logging_obj}
+                if prompt_swap
+                else {}
+            ),
+        }
+        respx_mock.route(host="chatgpt.fixture").mock(side_effect=backend)
+        if is_async:
+            await litellm.aresponses(**request_kwargs)
+        else:
+            litellm.responses(**request_kwargs)
+        assert len(captured) == 1
+        request: Final = captured[0]
+        assert request.method == "POST"
+        assert request.url.path == "/responses"
+        assert request.headers["authorization"] == "Bearer fixture-token"
+        assert request.headers["chatgpt-account-id"] == "fixture-account"
+        body: Final = json.loads(request.content)
+        assert body["model"] == "gpt-6-sol"
+        assert body["store"] is False
+        assert body["stream"] is True
+        assert "service_tier" not in body
+
+    @pytest.mark.parametrize(
+        "is_async,stream,api_base,response_format",
+        [
+            (is_async, stream, api_base, "sse")
+            for is_async in (False, True)
+            for stream in (False, True)
+            for api_base in ("https://chatgpt.fixture", "https://chatgpt.fixture?route=create")
+        ]
+        + [(False, False, "https://chatgpt.fixture", "json")],
+    )
+    @pytest.mark.asyncio
+    async def test_final_http_boundary_preserves_chatgpt_provider_policy(
+        self, tmp_path, monkeypatch, is_async, stream, api_base, response_format
+    ):
+        monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(tmp_path))
+        monkeypatch.setenv("CHATGPT_API_BASE", "https://chatgpt.fixture")
+        (tmp_path / "auth.json").write_text(
+            json.dumps(
+                {
+                    "access_token": "fixture-provider-token",
+                    "account_id": "fixture-provider-account",
+                    "expires_at": 4102444800,
+                }
+            )
+        )
+        captured = []
+        payload = {
+            "id": "resp_fixture",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "model": "gpt-6-sol",
+            "output": [],
+        }
+
+        def backend(request):
+            captured.append(request)
+            return httpx.Response(
+                200,
+                headers={
+                    "content-type": "application/json" if response_format == "json" else "text/event-stream",
+                    "request-id": "fixture-other-request",
+                    "x-ratelimit-remaining-requests": "101",
+                    "x-ratelimit-remaining-tokens": "102",
+                    "x-ratelimit-limit-requests": "103",
+                    "x-ratelimit-limit-tokens": "104",
+                    "x-ratelimit-reset-requests": "105",
+                    "x-ratelimit-reset-tokens": "106",
+                    "x-request-id": "fixture-request",
+                    "retry-after": "7",
+                    "set-cookie": "fixture-cookie=private",
+                    "x-codex-turn-state": "fixture-turn-state",
+                    "llm_provider-set-cookie": "fixture-prefixed-cookie=private",
+                    "x-private-backend-header": "private",
+                },
+                text=(
+                    json.dumps(payload)
+                    if response_format == "json"
+                    else f"data: {json.dumps({'type': 'response.completed', 'response': payload})}\n\n"
+                ),
+            )
+
+        from litellm.litellm_core_utils.credential_ownership import CONTEXT as CREDENTIAL_CONTEXT
+        from litellm.litellm_core_utils.credential_ownership import DISPATCH, select_credential
+        from litellm.litellm_core_utils.terminal_receipt_evidence import Terminal
+        from litellm.litellm_core_utils.terminal_receipt_hooks import CONTEXT, STAMP, Session
+
+        registration_path: Final = tmp_path / "registration.json"
+        registration_path.write_text(
+            json.dumps(
+                {
+                    "v": 1,
+                    "source": "byok",
+                    "registration_id": str(uuid4()),
+                    "registration_revision": str(uuid4()),
+                    "account_sha256": hashlib.sha256(b"fixture-provider-account").hexdigest(),
+                    "api_base": "https://chatgpt.fixture",
+                }
+            )
+        )
+        registration_path.chmod(0o600)
+        monkeypatch.setenv("OPENORANGE_CHATGPT_CREDENTIAL_REGISTRATION_FILE", str(registration_path))
+        session: Final = Session(
+            root=MagicMock(),
+            attempt_id=str(uuid4()),
+            terminal=Terminal(deployment_id="fixture", model="chatgpt/gpt-6-sol", provider="chatgpt"),
+            base=None,
+            begun=True,
+        )
+        metadata: Final = {
+            CONTEXT: session,
+            CREDENTIAL_CONTEXT: select_credential({"litellm_params": {"model": "chatgpt/gpt-6-sol"}}, {}, "fixture"),
+        }
+        config = ChatGPTResponsesAPIConfig()
+        from litellm.litellm_core_utils.terminal_receipt_oauth import AccountSnapshot
+        from litellm.llms.chatgpt.authenticator import Authenticator
+
+        class RotatingAuthenticator(Authenticator):
+            def get_account_snapshot(self, access_token: str | None) -> AccountSnapshot | None:
+                snapshot: Final = super().get_account_snapshot(access_token)
+                (tmp_path / "auth.json").write_text(
+                    json.dumps(
+                        {
+                            "access_token": "fixture-refreshed-token",
+                            "account_id": "fixture-provider-account",
+                            "expires_at": 4102444800,
+                        }
+                    )
+                )
+                return snapshot
+
+        config.authenticator = RotatingAuthenticator()
+        logging_obj = MagicMock()
+        logging_obj.model_call_details = {STAMP: session}
+        logging_obj.dynamic_success_callbacks = []
+        protected_headers: Final = (
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "chatgpt-account-id",
+            "openai-organization",
+            "openai-project",
+            "originator",
+            "user-agent",
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "content-type",
+            "accept",
+        )
+        caller_headers: Final = {
+            "aUtHoRiZaTiOn": "Bearer fixture-caller-token",
+            "chatgpt-account-id": "fixture-caller-account",
+            "originator": "caller",
+            "User-Agent": "caller",
+            "Cookie": "fixture-cookie=caller",
+            "session-id": "fixture-session",
+            "thread-id": "fixture-thread",
+            "x-codex-turn-state": "fixture-provider-replay",
+            **{key: "caller-protected" for key in protected_headers if key != "authorization"},
+            **{key.replace("-", "_"): "caller-underscore" for key in protected_headers},
+            "session_id": "fixture-underscore-session",
+        }
+        kwargs = dict(
+            model="gpt-6-sol",
+            input="hello",
+            responses_api_provider_config=config,
+            response_api_optional_request_params={"stream": stream, "extra_headers": caller_headers},
+            custom_llm_provider="chatgpt",
+            litellm_params=GenericLiteLLMParams(metadata=metadata, api_base=api_base),
+            logging_obj=logging_obj,
+            extra_headers=caller_headers,
+            extra_body={
+                "model": "gpt-other-expensive",
+                "unknown_backend_option": "caller",
+                "extra_headers": {"Authorization": "nested"},
+                "store": True,
+                "stream": False,
+                "include": [],
+                "prompt_cache_key": "fixture-cache" if response_format == "sse" else "",
+            },
+        )
+        transport = httpx.MockTransport(backend)
+        handler = BaseLLMHTTPHandler()
+        if is_async:
+            async with httpx.AsyncClient(transport=transport) as http_client:
+                client = AsyncHTTPHandler()
+                await client.client.aclose()
+                client.client = http_client
+                result = await handler.async_response_api_handler(**kwargs, client=client)
+        else:
+            with httpx.Client(transport=transport) as http_client:
+                result = handler.response_api_handler(**kwargs, client=HTTPHandler(client=http_client))
+        assert len(captured) == 1
+        request = captured[0]
+        assert not any(value in ("caller-protected", "caller-underscore") for value in request.headers.values())
+        assert request.headers["authorization"] == "Bearer fixture-refreshed-token"
+        sent_digest: Final = hashlib.sha256(request.headers["authorization"].removeprefix("Bearer ").encode()).digest()
+        assert session.oauth.key_digest == sent_digest
+        assert logging_obj.model_call_details[DISPATCH].key_digest == sent_digest
+        assert request.headers["chatgpt-account-id"] == "fixture-provider-account"
+        assert request.headers["originator"] != "caller"
+        assert request.headers["user-agent"] != "caller"
+        assert "cookie" not in request.headers
+        assert request.headers["session-id"] == "fixture-session"
+        assert request.headers["thread-id"] == "fixture-thread"
+        assert request.headers["x-codex-turn-state"] == "fixture-provider-replay"
+        assert request.headers["session_id"] == (
+            "fixture-cache" if response_format == "sse" else "fixture-underscore-session"
+        )
+        body = json.loads(request.content)
+        assert logging_obj.pre_call.call_args.kwargs["additional_args"]["complete_input_dict"] == body
+        assert body["model"] == "gpt-6-sol"
+        assert "unknown_backend_option" not in body
+        assert "extra_headers" not in body
+        assert body["store"] is False
+        assert body["stream"] is True
+        assert "reasoning.encrypted_content" in body["include"]
+        assert body["prompt_cache_key"] == ("fixture-cache" if response_format == "sse" else "")
+        headers = result._hidden_params["additional_headers"]
+        assert headers["llm_provider-x-request-id"] == "fixture-request"
+        assert headers["llm_provider-retry-after"] == "7"
+        assert headers["llm_provider-request-id"] == "fixture-other-request"
+        for key, value in (
+            ("x-ratelimit-remaining-requests", "101"),
+            ("x-ratelimit-remaining-tokens", "102"),
+            ("x-ratelimit-limit-requests", "103"),
+            ("x-ratelimit-limit-tokens", "104"),
+            ("x-ratelimit-reset-requests", "105"),
+            ("x-ratelimit-reset-tokens", "106"),
+        ):
+            assert headers[key] == value
+            assert headers[f"llm_provider-{key}"] == value
+        assert "llm_provider-set-cookie" not in headers
+        assert "llm_provider-x-codex-turn-state" not in headers
+        assert "llm_provider-x-private-backend-header" not in headers
+
+    def test_compact_http_request_preserves_its_body_contract(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(tmp_path))
+        (tmp_path / "auth.json").write_text(
+            json.dumps({"access_token": "fixture-token", "account_id": "fixture-account", "expires_at": 4102444800})
+        )
+        captured = []
+
+        def backend(request):
+            captured.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_fixture",
+                    "object": "response",
+                    "created_at": 1700000000,
+                    "status": "completed",
+                    "model": "gpt-6-sol",
+                    "output": [],
+                },
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(backend)) as http_client:
+            BaseLLMHTTPHandler().compact_response_api_handler(
+                model="gpt-6-sol",
+                input="hello",
+                responses_api_provider_config=ChatGPTResponsesAPIConfig(),
+                response_api_optional_request_params={},
+                litellm_params=GenericLiteLLMParams(api_base="https://chatgpt.fixture"),
+                logging_obj=MagicMock(),
+                custom_llm_provider="chatgpt",
+                client=HTTPHandler(client=http_client),
+            )
+        assert captured[0].url.path == "/responses/compact"
+        assert json.loads(captured[0].content) == {"model": "gpt-6-sol", "input": "hello"}
+
     def test_system_input_is_normalized_without_reordering_content(self):
         input_items = [
             {
@@ -142,7 +487,7 @@ class TestChatGPTResponsesAPITransformation:
 
         request_kwargs = client.post.call_args.kwargs
         assert request_kwargs["stream"] is True
-        assert request_kwargs["json"]["input"] == [
+        assert json.loads(request_kwargs["data"])["input"] == [
             {
                 "role": "user",
                 "content": [{"type": "input_text", "text": "Reply with ok."}],
@@ -261,7 +606,7 @@ class TestChatGPTResponsesAPITransformation:
 
         assert headers["Authorization"] == "Bearer access-123"
         assert headers["ChatGPT-Account-Id"] == "acct-123"
-        assert headers["originator"] == "custom-origin"
+        assert headers["originator"] != "custom-origin"
         assert headers["content-type"] == "application/json"
         assert headers["accept"] == "text/event-stream"
         assert headers["session_id"] == "session-123"

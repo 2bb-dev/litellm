@@ -2748,11 +2748,6 @@ class BaseLLMHTTPHandler:
             litellm_params=litellm_params,
         )
 
-        if custom_llm_provider == "chatgpt":
-            from litellm.litellm_core_utils.terminal_receipt_oauth import bind_account
-
-            bind_account(dict(litellm_params), logging_obj.model_call_details, responses=True)
-
         if extra_headers:
             headers.update(extra_headers)
 
@@ -2812,12 +2807,19 @@ class BaseLLMHTTPHandler:
         )
         body_kwargs: Final[dict[str, Any]] = {"data": signed_body} if signed_body is not None else {"json": data}
 
+        if custom_llm_provider == "chatgpt":
+            from litellm.litellm_core_utils.terminal_receipt_oauth import bind_account
+
+            bind_account(dict(litellm_params), logging_obj.model_call_details, responses=True)
+
         ## LOGGING
         logging_obj.pre_call(
             input=input,
             api_key="",
             additional_args={
-                "complete_input_dict": data,
+                "complete_input_dict": (
+                    json.loads(signed_body) if custom_llm_provider == "chatgpt" and signed_body is not None else data
+                ),
                 "api_base": api_base,
                 "headers": headers,
             },
@@ -2961,11 +2963,6 @@ class BaseLLMHTTPHandler:
             litellm_params=litellm_params,
         )
 
-        if custom_llm_provider == "chatgpt":
-            from litellm.litellm_core_utils.terminal_receipt_oauth import bind_account
-
-            bind_account(dict(litellm_params), logging_obj.model_call_details, responses=True)
-
         if extra_headers:
             headers.update(extra_headers)
 
@@ -3024,12 +3021,19 @@ class BaseLLMHTTPHandler:
         )
         body_kwargs: Final[dict[str, Any]] = {"data": signed_body} if signed_body is not None else {"json": data}
 
+        if custom_llm_provider == "chatgpt":
+            from litellm.litellm_core_utils.terminal_receipt_oauth import bind_account
+
+            bind_account(dict(litellm_params), logging_obj.model_call_details, responses=True)
+
         ## LOGGING
         logging_obj.pre_call(
             input=input,
             api_key="",
             additional_args={
-                "complete_input_dict": data,
+                "complete_input_dict": (
+                    json.loads(signed_body) if custom_llm_provider == "chatgpt" and signed_body is not None else data
+                ),
                 "api_base": api_base,
                 "headers": headers,
             },

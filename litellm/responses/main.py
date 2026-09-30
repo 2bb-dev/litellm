@@ -407,6 +407,11 @@ def _bridges_to_chat_completions(
     responses_api_provider_config: BaseResponsesAPIConfig | None, use_chat_completions_api: bool
 ) -> bool:
     """Whether the request reaches its provider as a chat completion, not a Responses call."""
+    if (
+        responses_api_provider_config is not None
+        and responses_api_provider_config.custom_llm_provider == litellm.LlmProviders.CHATGPT
+    ):
+        return False
     return responses_api_provider_config is None or use_chat_completions_api is True
 
 
@@ -1034,7 +1039,7 @@ def _responses_try_dispatch_emulated_file_search(
     """Return a response when emulated file_search handles the call; otherwise None."""
     if not _has_file_search_tool(tools) or not (
         responses_api_provider_config is None
-        or use_chat_completions_api is True
+        or _bridges_to_chat_completions(responses_api_provider_config, use_chat_completions_api)
         or not responses_api_provider_config.supports_native_file_search()
     ):
         return None
@@ -1070,7 +1075,12 @@ def _responses_try_dispatch_emulated_file_search(
         "extra_body": extra_body,
         "timeout": timeout,
         "custom_llm_provider": custom_llm_provider,
-        **({"use_chat_completions_api": True} if use_chat_completions_api else {}),
+        **(
+            {"use_chat_completions_api": True}
+            if use_chat_completions_api
+            and _bridges_to_chat_completions(responses_api_provider_config, use_chat_completions_api)
+            else {}
+        ),
         **{k: v for k, v in kwargs.items() if k not in _internal_skip},
     }
     if _is_async:
