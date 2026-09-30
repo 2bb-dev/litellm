@@ -976,6 +976,13 @@ def _get_deployment_default_tpm_limit(model_name: str) -> int | None:
     return _get_deployment_default_limit(model_name, "default_api_key_tpm_limit")
 
 
+def get_model_rate_limit_scopes(model: str | None) -> tuple[str, ...]:
+    if model is None:
+        return ()
+    canonical: Final = litellm.model_access_alias_map.get(model)
+    return (canonical, model) if canonical and canonical != model else (model,)
+
+
 def get_key_model_rpm_limit(
     user_api_key_dict: UserAPIKeyAuth,
     model_name: str | None = None,

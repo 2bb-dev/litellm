@@ -24,6 +24,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointT
 from litellm.types.utils import GenericStreamingChunk, ModelResponseStream
 
 GLOBAL_PASS_THROUGH_SUCCESS_HANDLER_OBJ: Final = PassThroughEndpointLogging()
+_ANTHROPIC_EVENT_MAPPING: Final = TypeAdapter(Mapping[str, object])
 
 _UPSTREAM_PUMP_TASKS: Final[set[asyncio.Task[None]]] = set()  # mutable-ok: stdlib strong-ref set for pump tasks
 _DETACHED_STREAM_DRAINS: Final[set[asyncio.Task[None]]] = set()  # mutable-ok: bounded strong-ref set, detached drains
@@ -62,19 +63,29 @@ def is_anthropic_ping_chunk(chunk: object) -> bool:
     return False
 
 
-def is_anthropic_content_delta_chunk(chunk: object) -> bool:
-    """
-    Whether a chunk carries actual assistant-generated output (a
-    ``content_block_delta`` frame), as opposed to a lifecycle/bookkeeping
-    frame (``message_start``, ``content_block_start``/``stop``,
-    ``message_delta``, ``message_stop``, ``ping``) that carries nothing
-    worth preserving before an invisible mid-stream fallback retry.
-    """
-    if isinstance(chunk, dict):
-        return chunk.get("type") == "content_block_delta"
-    if isinstance(chunk, (bytes, bytearray)):
-        return any(line == b"event: content_block_delta" for line in chunk.splitlines())
-    return False
+def is_anthropic_content_chunk(chunk: object) -> bool:
+    if isinstance(chunk, dict) and chunk.get("type") == "content_block_delta":
+        return True
+    if isinstance(chunk, (bytes, bytearray)) and any(
+        line == b"event: content_block_delta" for line in chunk.splitlines()
+    ):
+        return True
+    candidates: Final = (
+        (chunk,) if isinstance(chunk, dict) else
+        tuple(_decoded_sse_data_line(line) for line in chunk.splitlines())
+        if isinstance(chunk, (bytes, bytearray)) else ()
+    )
+    return any(
+        (isinstance(block.get("type"), str) and block.get("type") not in ("text", "thinking"))
+        or bool(block.get("text") or block.get("thinking") or block.get("signature") or block.get("citations"))
+        for candidate in candidates
+        if isinstance(candidate, Mapping)
+        for payload in (_ANTHROPIC_EVENT_MAPPING.validate_python(candidate),)
+        if payload.get("type") == "content_block_start"
+        for raw_block in (payload.get("content_block"),)
+        if isinstance(raw_block, Mapping)
+        for block in (_ANTHROPIC_EVENT_MAPPING.validate_python(raw_block),)
+    )
 
 
 def _decoded_sse_data_line(line: bytes) -> object | None:

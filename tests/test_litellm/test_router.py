@@ -5,8 +5,9 @@ import json
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from datetime import datetime
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from types import SimpleNamespace
 from typing import Final, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12879,14 +12880,15 @@ async def test_native_anthropic_messages_pre_content_429_cools_selected_deployme
                     "api_key": "synthetic",
                     "api_base": f"https://{deployment_id}.anthropic.invalid",
                     "order": order,
+                    "num_retries": 0,
                 },
-                "model_info": {"id": deployment_id},
+                "model_info": {"id": deployment_id, "order_fallback_on_rate_limit_only": True},
             }
             for order, deployment_id in enumerate(("subscription", "paid-api"), start=1)
         ],
         allowed_fails=0,
         cooldown_time=300,
-        num_retries=0,
+        num_retries=2,
     )
     fallback_stream = (
         _anthropic_messages_message_start_chunk()
@@ -12913,6 +12915,133 @@ async def test_native_anthropic_messages_pre_content_429_cools_selected_deployme
         assert b"fallback answer" in b"".join(chunks)
         key = router.cooldown_cache.get_cooldown_cache_key("subscription")
         assert router.cooldown_cache.cooldown_store.get_cache(key=key)["cooldown_time"] == 300
+    finally:
+        router.reset()
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeSSEFragments(httpx.AsyncByteStream):
+    chunks: tuple[bytes, ...]
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            yield chunk
+
+
+@pytest.mark.parametrize(
+    "api_surface,after_content,content_kind",
+    [
+        ("chat", False, "delta"), ("chat", True, "delta"),
+        ("messages", False, "delta"), ("messages", True, "delta"),
+        ("messages", True, "redacted_thinking"), ("messages", True, "text"),
+        ("messages", True, "thinking"), ("messages", True, "tool_use"),
+        ("messages", True, "signature"), ("messages", True, "citations"), ("messages", True, "hosted"),
+        *(("messages", True, f"{kind}_fragmented") for kind in
+          ("delta", "redacted_thinking", "text", "thinking", "signature", "citations", "hosted", "tool_use")),
+    ],
+)
+@pytest.mark.parametrize("error_status", [429, 503])
+@pytest.mark.asyncio
+async def test_order_paid_fallback_gates_stream_errors(
+    monkeypatch: pytest.MonkeyPatch, api_surface: str, after_content: bool, error_status: int, content_kind: str
+):
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "include_cost_in_streaming_usage", False)
+    kind: Final = content_kind.removesuffix("_fragmented")
+    alias: Final = "anthropic/claude-opus-5-5"
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": alias,
+                "litellm_params": {
+                    "model": f"litellm_proxy/{alias}{suffix}",
+                    "api_key": "synthetic",
+                    "api_base": "https://central.invalid",
+                    "order": order,
+                    "num_retries": 0,
+                },
+                "model_info": {
+                    "id": deployment_id,
+                    "supported_endpoints": ["/v1/messages"],
+                    "order_fallback_on_rate_limit_only": True,
+                },
+            }
+            for order, deployment_id, suffix in ((1, "subscription", "/pi"), (2, "paid-api", ""))
+        ],
+        num_retries=2,
+        disable_cooldowns=True,
+    )
+    error_type: Final = "rate_limit_error" if error_status == 429 else "overloaded_error"
+    error_payload: Final = (
+        _anthropic_messages_rate_limit_error_chunk() if error_status == 429
+        else _anthropic_messages_overloaded_error_chunk()
+    ) if api_surface == "messages" else (
+        f'data: {json.dumps({"error": {"type": error_type, "message": "provider failed", "code": error_status}})}\n\n'.encode()
+    )
+    start_block: Final = {
+        "redacted_thinking": {"type": "redacted_thinking", "data": "primary answer"},
+        "text": {"type": "text", "text": "primary answer"},
+        "thinking": {"type": "thinking", "thinking": "primary answer", "signature": ""},
+        "tool_use": {"type": "tool_use", "id": "tool_1", "name": "primary_answer", "input": {}},
+        "signature": {"type": "thinking", "thinking": "", "signature": "primary answer"},
+        "citations": {"type": "text", "text": "", "citations": [{"type": "web_search_result_location", "title": "primary answer"}]},
+        "hosted": {"type": "web_search_tool_result", "tool_use_id": "tool_1", "content": "primary answer"},
+    }.get(kind)
+    start_frame: Final = json.dumps({"type": "content_block_start", "index": 0, "content_block": start_block})
+    native_content: Final = (
+        _anthropic_messages_content_chunk("primary answer") if kind == "delta" else
+        f"event: content_block_start\ndata: {start_frame}\n\n".encode()
+    )
+    content_payload: Final = (
+        _anthropic_messages_message_start_chunk() + native_content
+        if api_surface == "messages" else
+        b'data: {"id":"answer","object":"chat.completion.chunk","created":1,"model":"claude-opus-5-5",'
+        b'"choices":[{"index":0,"delta":{"role":"assistant","content":"primary answer"},"finish_reason":null}]}\n\n'
+    )
+    payload: Final = (content_payload if after_content else b"") + error_payload
+    split: Final = len(b"event: content_block_") if kind == "delta" else native_content.index(b"data:") + 35
+    primary_chunks: Final = (
+        (_anthropic_messages_message_start_chunk(), native_content[:split], native_content[split:], error_payload)
+        if content_kind.endswith("_fragmented") else (payload,)
+    )
+    paid_payload: Final = (
+        _anthropic_messages_message_start_chunk() + _anthropic_messages_content_chunk("paid answer")
+        + b'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+        if api_surface == "messages" else content_payload.replace(b"primary answer", b"paid answer") + b'data: [DONE]\n\n'
+    )
+    endpoint: Final = "v1/messages" if api_surface == "messages" else "chat/completions"
+    expected_paid_attempts: Final = int(not after_content and error_status == 429)
+    try:
+        with respx.mock as mock:
+            primary: Final = mock.post(f"https://central.invalid/{endpoint}", json__model=f"{alias}/pi").mock(
+                return_value=httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_NativeSSEFragments(primary_chunks))
+            )
+            paid: Final = mock.post(f"https://central.invalid/{endpoint}", json__model=alias).mock(
+                return_value=httpx.Response(200, headers={"content-type": "text/event-stream"}, content=paid_payload)
+            )
+            request: Final = {
+                "model": alias, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10, "stream": True,
+            }
+            call: Final = router.aanthropic_messages if api_surface == "messages" else router.acompletion
+            response: Final = await call(**request)
+            if expected_paid_attempts:
+                chunks: Final = [chunk async for chunk in response]
+                answer: Final = b"".join(chunks).decode() if api_surface == "messages" else "".join(
+                    chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices
+                )
+                assert "paid answer" in answer
+            elif after_content and api_surface == "messages":
+                wire: Final = b"".join([chunk async for chunk in response])
+                assert (b"primary_answer" if kind == "tool_use" else b"primary answer") in wire
+                assert error_type.encode() in wire
+            else:
+                if after_content:
+                    first: Final = await anext(response)
+                    assert first.choices[0].delta.content == "primary answer"
+                with pytest.raises(openai.APIError):
+                    _ = [chunk async for chunk in response]
+            assert primary.call_count == 1
+            assert paid.call_count == expected_paid_attempts
     finally:
         router.reset()
 
@@ -12947,12 +13076,11 @@ async def test_anthropic_chat_pre_content_sse_error_records_one_failure(monkeypa
             mock.post("https://anthropic.chat.invalid/v1/messages").mock(
                 return_value=httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream)
             )
-            with pytest.raises(Exception):
-                response = await router.acompletion(
-                    model="primary", messages=[{"role": "user", "content": "hi"}], max_tokens=10, stream=True
-                )
-                async for _ in response:
-                    pass
+            response = await router.acompletion(
+                model="primary", messages=[{"role": "user", "content": "hi"}], max_tokens=10, stream=True
+            )
+            with pytest.raises(litellm.InternalServerError, match="Overloaded"):
+                _ = [chunk async for chunk in response]
         from litellm.router_utils.cooldown_handlers import _async_get_cooldown_deployments
         from litellm.router_utils.router_callbacks.track_deployment_metrics import (
             get_deployment_failures_for_current_minute,
@@ -15277,6 +15405,321 @@ async def test_router_retry_policy_400_keeps_upstream_error_when_tags_narrow_the
     assert "No deployments available" not in str(raised.value)
     assert tagged.call_count == 3
     assert untagged.call_count == 0
+
+
+@pytest.mark.parametrize("api_surface", ["chat", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("request_retries", [None, 2])
+@pytest.mark.parametrize(
+    "status,error_type,paid_status,paid_attempts",
+    [
+        (200, "", 200, 0),
+        (400, "invalid_request_error", 200, 0),
+        (400, "rate_limit_error", 200, 0),
+        (401, "authentication_error", 200, 0),
+        (403, "permission_error", 200, 0),
+        (429, "rate_limit_error", 200, 1),
+        (429, "rate_limit_error", 429, 1),
+        (429, "rate_limit_error", 502, 1),
+        (502, "api_error", 200, 0),
+        (504, "api_error", 200, 0),
+        (None, "timeout", 200, 0),
+    ],
+)
+@pytest.mark.asyncio
+async def test_order_paid_fallback_only_on_primary_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    api_surface: str,
+    stream: bool,
+    status: int | None,
+    error_type: str,
+    paid_status: int,
+    paid_attempts: int,
+    request_retries: int | None,
+):
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    alias: Final = "anthropic/claude-opus-5-5"
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": alias,
+                "litellm_params": {
+                    "model": f"litellm_proxy/{alias}{suffix}",
+                    "api_base": "https://central.invalid",
+                    "api_key": "synthetic",
+                    "order": order,
+                    "num_retries": 0,
+                },
+                "model_info": {
+                    "id": deployment_id,
+                    "pi_api": "anthropic-messages",
+                    "supported_endpoints": ["/v1/messages"],
+                    "cache_control_ttl": True,
+                    "order_fallback_on_rate_limit_only": True,
+                },
+            }
+            for order, deployment_id, suffix in ((1, "subscription", "/pi"), (2, "paid-api", ""))
+        ],
+        num_retries=2,
+        disable_cooldowns=True,
+    )
+    answer: Final = (
+        {
+            "id": "answer",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-5-5",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        if api_surface == "messages"
+        else _LIT_7114_CHAT_OK
+    )
+    stream_answer: Final = (
+        _anthropic_messages_message_start_chunk()
+        + _anthropic_messages_content_chunk("ok")
+        + b'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+        if api_surface == "messages"
+        else b'data: {"id":"answer","object":"chat.completion.chunk","created":1,"model":"claude-opus-5-5",'
+        b'"choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    ok: Final = (
+        httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream_answer)
+        if stream
+        else httpx.Response(200, json=answer)
+    )
+    primary_result: Final = (
+        httpx.ReadTimeout("response status unknown")
+        if status is None
+        else ok
+        if status == 200
+        else httpx.Response(status, json={"error": {"message": "primary failed", "type": error_type}})
+    )
+    paid_result: Final = (
+        ok
+        if paid_status == 200
+        else httpx.Response(paid_status, json={"error": {"message": "paid failed", "type": "rate_limit_error"}})
+    )
+    endpoint: Final = "v1/messages" if api_surface == "messages" else "chat/completions"
+    try:
+        with respx.mock as mock:
+            primary: Final = mock.post(f"https://central.invalid/{endpoint}", json__model=f"{alias}/pi").mock(
+                side_effect=primary_result if isinstance(primary_result, Exception) else None,
+                return_value=primary_result if isinstance(primary_result, httpx.Response) else None,
+            )
+            paid: Final = mock.post(f"https://central.invalid/{endpoint}", json__model=alias).mock(
+                return_value=paid_result
+            )
+            call: Final = router.aanthropic_messages if api_surface == "messages" else router.acompletion
+            request: Final = {
+                "model": alias,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 10,
+                "stream": stream,
+                **(
+                    {"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}}
+                    if api_surface == "messages"
+                    else {}
+                ),
+                **({"num_retries": request_retries} if request_retries is not None else {}),
+            }
+            if status == 200 or (paid_attempts and paid_status == 200):
+                response: Final = await call(**request)
+                if stream:
+                    chunks: Final = [chunk async for chunk in response]
+                    wire: Final = (
+                        b"".join(chunks).decode()
+                        if api_surface == "messages"
+                        else "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
+                    )
+                    assert "ok" in wire
+                elif api_surface == "messages":
+                    assert response["content"][0]["text"] == "ok"
+                else:
+                    assert response.choices[0].message.content == "hi back"
+            else:
+                with pytest.raises(openai.APIError):
+                    await call(**request)
+            assert router.model_names == {alias}
+            assert primary.call_count == 1
+            assert paid.call_count == paid_attempts
+            if api_surface == "messages":
+                for attempt in (*primary.calls, *paid.calls):
+                    payload: Final = json.loads(attempt.request.content)
+                    assert payload["thinking"] == {"type": "adaptive"}
+                    assert payload["output_config"] == {"effort": "xhigh"}
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("api_surface", ["chat", "messages"])
+@pytest.mark.parametrize(
+    "primary_status,error_type,paid_status,paid_attempts",
+    [
+        (200, "", 200, 0),
+        (400, "rate_limit_error", 200, 0),
+        (401, "authentication_error", 200, 0),
+        (429, "rate_limit_error", 200, 1),
+        (429, "rate_limit_error", 429, 1),
+        (429, "rate_limit_error", 502, 1),
+        (503, "overloaded_error", 200, 0),
+    ],
+)
+@pytest.mark.asyncio
+async def test_order_paid_fallback_across_instance_and_central_routers(
+    monkeypatch: pytest.MonkeyPatch,
+    api_surface: str,
+    primary_status: int,
+    error_type: str,
+    paid_status: int,
+    paid_attempts: int,
+):
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    alias: Final = "anthropic/claude-opus-5-5"
+    central: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": f"{alias}{suffix}",
+                "litellm_params": {
+                    "model": alias,
+                    "api_base": f"https://{role}-backend.invalid",
+                    "api_key": "synthetic",
+                    "num_retries": 0,
+                    "cooldown_time": 0,
+                },
+                "model_info": {"id": role, "order_fallback_on_rate_limit_only": True},
+            }
+            for role, suffix in (("pi", "/pi"), ("paid", ""))
+        ],
+        num_retries=2,
+        retry_policy=RetryPolicy(
+            RateLimitErrorRetries=2, InternalServerErrorRetries=2, AuthenticationErrorRetries=2,
+        ),
+    )
+    instance: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": alias,
+                "litellm_params": {
+                    "model": f"litellm_proxy/{alias}{suffix}",
+                    "api_base": "https://central.invalid",
+                    "api_key": "synthetic",
+                    "order": order,
+                    "num_retries": 0,
+                    "cooldown_time": 0,
+                },
+                "model_info": {
+                    "id": role,
+                    "order_fallback_on_rate_limit_only": True,
+                    "supported_endpoints": ["/v1/messages"],
+                    "cache_control_ttl": True,
+                },
+            }
+            for order, role, suffix in ((1, "pi", "/pi"), (2, "paid", ""))
+        ],
+        num_retries=2,
+    )
+    answer: Final = {
+        "id": "answer", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+        "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    central_call: Final = central.aanthropic_messages if api_surface == "messages" else central.acompletion
+
+    async def forward_to_central(request: httpx.Request) -> httpx.Response:
+        payload: Final = json.loads(request.content)
+        try:
+            response: Final = await central_call(**(payload | {"num_retries": 2}))
+        except openai.APIError as error:
+            return httpx.Response(
+                error.status_code,
+                json={"error": {"message": str(error), "type": "rate_limit_error" if error.status_code == 429 else "api_error"}},
+            )
+        return httpx.Response(200, json=response if api_surface == "messages" else response.model_dump(mode="json"))
+
+    endpoint: Final = "v1/messages" if api_surface == "messages" else "chat/completions"
+    try:
+        with respx.mock as mock:
+            mock.post(f"https://central.invalid/{endpoint}").mock(side_effect=forward_to_central)
+            primary: Final = mock.post("https://pi-backend.invalid/v1/messages").mock(
+                return_value=httpx.Response(200, json=answer) if primary_status == 200 else httpx.Response(
+                    primary_status, json={"error": {"type": error_type, "message": "primary failed"}},
+                )
+            )
+            paid: Final = mock.post("https://paid-backend.invalid/v1/messages").mock(
+                return_value=httpx.Response(200, json=answer) if paid_status == 200 else httpx.Response(
+                    paid_status, json={"error": {"type": "rate_limit_error" if paid_status == 429 else "api_error", "message": "paid failed"}},
+                )
+            )
+            call: Final = instance.aanthropic_messages if api_surface == "messages" else instance.acompletion
+            request: Final = {
+                "model": alias, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10,
+                "num_retries": 2,
+                **({"system": [{"type": "text", "text": "cached", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]} if api_surface == "messages" else {}),
+            }
+            if primary_status == 200 or (paid_attempts and paid_status == 200):
+                response: Final = await call(**request)
+                assert (response["content"][0]["text"] if api_surface == "messages" else response.choices[0].message.content) == "ok"
+            else:
+                with pytest.raises(openai.APIError):
+                    await call(**request)
+            assert instance.model_names == {alias}
+            assert primary.call_count == 1
+            assert paid.call_count == paid_attempts
+            if api_surface == "messages":
+                for attempt in (*primary.calls, *paid.calls):
+                    assert json.loads(attempt.request.content)["system"][0]["cache_control"]["ttl"] == "1h"
+    finally:
+        instance.reset()
+        central.reset()
+
+
+@pytest.mark.asyncio
+async def test_order_paid_fallback_retries_subscription_first_on_next_request(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router = litellm.Router(
+        model_list=[
+            _retry_skip_deployment(
+                deployment_id,
+                deployment_id,
+                litellm_params={"order": order, "num_retries": 0, "cooldown_time": 0},
+                model_info={"order_fallback_on_rate_limit_only": True},
+            )
+            for order, deployment_id in enumerate(("subscription", "paid-api"), start=1)
+        ],
+        num_retries=2,
+        allowed_fails=0,
+        cooldown_time=300,
+    )
+    answer = {
+        "id": "answer",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gpt-5.6",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+    try:
+        with respx.mock as mock:
+            primary = mock.post("https://subscription.local/v1/chat/completions").mock(
+                side_effect=[
+                    httpx.Response(429, json={"error": {"message": "quota reached", "type": "rate_limit_error"}}),
+                    httpx.Response(200, json=answer),
+                ]
+            )
+            paid = mock.post("https://paid-api.local/v1/chat/completions").mock(
+                return_value=httpx.Response(200, json=answer)
+            )
+            for _ in range(2):
+                response = await router.acompletion(model="gpt-5.6", messages=[{"role": "user", "content": "hi"}])
+                assert response.choices[0].message.content == "ok"
+            assert primary.call_count == 2
+            assert paid.call_count == 1
+    finally:
+        router.reset()
 
 
 @pytest.mark.asyncio

@@ -8,8 +8,9 @@ import os
 import sys
 import time
 from contextlib import contextmanager
+from types import MappingProxyType
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Final, List, Optional
 
 import pytest
 from fastapi import HTTPException
@@ -38,6 +39,188 @@ from litellm.types.utils import (
     TextCompletionResponse,
     Usage,
 )
+
+
+@pytest.mark.parametrize("legacy", (False, True))
+@pytest.mark.parametrize("source", ("metadata", "budget", "team", "deployment"))
+@pytest.mark.parametrize("pi_first", (False, True))
+@pytest.mark.asyncio
+async def test_access_alias_shares_canonical_model_rpm(monkeypatch, legacy, source, pi_first):
+    from litellm.proxy import proxy_server
+    from litellm.proxy.hooks.parallel_request_limiter import _PROXY_MaxParallelRequestsHandler as LegacyLimiter
+
+    canonical: Final = "anthropic/claude-opus-5-5"
+    pi: Final = f"{canonical}/pi"
+    monkeypatch.setattr(litellm, "model_access_alias_map", MappingProxyType({pi: canonical}), raising=False)
+    cache: Final = DualCache()
+    handler: Final = (LegacyLimiter if legacy else _PROXY_MaxParallelRequestsHandler)(InternalUsageCache(cache))
+    key: Final = UserAPIKeyAuth(
+        api_key=hash_token("offline-alias-rpm"), team_id="offline-team",
+        metadata={"model_rpm_limit": {canonical: 2, pi: 100}} if source == "metadata" else {},
+        model_max_budget={canonical: {"budget_limit": 100, "time_period": "1d", "rpm_limit": 2}}
+        if source == "budget" else {},
+        team_metadata={"model_rpm_limit": {canonical: 2}} if source == "team" else {},
+    )
+    if source == "deployment":
+        monkeypatch.setattr(proxy_server, "llm_router", Router(model_list=[
+            {"model_name": model, "litellm_params": {
+                "model": canonical, "api_key": "offline", "default_api_key_rpm_limit": cap,
+            }}
+            for model, cap in ((canonical, 2), (pi, 100))
+        ]))
+
+    async def admit(model: str) -> None:
+        await handler.async_pre_call_hook(key, cache, {"model": model, "metadata": {}}, "completion")
+
+    await admit(pi if pi_first else canonical)
+    await admit(canonical if pi_first else pi)
+    for model in (canonical, pi):
+        with pytest.raises(HTTPException) as rejected:
+            await admit(model)
+        assert rejected.value.status_code == 429
+
+
+@pytest.mark.parametrize("legacy", (False, True))
+@pytest.mark.parametrize("pi_cap", (0, 1))
+@pytest.mark.asyncio
+async def test_access_alias_keeps_explicit_pi_rpm_separate(monkeypatch, legacy, pi_cap):
+    from litellm.proxy.hooks.parallel_request_limiter import _PROXY_MaxParallelRequestsHandler as LegacyLimiter
+
+    canonical: Final = "anthropic/claude-opus-5-5"
+    pi: Final = f"{canonical}/pi"
+    monkeypatch.setattr(litellm, "model_access_alias_map", MappingProxyType({pi: canonical}), raising=False)
+    cache: Final = DualCache()
+    handler: Final = (LegacyLimiter if legacy else _PROXY_MaxParallelRequestsHandler)(InternalUsageCache(cache))
+    key: Final = UserAPIKeyAuth(api_key=hash_token("offline-pi-cap"), metadata={
+        "model_rpm_limit": {canonical: 100, pi: pi_cap},
+    })
+    await handler.async_pre_call_hook(key, cache, {"model": canonical}, "completion")
+    if pi_cap:
+        await handler.async_pre_call_hook(key, cache, {"model": pi}, "completion")
+    for _ in range(2):
+        with pytest.raises(HTTPException) as rejected:
+            await handler.async_pre_call_hook(key, cache, {"model": pi}, "completion")
+        assert rejected.value.status_code == 429
+    await handler.async_pre_call_hook(key, cache, {"model": canonical}, "completion")
+    await handler.async_pre_call_hook(key, cache, {"model": canonical}, "completion")
+
+
+@pytest.mark.parametrize("reservation", (False, True))
+@pytest.mark.parametrize("native_usage", (False, True))
+@pytest.mark.asyncio
+async def test_access_alias_reconciles_actual_tpm_to_both_names(monkeypatch, reservation, native_usage):
+    canonical: Final = "anthropic/claude-opus-5-5"
+    pi: Final = f"{canonical}/pi"
+    monkeypatch.setattr(litellm, "model_access_alias_map", MappingProxyType({pi: canonical}), raising=False)
+    monkeypatch.setenv("LITELLM_TPM_TOKEN_RESERVATION_ENABLED", str(reservation).lower())
+    cache: Final = DualCache()
+    handler: Final = _PROXY_MaxParallelRequestsHandler(InternalUsageCache(cache))
+    key: Final = UserAPIKeyAuth(api_key=hash_token("offline-alias-tpm"), metadata={
+        "model_tpm_limit": {canonical: 20, pi: 100},
+    })
+
+    async def complete(model: str, output_limit: int, actual: int) -> None:
+        await handler.async_pre_call_hook(key, cache, {
+            "model": model, "messages": [], "max_tokens": output_limit,
+        }, "completion")
+        usage: Final = Usage(prompt_tokens=1, completion_tokens=actual - 1, total_tokens=actual)
+        kwargs: Final = {
+            "litellm_params": {"metadata": {"model_group": model}},
+            "standard_logging_object": {"metadata": {"user_api_key_hash": key.api_key}},
+            "combined_usage_object": usage,
+        }
+        await handler.async_log_success_event(kwargs, object() if native_usage else ModelResponse(usage=usage), None, None)
+
+    await complete(pi, 10, 3)
+    assert await cache.async_get_cache(key=f"{{model_per_key:{key.api_key}:{canonical}}}:tokens") == (3 if reservation else 4)
+    assert await cache.async_get_cache(key=f"{{model_per_key:{key.api_key}:{pi}}}:tokens") == (3 if reservation else 4)
+    await complete(canonical, 17, 17)
+    for model in (canonical, pi):
+        with pytest.raises(HTTPException) as rejected:
+            await handler.async_pre_call_hook(key, cache, {"model": model, "messages": [], "max_tokens": 1}, "completion")
+        assert rejected.value.status_code == 429
+
+
+@pytest.mark.parametrize("entity", ("team", "organization", "project"))
+@pytest.mark.asyncio
+async def test_access_alias_shares_entity_model_rpm_across_keys(monkeypatch, entity):
+    canonical: Final = "anthropic/claude-opus-5-5"
+    pi: Final = f"{canonical}/pi"
+    monkeypatch.setattr(litellm, "model_access_alias_map", MappingProxyType({pi: canonical}), raising=False)
+    cache: Final = DualCache()
+    handler: Final = _PROXY_MaxParallelRequestsHandler(InternalUsageCache(cache))
+    entity_fields: Final = {"org_id" if entity == "organization" else f"{entity}_id": "offline-entity",
+                           f"{entity}_metadata": {"model_rpm_limit": {canonical: 2, pi: 100}}}
+    for index, model in enumerate((pi, pi)):
+        await handler.async_pre_call_hook(
+            UserAPIKeyAuth(api_key=hash_token(f"offline-key-{index}"), **entity_fields),
+            cache, {"model": model}, "completion",
+        )
+    with pytest.raises(HTTPException) as rejected:
+        await handler.async_pre_call_hook(
+            UserAPIKeyAuth(api_key=hash_token("offline-third-key"), **entity_fields),
+            cache, {"model": canonical}, "completion",
+        )
+    assert rejected.value.status_code == 429
+
+
+@pytest.mark.parametrize("actual", (0, 4))
+@pytest.mark.asyncio
+async def test_access_alias_failure_settles_both_reservations_once(monkeypatch, actual):
+    canonical: Final = "anthropic/claude-opus-5-5"
+    pi: Final = f"{canonical}/pi"
+    monkeypatch.setattr(litellm, "model_access_alias_map", MappingProxyType({pi: canonical}), raising=False)
+    monkeypatch.setenv("LITELLM_TPM_TOKEN_RESERVATION_ENABLED", "true")
+    cache: Final = DualCache()
+    handler: Final = _PROXY_MaxParallelRequestsHandler(InternalUsageCache(cache))
+    key: Final = UserAPIKeyAuth(api_key=hash_token("offline-refund"), metadata={
+        "model_tpm_limit": {canonical: 20, pi: 100},
+    })
+    data: Final = {"model": pi, "messages": [], "max_tokens": 10, "litellm_call_id": "offline-failure"}
+    await handler.async_pre_call_hook(key, cache, data, "completion")
+    for model in (canonical, pi):
+        assert await cache.async_get_cache(key=f"{{model_per_key:{key.api_key}:{model}}}:tokens") == 10
+    usage: Final = Usage(prompt_tokens=1, completion_tokens=3, total_tokens=4) if actual else None
+    await handler.async_post_call_failure_hook(
+        request_data={**data, "combined_usage_object": usage}, original_exception=Exception("offline failure"),
+        user_api_key_dict=key,
+    )
+    await handler.async_log_failure_event(
+        kwargs={"litellm_call_id": "offline-failure", "combined_usage_object": usage}, response_obj=None,
+        start_time=None, end_time=None,
+    )
+    for model in (canonical, pi):
+        assert await cache.async_get_cache(key=f"{{model_per_key:{key.api_key}:{model}}}:tokens") == actual
+
+
+@pytest.mark.asyncio
+async def test_access_alias_legacy_success_charges_shared_tpm(monkeypatch):
+    from litellm.proxy.hooks.parallel_request_limiter import _PROXY_MaxParallelRequestsHandler as LegacyLimiter
+
+    canonical: Final = "anthropic/claude-opus-5-5"
+    pi: Final = f"{canonical}/pi"
+    monkeypatch.setattr(litellm, "model_access_alias_map", MappingProxyType({pi: canonical}), raising=False)
+    cache: Final = DualCache()
+    handler: Final = LegacyLimiter(InternalUsageCache(cache))
+    key: Final = UserAPIKeyAuth(api_key=hash_token("offline-legacy-tpm"), metadata={
+        "model_tpm_limit": {canonical: 5, pi: 100},
+    })
+    for model, actual in ((pi, 3), (canonical, 2)):
+        await handler.async_pre_call_hook(key, cache, {"model": model}, "completion")
+        await handler.async_log_success_event(
+            kwargs={"litellm_params": {"metadata": {
+                "model_group": model, "user_api_key": key.api_key, "user_api_key_metadata": key.metadata,
+                "user_api_key_model_max_budget": key.model_max_budget,
+            }}}, response_obj=ModelResponse(usage=Usage(prompt_tokens=1, completion_tokens=actual - 1, total_tokens=actual)),
+            start_time=None, end_time=None,
+        )
+    assert (await cache.async_get_cache(
+        key=f"{key.api_key}::{canonical}::{datetime.now().strftime('%Y-%m-%d-%H-%M')}::request_count"
+    ))["current_tpm"] == 5
+    for model in (canonical, pi):
+        with pytest.raises(HTTPException) as rejected:
+            await handler.async_pre_call_hook(key, cache, {"model": model}, "completion")
+        assert rejected.value.status_code == 429
 
 
 class TimeController:

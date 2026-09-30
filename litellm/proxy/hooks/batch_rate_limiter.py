@@ -275,26 +275,25 @@ class _PROXY_BatchRateLimiter(CustomLogger):
         unlimited routing model, and an unrelated model's rows can't inflate
         a different model's counter.
         """
-        extra_descriptors: Final[list[RateLimitDescriptor]] = []  # mutable-ok: see above
-        extra_increments: Final[list[IncrementAmounts]] = []  # mutable-ok: see above
-        for model, usage in per_model_usage.items():
-            model_descriptors: list[RateLimitDescriptor] = []  # mutable-ok: reset per loop iteration, not module state
-            self.parallel_request_limiter.add_project_io_token_rate_limit_descriptors_from_metadata(
-                user_api_key_dict=user_api_key_dict,
-                requested_model=model,
-                descriptors=model_descriptors,
+        contributions: Final = tuple(
+            (descriptor, usage.get("output_tokens", 0) if descriptor["key"] == PROJECT_OTPM_DESCRIPTOR_KEY
+             else usage.get("total_tokens", 0))
+            for model, usage in per_model_usage.items()
+            for descriptor in self.parallel_request_limiter.project_io_token_rate_limit_descriptors_from_metadata(
+                user_api_key_dict, model,
             )
-            for descriptor in model_descriptors:
-                extra_descriptors.append(descriptor)
-                extra_increments.append(
-                    {  # mutable-ok: atomic limiter API requires mutable increment records
-                        "requests": 0,
-                        "tokens": usage.get("output_tokens", 0)
-                        if descriptor["key"] == PROJECT_OTPM_DESCRIPTOR_KEY
-                        else usage.get("total_tokens", 0),
-                    }
-                )
-        return extra_descriptors, extra_increments
+        )
+        distinct: Final = MappingProxyType({
+            (descriptor["key"], descriptor["value"]): descriptor for descriptor, _ in contributions
+        })
+        return list(distinct.values()), [
+            {  # mutable-ok: atomic limiter API requires mutable increment records
+                "requests": 0,
+                "tokens": sum(tokens for descriptor, tokens in contributions
+                              if (descriptor["key"], descriptor["value"]) == identity),
+            }
+            for identity in distinct
+        ]
 
     def _should_skip_batch_input_file_processing(
         self,

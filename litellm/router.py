@@ -472,6 +472,19 @@ def _with_router_resolved_session_model(session: object, model_name: str) -> Map
 # upstream that never emits content or an error could otherwise grow that
 # buffer without bound, so hitting this cap forces an early commit instead.
 MAX_BUFFERED_PRE_CONTENT_ANTHROPIC_CHUNKS: Final = 200
+_ORDER_POLICY_DEPLOYMENTS_ADAPTER: Final = TypeAdapter(tuple[Mapping[str, object], ...])
+_ORDER_POLICY_METADATA_ADAPTER: Final = TypeAdapter(Mapping[str, object])
+_EMPTY_ORDER_POLICY_METADATA: Final[Mapping[str, object]] = MappingProxyType({})
+
+
+def _rate_limit_only_order_policy(deployments: Sequence[DeploymentTypedDict]) -> bool:
+    rows: Final = _ORDER_POLICY_DEPLOYMENTS_ADAPTER.validate_python(deployments)
+    return any(
+        _ORDER_POLICY_METADATA_ADAPTER.validate_python(row.get("model_info") or MappingProxyType({})).get(
+            "order_fallback_on_rate_limit_only"
+        ) is True
+        for row in rows
+    )
 
 
 def _anthropic_stream_should_drop_pre_content_ping(chunk: object, has_generated_content: bool) -> bool:
@@ -558,12 +571,12 @@ def _anthropic_stream_commits_now(chunk: object, has_generated_content: bool, bu
     frames toward a possible fallback.
     """
     from litellm.llms.anthropic.experimental_pass_through.messages.streaming_iterator import (
-        is_anthropic_content_delta_chunk,
+        is_anthropic_content_chunk,
     )
 
     if has_generated_content:
         return False
-    return is_anthropic_content_delta_chunk(chunk) or buffered_chunk_count >= MAX_BUFFERED_PRE_CONTENT_ANTHROPIC_CHUNKS
+    return is_anthropic_content_chunk(chunk) or buffered_chunk_count >= MAX_BUFFERED_PRE_CONTENT_ANTHROPIC_CHUNKS
 
 
 class FallbackAwareAnthropicMessagesStream:
@@ -2780,23 +2793,23 @@ class Router:
         status_code: Final = getattr(provider_error, "status_code", None)
         if not isinstance(status_code, int) or not _is_retriable_anthropic_status(status_code):
             return
-        model_id: Final = (getattr(response, "_hidden_params", None) or {}).get("model_id")
+        model_id: Final = (getattr(response, "_hidden_params", None) or MappingProxyType({})).get("model_id")
         if not isinstance(model_id, str):
             return
         deployment: Final = next(
-            (row for row in self.model_list if (row.get("model_info") or {}).get("id") == model_id), None
+            (row for row in self.model_list if (row.get("model_info") or MappingProxyType({})).get("id") == model_id), None
         )
         if deployment is None:
             return
         self.deployment_callback_on_failure(
-            kwargs={
+            kwargs=MappingProxyType({
                 "exception": provider_error,
-                "litellm_params": {
+                "litellm_params": MappingProxyType({
                     **deployment["litellm_params"],
                     "model_info": deployment["model_info"],
-                    "litellm_metadata": {"model_group": model_group},
-                },
-            },
+                    "litellm_metadata": {"model_group": model_group},  # mutable-ok: callback merges configured spend metadata into this bucket
+                }),
+            }),
             completion_response=None,
             start_time=None,
             end_time=None,
@@ -5573,8 +5586,6 @@ class Router:
                         continue
                     if _anthropic_stream_should_drop_pre_content_ping(chunk, has_generated_content):
                         continue
-                    if _anthropic_stream_commits_now(chunk, has_generated_content, len(buffered_lifecycle_chunks)):
-                        has_generated_content = True  # rebind-ok: real content seen, or the buffer cap was hit
                     # A transport can split one SSE data line across byte chunks, so pre-content
                     # detection parses the accumulated buffer plus the current chunk, never the
                     # chunk alone; the buffer is already capped, which bounds this window too.
@@ -5583,6 +5594,8 @@ class Router:
                         if not has_generated_content and isinstance(chunk, (bytes, bytearray))  # pyright: ignore[reportUnnecessaryIsInstance]  # bridge-path chunks are not always bytes at runtime
                         else chunk
                     )
+                    if _anthropic_stream_commits_now(parse_window, has_generated_content, len(buffered_lifecycle_chunks)):
+                        has_generated_content = True  # rebind-ok: real content seen, or the buffer cap was hit
                     error_event = parse_anthropic_error_event(parse_window)
                     retriable_pending_error = (  # rebind-ok: freshly computed each iteration, never carried over
                         not has_generated_content
@@ -7441,12 +7454,43 @@ class Router:
         # Use wildcard-aware lookup so order-based fallback also works for model
         # groups resolved via pattern routing (e.g. `openai/*` -> `openai/gpt-4.1-mini`).
         all_deployments: Final = self.get_model_list(model_name=original_model_group, team_id=_request_team_id) or []
-        _order_set: Final[set] = {
-            litellm.utils._get_deployment_order(d)
-            for d in all_deployments
-            if litellm.utils._get_deployment_order(d) is not None
-        }
-        order_values: Final[list] = sorted(_order_set)
+        _order_set: Final = frozenset(
+            order for deployment in all_deployments
+            for order in (litellm.utils._get_deployment_order(deployment),)
+            if order is not None
+        )
+        order_values: Final = tuple(sorted(_order_set))
+        if len(order_values) > 1 and _rate_limit_only_order_policy(all_deployments):
+            from litellm.exceptions import MidStreamFallbackError
+
+            rate_limit_error: Final = e.original_exception if isinstance(e, MidStreamFallbackError) else e
+            before_content: Final = not isinstance(e, MidStreamFallbackError) or (
+                e.is_pre_first_chunk and not e.generated_content
+            )
+            source_status: Final = getattr(getattr(rate_limit_error, "__context__", None), "status_code", None)
+            stream_source: Final = e.__context__ if isinstance(e, MidStreamFallbackError) else None
+            stream_source_body: Final = (
+                stream_source.body
+                if isinstance(stream_source, openai.APIError) and not isinstance(stream_source, openai.APIStatusError)
+                else None
+            )
+            stream_error_body: Final = (
+                _ORDER_POLICY_METADATA_ADAPTER.validate_python(stream_source_body)
+                if isinstance(stream_source_body, Mapping)
+                else _EMPTY_ORDER_POLICY_METADATA
+            )
+            stream_rate_limit: Final = (
+                stream_error_body.get("type") == "rate_limit_error" and stream_error_body.get("code") == 429
+            )
+            is_rate_limit: Final = stream_rate_limit or isinstance(rate_limit_error, litellm.RateLimitError) or (
+                isinstance(e, MidStreamFallbackError)
+                and isinstance(rate_limit_error, litellm.APIError)
+            )
+            rate_limit_status: Final = 429 if stream_rate_limit else getattr(rate_limit_error, "status_code", None)
+            if not before_content or not (
+                is_rate_limit and rate_limit_status == 429 and source_status in (None, 429)
+            ):
+                raise original_exception
         if len(order_values) > 1 and not _skip_order_fallback:
             # Determine which order levels have already been tried
             current_target: Final = kwargs.get("_target_order")
@@ -7791,7 +7835,10 @@ class Router:
         model_group_retry_policy: Final = kwargs.pop("model_group_retry_policy", self.model_group_retry_policy)
         model_group: Final[str | None] = kwargs.get("model")
         request_num_retries: Final[int | None] = kwargs.pop("num_retries", None)
-        num_retries = request_num_retries
+        rate_limit_only_group: Final = _rate_limit_only_order_policy(
+            self.get_model_list(model_name=model_group if isinstance(model_group, str) else "") or ()
+        )
+        num_retries = 0 if rate_limit_only_group else request_num_retries
         if num_retries is None:
             # Fall back to the router setting (then 0) so the comparisons below never
             # hit `None > int`, which would mask the real upstream error with a TypeError.
@@ -7831,7 +7878,8 @@ class Router:
             deployment_num_retries: Final = getattr(e, "num_retries", None)
 
             if (
-                request_num_retries is None
+                not rate_limit_only_group
+                and request_num_retries is None
                 and deployment_num_retries is not None
                 and isinstance(deployment_num_retries, int)
             ):
@@ -7850,7 +7898,11 @@ class Router:
             # Check retry policy FIRST, before should_retry_this_error
             # This allows retry policies to override the healthy deployments check
             _retry_policy_applies = False
-            if request_num_retries != 0 and (self.retry_policy is not None or model_group_retry_policy is not None):
+            if (
+                not rate_limit_only_group
+                and request_num_retries != 0
+                and (self.retry_policy is not None or model_group_retry_policy is not None)
+            ):
                 # get num_retries from retry policy
                 # Use the model_group captured at the start of the function, or get it from metadata
                 # kwargs.get("model") at this point is the deployment model, not the model_group
