@@ -2675,6 +2675,36 @@ def test_transform_request_respects_user_max_tokens():
     assert result["max_tokens"] == 1000
 
 
+@pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"])
+def test_always_thinking_claude_chat_transform(local_model_cost_map, model):
+    config = AnthropicConfig()
+
+    mapped = config.map_openai_params(
+        non_default_params={
+            "tool_choice": "required",
+            "temperature": 0.5,
+            "top_p": 0.9,
+        },
+        optional_params={},
+        model=model,
+        drop_params=True,
+    )
+    assert mapped["tool_choice"] == {"type": "auto"}
+    assert "temperature" not in mapped
+    assert "top_p" not in mapped
+
+    request = config.transform_request(
+        model=model,
+        messages=[{"role": "user", "content": "hi"}],
+        optional_params={"thinking": {"type": "disabled"}, "top_k": 40},
+        litellm_params={"drop_params": True},
+        headers={},
+    )
+    assert "thinking" not in request
+    assert "top_k" not in request
+    assert request["max_tokens"] == 128000
+
+
 def test_calculate_usage_completion_tokens_details_always_populated():
     """
     Test that completion_tokens_details is always populated in Usage object,
