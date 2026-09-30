@@ -191,7 +191,9 @@ function toContext(input: NativeRequest, model: Model<Api>): Context {
   );
   const calls = input.messages.flatMap((message) =>
     message.role === "assistant" && Array.isArray(message.content)
-      ? message.content.filter(is("tool_use"))
+      ? message.content
+          .filter(is("tool_use"))
+          .filter((call) => !anthropicTools.has(call.name))
       : [],
   );
   const messages = input.messages.flatMap((message): Message[] => {
@@ -221,6 +223,7 @@ function toContext(input: NativeRequest, model: Model<Api>): Context {
           }),
           toolsRemoved: blocks
             .filter(is("tool_removal"))
+            .filter((block) => !anthropicTools.has(block.tool.name))
             .map((block) => ({ name: block.tool.name })),
           timestamp: 0,
         },

@@ -1411,6 +1411,23 @@ const forwardedRequest = {
         },
       ],
     },
+    {
+      role: "system",
+      content: [
+        {
+          type: "tool_removal",
+          tool: { type: "tool_reference", name: "web_search" },
+        },
+        {
+          type: "tool_removal",
+          tool: {
+            type: "tool_reference",
+            name: "str_replace_based_edit_tool",
+          },
+        },
+      ],
+    },
+    { role: "user", content: "Anything else?" },
   ],
 };
 
