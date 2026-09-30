@@ -15,16 +15,21 @@ import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { loadRuntime } from "../src/runtime.js";
 import { createInferenceServer } from "../src/server.js";
 
-// Parity contract for claude-opus-5-5 on the native Messages route. A real
-// pi-ai 0.87.1 client (the same library Pi agents use) talks to the sidecar
-// and a loopback server stands in for Anthropic. The body that reaches
-// Anthropic must be the client's body; the only allowed differences are the
-// documented transport and OAuth transforms asserted below.
+// Parity contract for the always-thinking Claude 5.5 models on the native
+// Messages route. A real pi-ai client (the same library Pi agents use) talks
+// to the sidecar and a loopback server stands in for Anthropic. The body that
+// reaches Anthropic must be the client's body; the only allowed differences
+// are the documented transport and OAuth transforms asserted below.
 
 const internalKey = "internal-parity-key";
 const alias = "anthropic/claude-opus-5-5";
-const opus = builtinModels({}).getModel("anthropic", "claude-opus-5-5");
-assert(opus, "pi-ai must ship claude-opus-5-5");
+const currentModels = ["claude-opus-5-5", "claude-sonnet-5-5"] as const;
+type CurrentModel = (typeof currentModels)[number];
+const builtin = (id: CurrentModel): Model<"anthropic-messages"> => {
+  const model = builtinModels({}).getModel("anthropic", id);
+  assert(model, `pi-ai must ship ${id}`);
+  return model as Model<"anthropic-messages">;
+};
 
 type Captured = {
   path: string;
@@ -35,7 +40,10 @@ type Captured = {
 const sse = (data: { type: string; [key: string]: unknown }) =>
   `event: ${data.type}\ndata: ${JSON.stringify(data)}\n\n`;
 
-function upstreamResponse(toolName: string): string {
+function upstreamResponse(
+  toolName: string,
+  modelId: CurrentModel = "claude-opus-5-5",
+): string {
   return [
     {
       type: "message_start",
@@ -43,7 +51,7 @@ function upstreamResponse(toolName: string): string {
         id: "msg_upstream",
         type: "message",
         role: "assistant",
-        model: "claude-opus-5-5",
+        model: modelId,
         content: [],
         stop_reason: null,
         stop_sequence: null,
@@ -142,7 +150,11 @@ const context: Context = {
   messages: [{ role: "user", content: "Weather in Paris?", timestamp: 1 }],
 };
 
-async function run(providerKey: string, clientBetas?: string) {
+async function run(
+  providerKey: string,
+  clientBetas?: string,
+  modelId: CurrentModel = "claude-opus-5-5",
+) {
   const received: Captured[] = [];
   const oauth = providerKey.includes("sk-ant-oat");
   const upstream = createServer(async (req, res) => {
@@ -162,16 +174,17 @@ async function run(providerKey: string, clientBetas?: string) {
       "content-type": "text/event-stream",
       "request-id": "req_upstream",
     });
-    res.end(upstreamResponse(tools[0]?.name ?? "lookup_weather"));
+    res.end(upstreamResponse(tools[0]?.name ?? "lookup_weather", modelId));
   });
   const upstreamUrl = await listen(upstream);
+  const runAlias = `anthropic/${modelId}`;
   const runtime = loadRuntime(
     {
       models: [
         {
-          alias,
+          alias: runAlias,
           provider: "anthropic",
-          model: "claude-opus-5-5",
+          model: modelId,
           baseUrl: upstreamUrl,
         },
       ],
@@ -193,8 +206,8 @@ async function run(providerKey: string, clientBetas?: string) {
   const backendUrl = await listen(backend.server);
 
   const clientModel: Model<"anthropic-messages"> = {
-    ...(opus as Model<"anthropic-messages">),
-    id: alias,
+    ...builtin(modelId),
+    id: runAlias,
     baseUrl: backendUrl,
   };
   const client = createModels();
@@ -265,10 +278,16 @@ function assertResponse(message: AssistantMessage) {
 const apiKey = "sk-ant-api03-parity-fixture";
 const oauthKey = "sk-ant-oat01-parity-fixture";
 
-for (const providerKey of [apiKey, oauthKey]) {
+for (const [modelId, providerKey] of currentModels.flatMap((id) =>
+  [apiKey, oauthKey].map((key) => [id, key] as const),
+)) {
   const mode = providerKey.includes("oat") ? "OAuth" : "API key";
-  test(`claude-opus-5-5 native request reaches Anthropic unchanged (${mode})`, async () => {
-    const { oauth, sent, received, first, second } = await run(providerKey);
+  test(`${modelId} native request reaches Anthropic unchanged (${mode})`, async () => {
+    const { oauth, sent, received, first, second } = await run(
+      providerKey,
+      undefined,
+      modelId,
+    );
     assertResponse(first);
     assertResponse(second);
     assert.equal(sent.length, 2);
@@ -290,7 +309,7 @@ for (const providerKey of [apiKey, oauthKey]) {
       ]);
       assert.deepEqual(betas(outgoing.headers), expectedBetas);
       const { model, system, tools, messages, ...rest } = outgoing.body;
-      assert.equal(model, "claude-opus-5-5");
+      assert.equal(model, modelId);
       const {
         system: clientSystem,
         tools: clientTools,
@@ -424,7 +443,7 @@ async function sidecar(
   };
 }
 
-test("API-key native JSON preserves upstream response fields and unknown blocks", async () => {
+test("API-key native JSON forwards stop sequences and preserves the matched one", async () => {
   const original = {
     id: "msg_original",
     type: "message",
@@ -436,16 +455,20 @@ test("API-key native JSON preserves upstream response fields and unknown blocks"
     stop_details: { reason: "matched" },
     usage: { input_tokens: 4, output_tokens: 2 },
   };
-  let requestStream: unknown;
+  let received: Record<string, unknown> = {};
   const backend = await sidecar((res, body) => {
-    requestStream = body.stream;
+    received = body;
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(original));
   });
   try {
-    const response = await backend.call({ stream: false });
+    const response = await backend.call({
+      stream: false,
+      stop_sequences: ["END"],
+    });
     assert.equal(response.status, 200);
-    assert.equal(requestStream, false);
+    assert.equal(received.stream, false);
+    assert.deepEqual(received.stop_sequences, ["END"]);
     assert.deepEqual(await response.json(), original);
   } finally {
     await backend.close();

@@ -6824,6 +6824,7 @@ def test_disabled_thinking_omitted_for_always_on_models_converse(
     else:
         assert additional.get("thinking") == {"type": "disabled"}
 
+@pytest.mark.parametrize("drop_params", [False, True])
 @pytest.mark.parametrize(
     "model",
     ["anthropic.claude-fable-5-1", "us.anthropic.claude-fable-5-1"],
@@ -6832,32 +6833,15 @@ def test_disabled_thinking_omitted_for_always_on_models_converse(
     "tool_choice",
     ["required", {"type": "function", "function": {"name": "get_weather"}}],
 )
-def test_forced_tool_choice_downgraded_to_auto_on_fable_5_1_converse(
-    local_model_cost_map, model, tool_choice
-):
-    config = AmazonConverseConfig()
-
-    result = config.map_tool_choice_values(
-        model=model, tool_choice=tool_choice, drop_params=True
-    )
-
-    assert result == {"auto": {}}
-
-
-@pytest.mark.parametrize(
-    "tool_choice",
-    ["required", {"type": "function", "function": {"name": "get_weather"}}],
-)
 def test_forced_tool_choice_raises_clean_error_on_fable_5_1_converse(
-    local_model_cost_map, tool_choice, monkeypatch
+    local_model_cost_map, model, tool_choice, drop_params, monkeypatch
 ):
-    monkeypatch.setattr(litellm, "drop_params", False)
+    """drop_params must not downgrade a forced tool choice to auto: that would drop the caller's contract."""
+    monkeypatch.setattr(litellm, "drop_params", drop_params)
     config = AmazonConverseConfig()
 
     with pytest.raises(litellm.utils.UnsupportedParamsError, match="forced tool use"):
-        config.map_tool_choice_values(
-            model="anthropic.claude-fable-5-1", tool_choice=tool_choice, drop_params=False
-        )
+        config.map_tool_choice_values(model=model, tool_choice=tool_choice, drop_params=drop_params)
 
 
 @pytest.mark.parametrize("tool_choice", ["auto", "none"])

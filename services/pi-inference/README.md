@@ -1,7 +1,7 @@
 # Private Pi inference
 
 An inference-only sidecar for this LiteLLM fork, using locked
-`@earendil-works/pi-ai@0.87.1` and `zod@4.4.3`. LiteLLM owns client keys,
+`@earendil-works/pi-ai@0.99.1` and `zod@4.4.3`. LiteLLM owns client keys,
 routing, and spend accounting. This service has no agent loop, executable tools,
 workspace access, shell endpoint, public login flow, or separate spend ledger
 
@@ -26,11 +26,12 @@ The catalog command needs neither credentials nor configuration and makes no
 inference calls. It lists all built-in provider/model metadata, not enabled
 routes or an authoritative price list. Only aliases in `config.example.json`
 are callable; having a provider credential does not enable its models. The
-example enables aliases `claude-haiku-4-5` and `claude-opus-5-5` as Anthropic's
-built-in models of the same names. Opus 5.5 always thinks: send adaptive thinking
-or omit `thinking`, pick depth with `output_config.effort` (the API default is
-`medium`), and expect a 400 for `thinking.type: disabled`, `budget_tokens`, forced
-`tool_choice` and sampling parameters, as on the Anthropic API
+example enables aliases `claude-haiku-4-5`, `claude-opus-5-5` and
+`claude-sonnet-5-5` as Anthropic's built-in models of the same names. Opus 5.5
+and Sonnet 5.5 always think: send adaptive thinking or omit `thinking`, pick
+depth with `output_config.effort` (the API default is `medium`), and expect a 400
+for `thinking.type: disabled`, `budget_tokens`, forced `tool_choice` and sampling
+parameters, as on the Anthropic API
 
 Load `ANTHROPIC_API_KEY` from your secret manager into the host environment.
 Use an Anthropic **API key**, not a Claude subscription/session token, for this
@@ -118,7 +119,8 @@ and refresh remain owned by Pi and the existing credential store
 
 Custom flat tool names become bounded, collision-safe `mcp__pi__…` aliases for
 upstream requests. Claude Code core names and existing `mcp__` names retain Pi's
-normal handling. Definitions, forced native tool choice, and history use the
+normal handling. Anthropic-defined and server tools, which are declared by a
+versioned `type`, keep their names. Definitions, forced native tool choice, and history use the
 same per-request map; responses, including streaming, restore client names.
 There is no shared tool registry or tool execution. IDs, arguments, schemas,
 cache metadata, and signed/redacted thinking are not rewritten
@@ -173,13 +175,15 @@ explicit transport budget remains enforced alongside the canonical budget;
 no extra allowance is created. This map does not enable fallback on the shared
 proxy
 
-Messages returns terminal usage and supports text streaming. With an Anthropic
-API key it forwards the upstream JSON or SSE response body; subscription OAuth
-responses still use the Pi adapter. It retains supported thinking/tool blocks,
-signed thinking round-trips and refusal stop reasons; tool definitions are data,
-never locally executed. `stop_sequences` is explicitly unsupported. Other
-unsupported request fields/features are explicitly rejected. This is not a complete drop-in
-implementation of every upstream API
+Messages returns terminal usage and supports text streaming. It forwards the
+upstream JSON or SSE response body in API-key and OAuth modes; OAuth only restores
+client tool names. The backend validates the fields it reads: model and output
+limits, thinking and sampling constraints, tool choice, custom tool definitions,
+and text, tool and thinking blocks. Every other field and block reaches Anthropic
+unchanged, including `stop_sequences`, documents, search results, citations,
+server and Anthropic-defined tools and their result blocks, `container`,
+`mcp_servers` and `context_management`; Anthropic validates them. Tool
+definitions are data, never locally executed
 
 Structured stdout traces correlate request/trace IDs with slot, route/provider,
 latency, status, and usage, without logging prompts, responses, or secrets.

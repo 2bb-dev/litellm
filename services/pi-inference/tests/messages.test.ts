@@ -16,6 +16,7 @@ import {
   messagesResponse,
   prepareMessages,
 } from "../src/messages.js";
+import { withClaudeOAuthCompatibility } from "../src/claude-oauth.js";
 import { emptyUsage, type WireEvent } from "../src/protocol.js";
 
 const model: Model<"anthropic-messages"> = {
@@ -72,7 +73,10 @@ test("accepts the Anthropic custom tool type that LiteLLM sends for Chat clients
   );
   assert.equal(
     prepareMessages(
-      { ...request, tools: [{ ...tool, type: "web_search_20250305" }] },
+      {
+        ...request,
+        tools: [{ ...tool, type: "custom", input_schema: { type: "array" } }],
+      },
       model,
     ).ok,
     false,
@@ -320,7 +324,7 @@ test("real Pi native HTTP preserves cache, signed thinking, schema and OAuth tra
   }
 });
 
-test("strictly rejects unsupported nested protocol features and malformed limits", () => {
+test("rejects malformed interpreted fields and model constraint violations", () => {
   const invalidBodies: unknown[] = [
     null,
     [],
@@ -330,40 +334,23 @@ test("strictly rejects unsupported nested protocol features and malformed limits
     { ...request, max_tokens: 9000 },
     { ...request, messages: [] },
     { ...request, stream: "true" },
-    { ...request, temperature: -1 },
-    { ...request, temperature: 2 },
-    { ...request, top_p: 2 },
-    { ...request, top_k: -1 },
-    { ...request, service_tier: "auto" },
-    { ...request, container: "opaque" },
-    { ...request, mcp_servers: [] },
-    { ...request, context_management: {} },
-    { ...request, metadata: { user_id: "x", secret: "must-not-leak" } },
-    { ...request, system: [{ type: "text", text: "x", citations: [] }] },
+    { ...request, temperature: "0.5" },
+    { ...request, system: [{ type: "document", text: "x" }] },
     { ...request, messages: [{ role: "system", content: "x" }] },
     {
       ...request,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "document", source: { type: "text", data: "document" } },
-          ],
-        },
-      ],
+      messages: [{ role: "user", content: [{ type: "text", text: 1 }] }],
+    },
+    {
+      ...request,
+      messages: [{ role: "user", content: [{ type: "Document" }] }],
     },
     {
       ...request,
       messages: [
         {
           role: "user",
-          content: [
-            {
-              type: "text",
-              text: "x",
-              cache_control: { type: "ephemeral", ttl: "2h" },
-            },
-          ],
+          content: [{ type: "tool_result", tool_use_id: "bad id" }],
         },
       ],
     },
@@ -372,18 +359,7 @@ test("strictly rejects unsupported nested protocol features and malformed limits
       messages: [
         {
           role: "assistant",
-          content: [{ type: "text", text: "x", citations: [] }],
-        },
-      ],
-    },
-    {
-      ...request,
-      messages: [
-        {
-          role: "assistant",
-          content: [
-            { type: "server_tool_use", id: "s", name: "search", input: {} },
-          ],
+          content: [{ type: "tool_use", id: "t", name: "bash" }],
         },
       ],
     },
@@ -407,32 +383,7 @@ test("strictly rejects unsupported nested protocol features and malformed limits
     },
     {
       ...request,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              ...image,
-              source: { type: "url", url: "https://invalid.test/a.png" },
-            },
-          ],
-        },
-      ],
-    },
-    {
-      ...request,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { ...image, source: { ...image.source, data: "not-base64" } },
-          ],
-        },
-      ],
-    },
-    {
-      ...request,
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      tools: [{ type: "web_search_20250305", name: "web search" }],
     },
     {
       ...request,
@@ -454,13 +405,7 @@ test("strictly rejects unsupported nested protocol features and malformed limits
     },
     { ...request, thinking: { type: "enabled", budget_tokens: 2048 } },
     { ...request, thinking: { type: "enabled", budget_tokens: 100 } },
-    { ...request, thinking: { type: "adaptive", budget_tokens: 1024 } },
-    { ...request, thinking: { type: "disabled", extra: true } },
-    {
-      ...request,
-      output_config: { effort: "high", format: { type: "json_schema" } },
-    },
-    { ...request, tool_choice: { type: "none", name: "bash" } },
+    { ...request, thinking: { type: "interleaved" } },
     { ...request, tool_choice: { type: "any" } },
     {
       ...request,
@@ -473,19 +418,35 @@ test("strictly rejects unsupported nested protocol features and malformed limits
       ...nativeRequest,
       tools: [...nativeRequest.tools, ...nativeRequest.tools],
     },
+    {
+      ...nativeRequest,
+      tools: [...nativeRequest.tools, { type: "bash_20250124", name: "BASH" }],
+    },
   ];
   for (const body of invalidBodies) {
     const result = prepareMessages(body, model);
     assert.equal(result.ok, false, JSON.stringify(body));
-    if (!result.ok) {
-      assert.equal(result.error.status, 400);
-      assert.doesNotMatch(result.error.message, /must-not-leak/);
-    }
+    if (!result.ok) assert.equal(result.error.status, 400);
   }
   assert.equal(
     prepareMessages(nativeRequest, { ...model, input: ["text"] }).ok,
     false,
   );
+  const urlImage = {
+    type: "image",
+    source: { type: "url", url: "https://images.invalid/a.png" },
+  };
+  for (const content of [
+    [urlImage],
+    [{ type: "tool_result", tool_use_id: "tool_1", content: [urlImage] }],
+  ])
+    assert.equal(
+      prepareMessages(
+        { ...request, messages: [{ role: "user", content }] },
+        { ...model, input: ["text"] },
+      ).ok,
+      false,
+    );
   assert.equal(
     prepareMessages(nativeRequest, { ...model, reasoning: false }).ok,
     false,
@@ -1331,16 +1292,214 @@ test("actual Pi client payload passes the LiteLLM cache callback and native adap
   }
 });
 
-test("stop sequences fail explicitly instead of discarding the matched sequence", () => {
-  for (const stop_sequences of [["STOP"], []]) {
-    const result = prepareMessages({ ...request, stop_sequences }, model);
-    assert.equal(result.ok, false);
-    if (!result.ok) {
-      assert.equal(result.error.status, 400);
-      assert.match(
-        result.error.message,
-        /stop_sequences.*not preserve.*matched/i,
+const lookupTool = {
+  name: "lookup_weather",
+  description: "Look up the weather",
+  input_schema: { type: "object", properties: { city: { type: "string" } } },
+};
+const forwardedRequest = {
+  ...request,
+  stream: true,
+  stop_sequences: ["END"],
+  metadata: { user_id: "test-user" },
+  service_tier: "auto",
+  container: "container_1",
+  context_management: { edits: [{ type: "clear_tool_uses_20250919" }] },
+  mcp_servers: [{ type: "url", url: "https://mcp.invalid/sse", name: "docs" }],
+  output_config: {
+    effort: "high",
+    format: { type: "json_schema", schema: { type: "object" } },
+  },
+  tools: [
+    lookupTool,
+    { type: "web_search_20250305", name: "web_search", max_uses: 2 },
+    { type: "text_editor_20250728", name: "str_replace_based_edit_tool" },
+    { type: "mcp_toolset", mcp_server_name: "docs" },
+  ],
+  messages: [
+    {
+      role: "user",
+      content: [
+        {
+          type: "document",
+          source: {
+            type: "base64",
+            media_type: "application/pdf",
+            data: "JVBERi0=",
+          },
+          citations: { enabled: true },
+        },
+        {
+          type: "search_result",
+          source: "https://docs.invalid/a",
+          title: "A",
+          content: [{ type: "text", text: "alpha" }],
+        },
+        {
+          type: "image",
+          source: { type: "url", url: "https://images.invalid/a.png" },
+        },
+        { type: "text", text: "Weather in Paris?" },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "server_tool_use",
+          id: "srvtoolu_1",
+          name: "web_search",
+          input: { query: "paris weather" },
+        },
+        {
+          type: "web_search_tool_result",
+          tool_use_id: "srvtoolu_1",
+          content: [
+            {
+              type: "web_search_result",
+              url: "https://weather.invalid",
+              title: "W",
+              encrypted_content: "opaque",
+            },
+          ],
+        },
+        {
+          type: "text",
+          text: "Sunny.",
+          citations: [
+            {
+              type: "web_search_result_location",
+              url: "https://weather.invalid",
+              title: "W",
+              encrypted_index: "idx",
+              cited_text: "Sunny",
+            },
+          ],
+        },
+        {
+          type: "tool_use",
+          id: "toolu_edit",
+          name: "str_replace_based_edit_tool",
+          input: { command: "view", path: "/notes" },
+        },
+        {
+          type: "tool_use",
+          id: "toolu_lookup",
+          name: "lookup_weather",
+          input: { city: "Paris" },
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "toolu_edit", content: "notes" },
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_lookup",
+          content: [
+            { type: "text", text: "21C" },
+            {
+              type: "document",
+              source: {
+                type: "text",
+                media_type: "text/plain",
+                data: "forecast",
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      role: "system",
+      content: [
+        {
+          type: "tool_removal",
+          tool: { type: "tool_reference", name: "web_search" },
+        },
+        {
+          type: "tool_removal",
+          tool: {
+            type: "tool_reference",
+            name: "str_replace_based_edit_tool",
+          },
+        },
+      ],
+    },
+    { role: "user", content: "Anything else?" },
+  ],
+};
+
+test("real Pi native HTTP forwards documents, hosted tools and other uninterpreted fields unchanged", async () => {
+  for (const apiKey of ["local-test-key", "sk-ant-oat-local-test"]) {
+    const received: Record<string, unknown>[] = [];
+    const server = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      received.push(
+        JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>,
       );
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(fixtureResponse);
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    try {
+      const localModel = {
+        ...model,
+        provider: "anthropic",
+        baseUrl: `http://127.0.0.1:${address.port}`,
+      };
+      const models = createModels();
+      models.setProvider(
+        withClaudeOAuthCompatibility(
+          createProvider({
+            id: localModel.provider,
+            models: [localModel],
+            api: anthropicMessagesApi(),
+            auth: {
+              apiKey: {
+                name: "Fixture",
+                resolve: async () => ({ auth: { apiKey } }),
+              },
+            },
+          }),
+        ),
+      );
+      const prepared = prepareMessages(forwardedRequest, localModel);
+      assert.ok(prepared.ok);
+      const result = await models.completeSimple(
+        localModel,
+        prepared.value.context,
+        { ...prepared.value.options, timeoutMs: 2000, maxRetries: 0 },
+      );
+      assert.equal(result.stopReason, "stop", result.errorMessage);
+      const expected = { ...forwardedRequest, model: model.id };
+      if (!apiKey.includes("oat")) {
+        assert.deepEqual(received[0], expected);
+        continue;
+      }
+      // OAuth aliases only the custom tool; Anthropic-defined and hosted tools keep their names.
+      assert.deepEqual(received[0], {
+        ...JSON.parse(
+          JSON.stringify(expected).replaceAll(
+            '"lookup_weather"',
+            '"mcp__pi__lookup_weather"',
+          ),
+        ),
+        system: [
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+          },
+        ],
+      });
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   }
 });
@@ -1376,7 +1535,7 @@ test("policy refusal remains a native message without exposing Pi's error detail
   );
 });
 
-test("native field overrides remain strict and preserve explicit false, omitted display and null cache", async () => {
+test("native field overrides preserve explicit false, omitted display, null cache and unknown values", async () => {
   const body = {
     ...request,
     cache_control: null,
@@ -1403,19 +1562,26 @@ test("native field overrides remain strict and preserve explicit false, omitted 
   assert.deepEqual(payload.thinking, body.thinking);
   assert.deepEqual(payload.tools, body.tools);
   assert.equal(payload.cache_control, null);
-  for (const invalidBody of [
+  // Anthropic validates fields the backend does not interpret.
+  for (const forwarded of [
     { ...request, cache_control: { type: "ephemeral", ttl: "2h" } },
-    { ...request, cache_control: { type: "ephemeral", extra: true } },
     {
       ...request,
       thinking: { type: "enabled", budget_tokens: 1024, display: "verbose" },
     },
-    { ...request, thinking: { type: "adaptive", display: false } },
-    {
-      ...request,
-      tools: [{ ...nativeRequest.tools[0], eager_input_streaming: "true" }],
-    },
     { ...request, tools: [{ ...nativeRequest.tools[0], strict: 1 }] },
-  ])
-    assert.equal(prepareMessages(invalidBody, model).ok, false);
+  ]) {
+    const result = prepareMessages(forwarded, model);
+    assert.ok(result.ok);
+    const output = (await result.value.options.onPayload?.(
+      {
+        model: model.id,
+        messages: [],
+        tools: [{ name: "bash" }],
+        stream: true,
+      },
+      model,
+    )) as Record<string, unknown>;
+    assert.deepEqual(output, { ...forwarded, stream: true, model: model.id });
+  }
 });

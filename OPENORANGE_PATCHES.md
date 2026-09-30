@@ -25,6 +25,13 @@ Upstream syncs must preserve these behaviors:
   credential-safe correlated stdout traces.
   See `services/pi-inference/README.md` for the API, packaging, and opt-in smoke
   contract; fork CI builds and tests this service without paid inference.
+- **Forced tool choice:** on a model whose map entry sets
+  `supports_forced_tool_use: false`, a forced Chat `tool_choice` (`required` or
+  a named function) is a client-side 400 on the Anthropic, Vertex and Bedrock
+  Converse paths even with `drop_params`. Upstream downgrades it to `auto`,
+  which silently drops the caller's forced-call contract. Unsupported sampling
+  parameters keep the normal `drop_params` behavior. The
+  `test_forced_tool_choice_raises_clean_error_*` tests cover both paths.
 - **ChatGPT subscription routing:** Responses state remains persistent where
   required, upstream storage stays disabled, prompt-cache parameters survive
   transformation, the ChatGPT session header follows `prompt_cache_key`,

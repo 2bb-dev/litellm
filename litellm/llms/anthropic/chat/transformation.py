@@ -1492,7 +1492,7 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
 
                 if _tool_choice is not None:
                     optional_params["tool_choice"] = AnthropicConfig._apply_forced_tool_choice(
-                        model=model, tool_choice=_tool_choice, drop_params=drop_params
+                        model=model, tool_choice=_tool_choice
                     )
             elif param == "stream" and value is True:
                 optional_params["stream"] = value
