@@ -1,4 +1,8 @@
+import json
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, Final, List, Optional, cast
+from urllib.parse import urlsplit
 
 from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.core_helpers import process_response_headers
@@ -32,6 +36,25 @@ if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 
 
+_PROTECTED_REQUEST_HEADERS: Final = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "chatgpt-account-id",
+        "openai-organization",
+        "openai-project",
+        "originator",
+        "user-agent",
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "content-type",
+        "accept",
+    }
+)
+
+
 class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     def __init__(self) -> None:
         super().__init__()
@@ -43,10 +66,10 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
 
     def validate_environment(
         self,
-        headers: dict,
+        headers: Mapping[str, str],
         model: str,
         litellm_params: GenericLiteLLMParams | None,
-    ) -> dict:
+    ) -> dict[str, str]:
         try:
             access_token: Final = self.authenticator.get_access_token()
         except GetAccessTokenError as e:
@@ -58,22 +81,59 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
 
         from litellm.litellm_core_utils.terminal_receipt_oauth import AccountSnapshot, record_account
 
-        snapshot = self.authenticator.get_account_snapshot(access_token)
-        account_id = snapshot.account_id if type(snapshot) is AccountSnapshot else self.authenticator.get_account_id()
+        snapshot: Final = self.authenticator.get_account_snapshot(access_token)
+        account_id: Final = (
+            snapshot.account_id if type(snapshot) is AccountSnapshot else self.authenticator.get_account_id()
+        )
         if litellm_params is not None:
             record_account(dict(litellm_params), snapshot)
-        session_id = ensure_chatgpt_session_id(litellm_params)
-        default_headers = get_chatgpt_default_headers(access_token, account_id, session_id)
-        return {**default_headers, **headers}
+        session_id: Final = ensure_chatgpt_session_id(litellm_params)
+        default_headers: Final = get_chatgpt_default_headers(access_token, account_id, session_id)
+        return {
+            **default_headers,
+            **MappingProxyType(
+                {
+                    key: value
+                    for key, value in headers.items()
+                    if key.lower().replace("_", "-") not in _PROTECTED_REQUEST_HEADERS
+                }
+            ),
+        }
+
+    def sign_request(
+        self,
+        headers: dict[str, str],  # mutable-ok: Responses transform writes cache affinity into SDK headers
+        optional_params: Mapping[str, object],
+        request_data: Mapping[str, object],
+        api_base: str,
+        api_key: str | None = None,
+        model: str | None = None,
+        stream: bool | None = None,
+        fake_stream: bool | None = None,
+    ) -> tuple[dict[str, str], bytes | None]:  # mutable-ok: SDK signing contract requires mutable headers
+        if urlsplit(api_base).path.rstrip("/").endswith("/responses/compact"):
+            return headers, None
+        params: Final = GenericLiteLLMParams.model_validate(optional_params)
+        provider_headers: Final = self.validate_environment(headers, model or "", params)
+        provider_body: Final = self.transform_responses_api_request(
+            model=model or "",
+            input=request_data.get("input"),
+            response_api_optional_request_params={  # mutable-ok: OpenAI transform replaces sanitized tools in its dict input
+                key: value for key, value in request_data.items() if key not in ("model", "input")
+            },
+            litellm_params=params,
+            headers=provider_headers,
+        )
+        return provider_headers, json.dumps(provider_body).encode("utf-8")
 
     def transform_responses_api_request(
         self,
         model: str,
         input: Any,
-        response_api_optional_request_params: dict,
+        response_api_optional_request_params: dict[str, object],
         litellm_params: GenericLiteLLMParams,
-        headers: dict,
-    ) -> dict:
+        headers: dict[str, str],
+    ) -> dict[str, object]:
         request: Final = super().transform_responses_api_request(
             model,
             input,
@@ -254,7 +314,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         raw_response: Any,
     ) -> None:
         raw_headers: Final = dict(raw_response.headers)
-        processed_headers: Final = process_response_headers(raw_headers)
+        processed_headers: Final = process_response_headers(raw_headers, custom_llm_provider="chatgpt")
         if not hasattr(completed_response, "_hidden_params"):
             setattr(completed_response, "_hidden_params", {})
         completed_response._hidden_params["additional_headers"] = processed_headers

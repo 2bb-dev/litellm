@@ -552,7 +552,9 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         except Exception:
             raise OpenAIError(message=raw_response.text, status_code=raw_response.status_code)
         raw_response_headers: Final = dict(raw_response.headers)
-        processed_headers: Final = process_response_headers(raw_response_headers)
+        processed_headers: Final = process_response_headers(
+            raw_response_headers, custom_llm_provider=self.custom_llm_provider
+        )
         try:
             response = ResponsesAPIResponse.model_validate(raw_response_json)
         except ValidationError:

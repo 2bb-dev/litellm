@@ -277,7 +277,8 @@ class BaseResponsesAPIStreamingIterator:
             "custom_llm_provider": custom_llm_provider,
         }
         self._hidden_params["additional_headers"] = process_response_headers(
-            self.response.headers or {}
+            self.response.headers or {},
+            custom_llm_provider=custom_llm_provider,
         )  # GUARANTEE OPENAI HEADERS IN RESPONSE
         self._stream_output_items: dict[str, dict[str, Any]] = {}
         self._stream_output_item_order: list[str] = []

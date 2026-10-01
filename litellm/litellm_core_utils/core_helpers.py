@@ -23,6 +23,19 @@ else:
 
 
 _CODEX_CLIENT_PREFIX_RE: Final = re.compile(r"^codex[-_ /]", re.IGNORECASE)
+_CHATGPT_RESPONSE_HEADERS: Final = frozenset(
+    {
+        "x-request-id",
+        "request-id",
+        "retry-after",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+    }
+)
 
 
 def is_codex_user_agent(user_agent: str) -> bool:
@@ -486,6 +499,7 @@ def _get_parent_otel_span_from_kwargs(
 def process_response_headers(
     response_headers: httpx.Headers | dict,
     preserve_litellm_internal_headers: bool = False,
+    custom_llm_provider: str | None = None,
 ) -> dict:
     """
     `preserve_litellm_internal_headers` must only be True when the input is a
@@ -510,6 +524,8 @@ def process_response_headers(
     additional_headers = {}
 
     for k, v in response_headers.items():
+        if custom_llm_provider == "chatgpt" and (not isinstance(k, str) or k.lower() not in _CHATGPT_RESPONSE_HEADERS):
+            continue
         if k in OPENAI_RESPONSE_HEADERS:  # return openai-compatible headers
             openai_headers[k] = v
         if k.startswith("llm_provider-"):  # return raw provider headers (incl. openai-compatible ones)
