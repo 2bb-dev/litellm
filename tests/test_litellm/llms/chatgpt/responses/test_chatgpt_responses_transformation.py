@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 import litellm
+from litellm.llms.chatgpt.common_utils import get_chatgpt_default_instructions
 from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
@@ -495,6 +496,81 @@ class TestChatGPTResponsesAPITransformation:
         ]
         assert result.output_text == "ok"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("caller_instructions", [None, "Follow the agent rules."])
+    async def test_responses_echo_caller_instructions_not_codex_prompt(
+        self, stream, caller_instructions
+    ):
+        config = ChatGPTResponsesAPIConfig()
+        config.validate_environment = MagicMock(return_value={})
+        config.get_complete_url = MagicMock(
+            return_value="https://chatgpt.example.com/responses"
+        )
+
+        async def post(**kwargs):
+            # The backend echoes the instructions it received in every response body.
+            response_payload = {
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1700000000,
+                "status": "completed",
+                "model": "gpt-5.5",
+                "instructions": json.loads(kwargs["data"])["instructions"],
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+                ],
+            }
+            events = [
+                {"type": "response.created", "response": {**response_payload, "status": "in_progress", "output": []}},
+                {"type": "response.completed", "response": response_payload},
+            ]
+            sse_body = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=sse_body,
+                request=httpx.Request("POST", "https://chatgpt.example.com/responses"),
+            )
+
+        client = AsyncHTTPHandler()
+        client.post = AsyncMock(side_effect=post)
+        logging_obj = MagicMock()
+        logging_obj.dynamic_success_callbacks = []
+        logging_obj.model_call_details = {}
+        logging_obj.completion_start_time = None
+        handler = BaseLLMHTTPHandler()
+        handler._call_agentic_completion_hooks = AsyncMock(return_value=None)
+        optional_params = {"stream": stream}
+        if caller_instructions is not None:
+            optional_params["instructions"] = caller_instructions
+
+        result = await handler.async_response_api_handler(
+            model="gpt-5.5",
+            input="Reply with ok.",
+            responses_api_provider_config=config,
+            response_api_optional_request_params=optional_params,
+            custom_llm_provider="chatgpt",
+            litellm_params=GenericLiteLLMParams(),
+            logging_obj=logging_obj,
+            client=client,
+        )
+        responses = (
+            [event.response async for event in result if getattr(event, "response", None) is not None]
+            if stream
+            else [result]
+        )
+
+        assert json.loads(client.post.call_args.kwargs["data"])["instructions"].startswith(
+            "You are Codex, based on GPT-5."
+        )
+        assert len(responses) == (2 if stream else 1)
+        assert [response.instructions for response in responses] == [caller_instructions] * len(responses)
+
     @pytest.mark.parametrize(
         "model_name",
         [
@@ -774,6 +850,7 @@ class TestChatGPTResponsesAPITransformation:
             "created_at": 1700000000,
             "status": "completed",
             "model": response_model,
+            "instructions": f"{get_chatgpt_default_instructions()}\n\nBe brief.",
             "output": [
                 {
                     "type": "message",
@@ -801,6 +878,7 @@ class TestChatGPTResponsesAPITransformation:
         )
 
         assert parsed.output_text == "Hello!"
+        assert parsed.instructions == "Be brief."
 
     @pytest.mark.parametrize(
         ("model_name", "response_model"),

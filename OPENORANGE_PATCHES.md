@@ -40,6 +40,8 @@ Upstream syncs must preserve these behaviors:
   content or order, and
   provider-forced SSE is accumulated into one complete response for
   non-streaming callers without duplicate streaming hooks or spend logs.
+  Requests still prepend the Codex CLI prompt for the backend, but response
+  bodies and their request logs return only the caller's own `instructions`.
 - **OpenClaw attribution:** trusted runtime context and supported OpenClaw
   payload markers continue to populate actor, parent, session, channel,
   execution, and Langfuse metadata without persisting raw credentials.

@@ -19,6 +19,7 @@ from litellm.responses.sse_output_recovery import (
 from litellm.types.llms.openai import (
     ResponsesAPIResponse,
     ResponsesAPIStreamEvents,
+    ResponsesAPIStreamingResponse,
 )
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
@@ -53,6 +54,14 @@ _PROTECTED_REQUEST_HEADERS: Final = frozenset(
         "accept",
     }
 )
+
+
+def _caller_instructions(instructions: str | None) -> str | None:
+    """Callers get back their own instructions, not the Codex prompt prepended to every request."""
+    base_instructions: Final = get_chatgpt_default_instructions()
+    if instructions is None or instructions == base_instructions:
+        return None
+    return instructions.removeprefix(f"{base_instructions}\n\n")
 
 
 class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
@@ -202,11 +211,13 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     ):
         body_text: Final = raw_response.text or ""
         if not self._should_parse_as_sse(raw_response=raw_response, body_text=body_text):
-            return super().transform_response_api_response(
+            response: Final = super().transform_response_api_response(
                 model=model,
                 raw_response=raw_response,
                 logging_obj=logging_obj,
             )
+            response.instructions = _caller_instructions(response.instructions)
+            return response
 
         logging_obj.post_call(
             original_response=raw_response.text,
@@ -221,7 +232,24 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             )
 
         self._attach_response_headers(completed_response=completed_response, raw_response=raw_response)
+        completed_response.instructions = _caller_instructions(completed_response.instructions)
         return completed_response
+
+    def transform_streaming_response(
+        self,
+        model: str,
+        parsed_chunk: dict[str, object],  # mutable-ok: overrides the base class signature
+        logging_obj: "LiteLLMLoggingObj",
+    ) -> ResponsesAPIStreamingResponse:
+        event: Final = super().transform_streaming_response(
+            model=model,
+            parsed_chunk=parsed_chunk,
+            logging_obj=logging_obj,
+        )
+        response: Final = getattr(event, "response", None)
+        if isinstance(response, ResponsesAPIResponse):
+            response.instructions = _caller_instructions(response.instructions)
+        return event
 
     def _should_parse_as_sse(self, raw_response: Any, body_text: str) -> bool:
         content_type: Final = (raw_response.headers or {}).get("content-type", "")
