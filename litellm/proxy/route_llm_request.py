@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 import httpx
 from fastapi import HTTPException, status
+from pydantic import TypeAdapter, ValidationError
 
 import litellm
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
@@ -26,6 +27,22 @@ GATED_MOCK_PARAM_NAMES: Final[tuple[str, ...]] = (
 )
 
 MOCK_TESTING_CONFIG_KEY: Final = "dangerously_allow_mock_testing_request_params"
+
+# ``extra_body`` is merged into the outbound request after this proxy checked the key's model
+# access, so these fields would pick the served model on the provider or on a downstream
+# LiteLLM proxy. A nested ``extra_body`` carries them one hop further.
+EXTRA_BODY_ROUTING_PARAM_NAMES: Final[tuple[str, ...]] = (
+    "model",
+    "fallbacks",
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+    "router_settings_override",
+    "user_config",
+    "extra_body",
+)
+
+# Multipart routes carry ``extra_body`` as a JSON string, so it is read the same way here.
+_EXTRA_BODY_OBJECT: Final = TypeAdapter(dict[str, object])
 
 if TYPE_CHECKING:
     from litellm.router import Router as _Router
@@ -212,6 +229,44 @@ def raise_if_mock_testing_params_disallowed(data: Mapping[str, object], *, allow
     present: Final = tuple(name for name in GATED_MOCK_PARAM_NAMES if name in data)
     if present:
         raise MockTestingParamsDisabledError(params=present)
+
+
+class ExtraBodyRejectedError(ProxyException):
+    def __init__(self, route: str, reason: str) -> None:
+        super().__init__(
+            message=f"{route}: {reason}",
+            type="invalid_request_error",
+            param="extra_body",
+            code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+def _extra_body_object(raw: object) -> Mapping[str, object] | None:
+    try:
+        if isinstance(raw, str):
+            return _EXTRA_BODY_OBJECT.validate_json(raw)
+        return _EXTRA_BODY_OBJECT.validate_python(raw)
+    except ValidationError:
+        return None
+
+
+def raise_if_extra_body_sets_routing_params(route_type: str, data: Mapping[str, object]) -> None:
+    raw: Final = data.get("extra_body")
+    if raw is None:
+        return
+    route: Final = ROUTE_ENDPOINT_MAPPING.get(route_type, route_type)
+    extra_body: Final = _extra_body_object(raw)
+    if extra_body is None:
+        raise ExtraBodyRejectedError(route=route, reason="extra_body must be a JSON object.")
+    present: Final = tuple(name for name in EXTRA_BODY_ROUTING_PARAM_NAMES if name in extra_body)
+    if present:
+        raise ExtraBodyRejectedError(
+            route=route,
+            reason=(
+                f"extra_body cannot set {', '.join(present)}. These choose what serves the request, "
+                "so they are only accepted at the top level, where this proxy checks them."
+            ),
+        )
 
 
 def mock_testing_params_allowed() -> bool:
@@ -472,6 +527,8 @@ async def _route_request_single_attempt(  # noqa: ANN202  # returns unawaited pr
     await add_shared_session_to_data(data)
 
     raise_if_mock_testing_params_disallowed(data, allowed=mock_testing_params_allowed())
+
+    raise_if_extra_body_sets_routing_params(route_type=route_type, data=data)
 
     data.pop("enable_tag_filtering", None)
 
