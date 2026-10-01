@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 from fastapi import HTTPException
 
+from litellm.proxy._types import ProxyException
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError, route_request
 
 
@@ -662,6 +663,77 @@ async def test_route_request_forwards_mock_params_when_opted_in(monkeypatch):
 
     call_kwargs = llm_router.acompletion.call_args[1]
     assert call_kwargs["mock_testing_fallbacks"] is True
+
+
+_REQUIRED_BODY_BY_ROUTE: Final = {
+    "acompletion": {"messages": [{"role": "user", "content": "Hello"}]},
+    "aresponses": {"input": "Hello"},
+}
+
+
+@pytest.mark.parametrize("route_type", ["acompletion", "aresponses"])
+@pytest.mark.parametrize(
+    "routing_param, value",
+    [
+        ("model", "chatgpt/gpt-6-astra"),
+        ("fallbacks", ["chatgpt/gpt-6-astra"]),
+        ("context_window_fallbacks", [{"gpt-3.5-turbo": ["chatgpt/gpt-6-astra"]}]),
+        ("content_policy_fallbacks", [{"gpt-3.5-turbo": ["chatgpt/gpt-6-astra"]}]),
+        ("user_config", {"model_list": []}),
+        ("extra_body", {"model": "chatgpt/gpt-6-astra"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_route_request_rejects_extra_body_routing_params(route_type, routing_param, value):
+    """extra_body is merged into the outbound request after the key's model access check, so on a
+    proxy that forwards to another LiteLLM proxy these fields would pick a model the key may not use"""
+    data = {
+        "model": "gpt-3.5-turbo",
+        **_REQUIRED_BODY_BY_ROUTE[route_type],
+        "extra_body": {"service_tier": "flex", routing_param: value},
+    }
+    llm_router = MagicMock()
+
+    with pytest.raises(ProxyException) as exc_info:
+        await route_request(data, llm_router, None, route_type)
+
+    assert exc_info.value.code == "400"
+    assert exc_info.value.type == "invalid_request_error"
+    assert f"extra_body cannot set {routing_param}." in exc_info.value.message
+    getattr(llm_router, route_type).assert_not_called()
+
+
+@pytest.mark.parametrize("route_type", ["acompletion", "aresponses"])
+@pytest.mark.asyncio
+async def test_route_request_forwards_extra_body_without_routing_params(route_type):
+    extra_body = {"service_tier": "flex", "metadata": {"trace_id": "t-1"}, "thinking": {"type": "enabled"}}
+    data = {"model": "gpt-3.5-turbo", **_REQUIRED_BODY_BY_ROUTE[route_type], "extra_body": extra_body}
+    llm_router = MagicMock()
+    getattr(llm_router, route_type).return_value = "ok"
+
+    await route_request(data, llm_router, None, route_type)
+
+    call_kwargs = getattr(llm_router, route_type).call_args[1]
+    assert call_kwargs["model"] == "gpt-3.5-turbo"
+    assert call_kwargs["extra_body"] == {
+        "service_tier": "flex",
+        "metadata": {"trace_id": "t-1"},
+        "thinking": {"type": "enabled"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_extra_body_routing_error_names_every_routing_param():
+    data = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "extra_body": {"seed": 7, "model": "chatgpt/gpt-6-astra", "fallbacks": ["chatgpt/gpt-6-astra"]},
+    }
+
+    with pytest.raises(ProxyException) as exc_info:
+        await route_request(data, MagicMock(), None, "acompletion")
+
+    assert "/chat/completions: extra_body cannot set model, fallbacks." in exc_info.value.message
 
 
 @pytest.mark.parametrize("route_type", ["agenerate_content", "agenerate_content_stream"])

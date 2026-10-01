@@ -27,6 +27,18 @@ GATED_MOCK_PARAM_NAMES: Final[tuple[str, ...]] = (
 
 MOCK_TESTING_CONFIG_KEY: Final = "dangerously_allow_mock_testing_request_params"
 
+# ``extra_body`` is merged into the outbound request after this proxy checked the key's model
+# access, so these fields would pick the served model on the provider or on a downstream
+# LiteLLM proxy. A nested ``extra_body`` carries them one hop further.
+EXTRA_BODY_ROUTING_PARAM_NAMES: Final[tuple[str, ...]] = (
+    "model",
+    "fallbacks",
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+    "user_config",
+    "extra_body",
+)
+
 if TYPE_CHECKING:
     from litellm.router import Router as _Router
 
@@ -212,6 +224,28 @@ def raise_if_mock_testing_params_disallowed(data: Mapping[str, object], *, allow
     present: Final = tuple(name for name in GATED_MOCK_PARAM_NAMES if name in data)
     if present:
         raise MockTestingParamsDisabledError(params=present)
+
+
+class ExtraBodyRoutingParamsError(ProxyException):
+    def __init__(self, route: str, params: tuple[str, ...]) -> None:
+        super().__init__(
+            message=(
+                f"{route}: extra_body cannot set {', '.join(params)}. These choose what serves the request, "
+                "so they are only accepted at the top level, where this proxy checks them."
+            ),
+            type="invalid_request_error",
+            param="extra_body",
+            code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+def raise_if_extra_body_sets_routing_params(route_type: str, data: Mapping[str, object]) -> None:
+    extra_body: Final = data.get("extra_body")
+    if not isinstance(extra_body, Mapping):
+        return
+    present: Final = tuple(name for name in EXTRA_BODY_ROUTING_PARAM_NAMES if name in extra_body)
+    if present:
+        raise ExtraBodyRoutingParamsError(route=ROUTE_ENDPOINT_MAPPING.get(route_type, route_type), params=present)
 
 
 def mock_testing_params_allowed() -> bool:
@@ -472,6 +506,8 @@ async def _route_request_single_attempt(  # noqa: ANN202  # returns unawaited pr
     await add_shared_session_to_data(data)
 
     raise_if_mock_testing_params_disallowed(data, allowed=mock_testing_params_allowed())
+
+    raise_if_extra_body_sets_routing_params(route_type=route_type, data=data)
 
     data.pop("enable_tag_filtering", None)
 
