@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 import httpx
 from fastapi import HTTPException, status
+from pydantic import TypeAdapter, ValidationError
 
 import litellm
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
@@ -35,9 +36,13 @@ EXTRA_BODY_ROUTING_PARAM_NAMES: Final[tuple[str, ...]] = (
     "fallbacks",
     "context_window_fallbacks",
     "content_policy_fallbacks",
+    "router_settings_override",
     "user_config",
     "extra_body",
 )
+
+# Multipart routes carry ``extra_body`` as a JSON string, so it is read the same way here.
+_EXTRA_BODY_OBJECT: Final = TypeAdapter(dict[str, object])
 
 if TYPE_CHECKING:
     from litellm.router import Router as _Router
@@ -226,26 +231,42 @@ def raise_if_mock_testing_params_disallowed(data: Mapping[str, object], *, allow
         raise MockTestingParamsDisabledError(params=present)
 
 
-class ExtraBodyRoutingParamsError(ProxyException):
-    def __init__(self, route: str, params: tuple[str, ...]) -> None:
+class ExtraBodyRejectedError(ProxyException):
+    def __init__(self, route: str, reason: str) -> None:
         super().__init__(
-            message=(
-                f"{route}: extra_body cannot set {', '.join(params)}. These choose what serves the request, "
-                "so they are only accepted at the top level, where this proxy checks them."
-            ),
+            message=f"{route}: {reason}",
             type="invalid_request_error",
             param="extra_body",
             code=status.HTTP_400_BAD_REQUEST,
         )
 
 
+def _extra_body_object(raw: object) -> Mapping[str, object] | None:
+    try:
+        if isinstance(raw, str):
+            return _EXTRA_BODY_OBJECT.validate_json(raw)
+        return _EXTRA_BODY_OBJECT.validate_python(raw)
+    except ValidationError:
+        return None
+
+
 def raise_if_extra_body_sets_routing_params(route_type: str, data: Mapping[str, object]) -> None:
-    extra_body: Final = data.get("extra_body")
-    if not isinstance(extra_body, Mapping):
+    raw: Final = data.get("extra_body")
+    if raw is None:
         return
+    route: Final = ROUTE_ENDPOINT_MAPPING.get(route_type, route_type)
+    extra_body: Final = _extra_body_object(raw)
+    if extra_body is None:
+        raise ExtraBodyRejectedError(route=route, reason="extra_body must be a JSON object.")
     present: Final = tuple(name for name in EXTRA_BODY_ROUTING_PARAM_NAMES if name in extra_body)
     if present:
-        raise ExtraBodyRoutingParamsError(route=ROUTE_ENDPOINT_MAPPING.get(route_type, route_type), params=present)
+        raise ExtraBodyRejectedError(
+            route=route,
+            reason=(
+                f"extra_body cannot set {', '.join(present)}. These choose what serves the request, "
+                "so they are only accepted at the top level, where this proxy checks them."
+            ),
+        )
 
 
 def mock_testing_params_allowed() -> bool:

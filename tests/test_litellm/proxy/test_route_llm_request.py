@@ -679,6 +679,7 @@ _REQUIRED_BODY_BY_ROUTE: Final = {
         ("fallbacks", ["chatgpt/gpt-6-astra"]),
         ("context_window_fallbacks", [{"gpt-3.5-turbo": ["chatgpt/gpt-6-astra"]}]),
         ("content_policy_fallbacks", [{"gpt-3.5-turbo": ["chatgpt/gpt-6-astra"]}]),
+        ("router_settings_override", {"fallbacks": ["chatgpt/gpt-6-astra"]}),
         ("user_config", {"model_list": []}),
         ("extra_body", {"model": "chatgpt/gpt-6-astra"}),
     ],
@@ -734,6 +735,50 @@ async def test_extra_body_routing_error_names_every_routing_param():
         await route_request(data, MagicMock(), None, "acompletion")
 
     assert "/chat/completions: extra_body cannot set model, fallbacks." in exc_info.value.message
+
+
+@pytest.mark.parametrize("route_type", ["acompletion", "aresponses"])
+@pytest.mark.parametrize(
+    "extra_body",
+    [
+        [["model", "chatgpt/gpt-6-astra"]],
+        [["fallbacks", ["chatgpt/gpt-6-astra"]]],
+        '[["model", "chatgpt/gpt-6-astra"]]',
+        "model=chatgpt/gpt-6-astra",
+        7,
+    ],
+)
+@pytest.mark.asyncio
+async def test_route_request_rejects_extra_body_that_is_not_an_object(route_type, extra_body):
+    """The Responses handler merges extra_body with dict.update, which also takes a list of key/value pairs"""
+    data = {"model": "gpt-3.5-turbo", **_REQUIRED_BODY_BY_ROUTE[route_type], "extra_body": extra_body}
+    llm_router = MagicMock()
+
+    with pytest.raises(ProxyException) as exc_info:
+        await route_request(data, llm_router, None, route_type)
+
+    assert exc_info.value.code == "400"
+    assert "extra_body must be a JSON object." in exc_info.value.message
+    getattr(llm_router, route_type).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_route_request_reads_extra_body_sent_as_a_json_string():
+    """Multipart routes carry extra_body as a JSON string"""
+    rejected = {
+        "model": "gpt-3.5-turbo",
+        "input": "Hello",
+        "extra_body": '{"model": "chatgpt/gpt-6-astra"}',
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        await route_request(rejected, MagicMock(), None, "aresponses")
+    assert "extra_body cannot set model." in exc_info.value.message
+
+    allowed = {"model": "gpt-3.5-turbo", "input": "Hello", "extra_body": '{"custom_llm_provider": "openai"}'}
+    llm_router = MagicMock()
+    llm_router.aresponses.return_value = "ok"
+    await route_request(allowed, llm_router, None, "aresponses")
+    assert llm_router.aresponses.call_args[1]["extra_body"] == '{"custom_llm_provider": "openai"}'
 
 
 @pytest.mark.parametrize("route_type", ["agenerate_content", "agenerate_content_stream"])
