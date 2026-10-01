@@ -67,7 +67,8 @@ _SERVICE_TIER_TO_COST_KEY_SUFFIX: Final[Mapping[str, str]] = MappingProxyType(
 
 _TOKEN_PERIOD_RATE_KEY: Final = re.compile(
     r"(?:(?:input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|"
-    r"cache_creation_input_token_cost(?:_above_1hr)?)(?:_above_\d+k?_tokens)?|output_cost_per_reasoning_token)"
+    r"cache_creation_input_token_cost(?:_above_1hr)?)(?:_above_\d+k?_tokens)?(?:_priority)?"
+    r"|output_cost_per_reasoning_token)"
 )
 
 _INCLUSIVE_THRESHOLD_PROVIDERS: Final = frozenset({"xai"})

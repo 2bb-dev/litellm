@@ -54,6 +54,17 @@ _PROTECTED_REQUEST_HEADERS: Final = frozenset(
     }
 )
 
+# Fast mode: the Codex client sends "priority", or "default" for an explicit
+# standard request; "fast" is OpenAI's public name for the priority tier.
+# Other tiers stay dropped, as the backend never received them before.
+_CHATGPT_SERVICE_TIERS: Final = MappingProxyType(
+    {
+        "priority": "priority",
+        "fast": "priority",
+        "default": "default",
+    }
+)
+
 
 class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     def __init__(self) -> None:
@@ -176,6 +187,9 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         if "reasoning.encrypted_content" not in include:
             include.append("reasoning.encrypted_content")
         request["include"] = include
+        service_tier: Final = _CHATGPT_SERVICE_TIERS.get(str(request.pop("service_tier", None) or "").lower())
+        if service_tier:
+            request["service_tier"] = service_tier
 
         allowed_keys: Final = {
             "model",
@@ -189,6 +203,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             "reasoning",
             "previous_response_id",
             "prompt_cache_key",
+            "service_tier",
             "truncation",
         }
 
