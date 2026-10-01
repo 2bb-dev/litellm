@@ -5,6 +5,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from collections.abc import Iterator
+from typing import Final
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -942,3 +943,66 @@ class TestResponsesInputToChatMessages:
         assert ResponsesAPIRequestUtils.responses_input_to_chat_messages(
             [reasoning_item, user_message, "stray"]
         ) == [user_message]
+
+
+@pytest.mark.parametrize(
+    ("masked_blob", "wrapper_count"),
+    [("gAAAAA\u2026UO4=", 0), ("gAAAAA\u2026UO4=", 1), ("gAAAAA\u2026UO4=", 2), ("***", 2)],
+)
+def test_strip_masked_encrypted_reasoning_preserves_readable_and_intact_items(
+    masked_blob: str, wrapper_count: int
+) -> None:
+    wrapped_once: Final = ResponsesAPIRequestUtils._wrap_encrypted_content_with_model_id(masked_blob, "deployment-a")
+    wrapped_twice: Final = ResponsesAPIRequestUtils._wrap_encrypted_content_with_model_id(wrapped_once, "deployment-b")
+    masked: Final = (masked_blob, wrapped_once, wrapped_twice)[wrapper_count]
+    intact_blob: Final = ResponsesAPIRequestUtils._wrap_encrypted_content_with_model_id(
+        "gAAAAA_intact=", "deployment-a"
+    )
+    intact: Final = {
+        "type": "reasoning",
+        "id": ResponsesAPIRequestUtils._build_encrypted_item_id("deployment-a", "rs_intact"),
+        "encrypted_content": intact_blob,
+        "summary": [],
+    }
+    non_reasoning: Final = {"type": "message", "id": "msg_1", "encrypted_content": masked, "content": "answer"}
+    request_input: Final = [
+        {"type": "reasoning", "id": "rs_masked", "encrypted_content": masked, "summary": "readable thought"},
+        intact,
+        {"type": "reasoning", "encrypted_content": masked, "summary": []},
+        {"type": "reasoning", "encrypted_content": masked, "summary": " ", "content": []},
+        {"type": "reasoning", "encrypted_content": masked},
+        {
+            "type": "reasoning",
+            "id": "rs_content",
+            "encrypted_content": masked,
+            "content": [{"type": "output_text", "text": "readable content"}],
+        },
+        non_reasoning,
+        {"role": "user", "content": "follow-up"},
+    ]
+    fallback_snapshot: Final = {"input": request_input}
+
+    ResponsesAPIRequestUtils.strip_masked_encrypted_reasoning_from_input(request_input)
+
+    assert fallback_snapshot["input"] == [
+        {"type": "reasoning", "summary": "readable thought"},
+        {
+            "type": "reasoning",
+            "id": ResponsesAPIRequestUtils._build_encrypted_item_id("deployment-a", "rs_intact"),
+            "encrypted_content": intact_blob,
+            "summary": [],
+        },
+        {"type": "reasoning", "content": [{"type": "output_text", "text": "readable content"}]},
+        {"type": "message", "id": "msg_1", "encrypted_content": masked, "content": "answer"},
+        {"role": "user", "content": "follow-up"},
+    ]
+    assert request_input[1] is intact
+    assert request_input[3] is non_reasoning
+
+
+def test_strip_masked_encrypted_reasoning_leaves_string_input_unchanged() -> None:
+    request_input: Final = "gAAAAA\u2026UO4= and *** are plain prompt text"
+
+    ResponsesAPIRequestUtils.strip_masked_encrypted_reasoning_from_input(request_input)
+
+    assert request_input == "gAAAAA\u2026UO4= and *** are plain prompt text"

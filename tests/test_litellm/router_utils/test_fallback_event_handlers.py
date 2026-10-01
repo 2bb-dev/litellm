@@ -1,5 +1,5 @@
 import json
-from typing import NoReturn
+from typing import Final, NoReturn
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -1405,6 +1405,72 @@ async def test_responses_http_encrypted_error_does_not_cycle_slots(stream: bool)
         assert attempts == [5, 3]
     finally:
         router.reset()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["responses", "compact"])
+async def test_responses_http_drops_masked_encrypted_reasoning_before_dispatch(endpoint: str) -> None:
+    from litellm.responses.main import acompact_responses
+    from litellm.responses.utils import ResponsesAPIRequestUtils
+
+    requests: Final[list[dict[str, object]]] = []
+
+    class Provider(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:
+            body: Final = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(body)
+            invalid: Final = any(
+                "encrypted_content" in item for item in body["input"] if item.get("type") == "reasoning"
+            )
+            result: Final = (
+                {"error": {"code": "invalid_encrypted_content", "message": "invalid_encrypted_content"}}
+                if invalid
+                else {
+                    "id": "resp_test",
+                    "object": "response.compaction" if endpoint == "compact" else "response",
+                    "created_at": 1741476542,
+                    "status": "completed",
+                    "model": "test",
+                    "output": [],
+                    "usage": {"input_tokens": 5, "output_tokens": 10, "total_tokens": 15},
+                }
+            )
+            self.send_response(400 if invalid else 200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+
+    server: Final = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    thread: Final = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    wrapped: Final = ResponsesAPIRequestUtils._wrap_encrypted_content_with_model_id("gAAAAA\u2026UO4=", "deployment-a")
+    request_input: Final = [
+        {"type": "reasoning", "id": "rs_masked", "encrypted_content": wrapped, "summary": "readable thought"},
+        {"role": "user", "content": "follow-up"},
+    ]
+    try:
+        call: Final = acompact_responses if endpoint == "compact" else litellm.aresponses
+        response: Final = await call(
+            model="openai/test",
+            input=request_input,
+            api_key="synthetic",
+            api_base=f"http://127.0.0.1:{server.server_port}/v1",
+            num_retries=0,
+        )
+
+        assert response.id.startswith("resp_")
+        assert len(requests) == 1
+        assert requests[0]["input"] == [
+            {"type": "reasoning", "summary": "readable thought"},
+            {"role": "user", "content": "follow-up"},
+        ]
+    finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

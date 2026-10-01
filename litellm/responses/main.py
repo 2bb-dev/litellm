@@ -1343,6 +1343,7 @@ def responses(
             custom_llm_provider=custom_llm_provider,
         )
 
+        ResponsesAPIRequestUtils.strip_masked_encrypted_reasoning_from_input(input)
         # Decode any litellm-encoded encrypted-content item IDs back to their original IDs
         input = ResponsesAPIRequestUtils._restore_encrypted_content_item_ids_in_input(input)
 
@@ -2168,6 +2169,7 @@ def compact_responses(
             custom_llm_provider=custom_llm_provider,
         )
 
+        ResponsesAPIRequestUtils.strip_masked_encrypted_reasoning_from_input(input)
         # Decode any litellm-encoded encrypted-content item IDs back to their original IDs
         # before forwarding to the upstream provider.
         input = ResponsesAPIRequestUtils._restore_encrypted_content_item_ids_in_input(input)
