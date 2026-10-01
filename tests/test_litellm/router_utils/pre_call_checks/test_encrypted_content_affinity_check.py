@@ -16,6 +16,7 @@ The mechanism works without any cache and supports two encoding strategies:
 """
 
 import time
+from typing import Final
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -1751,6 +1752,46 @@ async def test_encrypted_content_affinity_strips_bridge_reasoning_from_messages_
         {"type": "text", "text": "The zebra owner lives in the green house."},
     ]
     assert all(block["signature"] for block in assistant_content if block["type"] == "thinking")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encrypted_content", ["gAAAAA\u2026UO4=", "gAAAAA_intact="])
+async def test_affinity_ignores_masked_reasoning_but_still_pins_intact_reasoning(encrypted_content: str) -> None:
+    check: Final = EncryptedContentAffinityCheck()
+    deployments: Final = [
+        {"model_info": {"id": "deployment-a"}, "litellm_params": {"model": "openai/test"}},
+        {"model_info": {"id": "deployment-b"}, "litellm_params": {"model": "openai/test"}},
+    ]
+    wrapped: Final = ResponsesAPIRequestUtils._wrap_encrypted_content_with_model_id(encrypted_content, "deployment-a")
+    reasoning: Final = {
+        "type": "reasoning",
+        "id": ResponsesAPIRequestUtils._build_encrypted_item_id("deployment-a", "rs_1"),
+        "encrypted_content": wrapped,
+        "summary": [{"type": "summary_text", "text": "readable thought"}],
+    }
+    request_kwargs: Final = {"input": [reasoning]}
+
+    result: Final = await check.async_filter_deployments(
+        model="test", healthy_deployments=deployments, messages=None, request_kwargs=request_kwargs
+    )
+
+    if encrypted_content == "gAAAAA_intact=":
+        assert result == [deployments[0]]
+        assert request_kwargs["input"] == [
+            {
+                "type": "reasoning",
+                "id": ResponsesAPIRequestUtils._build_encrypted_item_id("deployment-a", "rs_1"),
+                "encrypted_content": wrapped,
+                "summary": [{"type": "summary_text", "text": "readable thought"}],
+            }
+        ]
+        assert request_kwargs["_encrypted_content_affinity_pinned"] is True
+    else:
+        assert result == deployments
+        assert request_kwargs["input"] == [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "readable thought"}]}
+        ]
+        assert "_encrypted_content_affinity_pinned" not in request_kwargs
 
 
 class TestStripEncryptedReasoningFromInput:

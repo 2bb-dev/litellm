@@ -557,6 +557,26 @@ class ResponsesAPIRequestUtils:
         items[:] = (item for item in stripped if item is not None)  # rebind-ok: list shared with fallback snapshot
 
     @staticmethod
+    def strip_masked_encrypted_reasoning_from_input(request_input: object) -> None:
+        if not isinstance(request_input, list):
+            return
+        items: Final = cast(list[object], request_input)  # cast-ok: untyped client json
+        stripped: Final = tuple(
+            ResponsesAPIRequestUtils._without_encrypted_reasoning(item)
+            if _is_object_dict(item)
+            and item.get("type") == "reasoning"
+            and isinstance(encrypted_content := item.get("encrypted_content"), str)
+            and ResponsesAPIRequestUtils._is_masked_encrypted_content(encrypted_content)
+            else item
+            for item in items
+        )
+        items[:] = (item for item in stripped if item is not None)  # rebind-ok: list shared with fallback snapshot
+
+    @staticmethod
+    def _is_masked_encrypted_content(encrypted_content: str) -> bool:
+        return "\u2026" in encrypted_content or "***" in encrypted_content
+
+    @staticmethod
     def _without_encrypted_reasoning(item: object) -> object | None:
         if not isinstance(item, dict):
             return item

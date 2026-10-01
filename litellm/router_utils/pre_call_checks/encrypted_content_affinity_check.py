@@ -322,6 +322,9 @@ class EncryptedContentAffinityCheck(CustomLogger):
             request_kwargs["litellm_metadata"]["encrypted_content_affinity_enabled"] = True
 
         request_input: Final = request_kwargs.get("input")
+        ResponsesAPIRequestUtils.strip_masked_encrypted_reasoning_from_input(
+            cast(object, request_input)  # cast-ok: untyped client json
+        )
         anthropic_messages: Final = messages or request_kwargs.get("messages")
         input_model_id: Final = self._extract_model_id_from_input(
             request_input
