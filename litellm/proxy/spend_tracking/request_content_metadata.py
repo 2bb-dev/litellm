@@ -27,7 +27,7 @@ _JSON_VALUE: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 _SPEND_FIELDS: TypeAdapter[Mapping[str, object]] = TypeAdapter(Mapping[str, object])
 _IDENTITY_FIELDS = frozenset(
     "user_api_key_team_id user_api_key_project_id user_api_key_org_id "
-    "user_api_key_user_id litellm_call_id openclaw_user_id openclaw_parent_user_id "
+    "user_api_key_user_id user_api_key_alias litellm_call_id openclaw_user_id openclaw_parent_user_id "
     "openclaw_actor_id openclaw_agent_id openclaw_execution_id openclaw_bot_id openclaw_sub_agent_id "
     "openclaw_session_id openclaw_session_id_raw openclaw_sender_id "
     "openclaw_conversation_id openclaw_parent_session_id openclaw_cron_id openclaw_cron_run_id "
@@ -237,7 +237,11 @@ def safe_metadata(value: object) -> dict[str, JsonValue]:
     if isinstance(nested, dict):
         # Do not recursively retain arbitrary metadata trees.
         result["spend_logs_metadata"] = safe_metadata(
-            {key: item for key, item in nested.items() if key not in {"spend_logs_metadata", FIELD, TERMINAL_FIELD}}
+            {
+                key: item
+                for key, item in nested.items()
+                if key not in {"spend_logs_metadata", "user_api_key_alias", FIELD, TERMINAL_FIELD}
+            }
         )
     return result
 
