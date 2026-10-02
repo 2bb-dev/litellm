@@ -395,6 +395,82 @@ def make_call(failed=False):
     return response, kwargs
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route,call_type",
+    [("/v1/chat/completions", "acompletion"), ("/v1/responses", "aresponses"), ("/v1/messages", "anthropic_messages")],
+)
+@pytest.mark.parametrize("key_alias", ["launch-qa-shared", None])
+async def test_encrypted_logging_preserves_only_authenticated_key_alias(protected_config, route, call_type, key_alias):
+    from fastapi import Request
+
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+    from litellm.proxy.proxy_server import ProxyConfig
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": route,
+            "server": ("localhost", 4000),
+            "client": ("127.0.0.1", 1234),
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+    updated = await add_litellm_data_to_request(
+        data={
+            "model": "test-model",
+            "metadata": {
+                "user_api_key_alias": "forged-metadata",
+                "spend_logs_metadata": {"user_api_key_alias": "forged-nested-metadata"},
+            },
+            "litellm_metadata": {
+                "user_api_key_alias": "forged-litellm-metadata",
+                "spend_logs_metadata": {"user_api_key_alias": "forged-nested-litellm-metadata"},
+            },
+        },
+        request=request,
+        user_api_key_dict=UserAPIKeyAuth(api_key="a" * 64, key_alias=key_alias, user_id=None, metadata={}),
+        proxy_config=ProxyConfig(),
+        general_settings={},
+        version="test",
+    )
+    response, kwargs = make_call()
+    kwargs["call_type"] = call_type
+    kwargs["litellm_params"] = {
+        **kwargs["litellm_params"],
+        "metadata": updated.get("metadata", {}),
+        "litellm_metadata": updated.get("litellm_metadata", {}),
+    }
+    raw = get_logging_payload(
+        kwargs,
+        response,
+        datetime(2026, 10, 2, tzinfo=timezone.utc),
+        datetime(2026, 10, 2, 0, 0, 1, tzinfo=timezone.utc),
+    )
+    assert not raw["user"]
+    protected = protect_spend_payload(raw)
+    metadata = json.loads(protected["metadata"])
+    assert metadata.get("user_api_key_alias") == key_alias
+    assert "user_api_key_alias" not in metadata.get("spend_logs_metadata", {})
+    assert "forged-" not in protected["metadata"]
+    assert metadata["openorange_request_log"]["content_status"] == "encrypted"
+    assert protected["spend"] == raw["spend"]
+    assert protected["total_tokens"] == raw["total_tokens"]
+    assert CANARY not in json.dumps(protected, default=str)
+    _, content = decrypt(json.loads(protected["proxy_server_request"]))
+    assert CANARY in json.dumps(content)
+
+
+@pytest.mark.parametrize("alias", ["", "alias with spaces", "alias\nforged", "a" * 257, {"alias": "agent"}])
+def test_encrypted_key_alias_requires_existing_identifier_shape(alias):
+    assert "user_api_key_alias" not in safe_metadata({"user_api_key_alias": alias})
+
+
 @pytest.mark.parametrize(
     "usage,expected",
     [
