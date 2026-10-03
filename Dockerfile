@@ -18,7 +18,7 @@ FROM $LITELLM_BUILD_IMAGE AS pgbouncer-builder
 ARG PGBOUNCER_VERSION
 ARG PGBOUNCER_SHA256
 USER root
-RUN apk add --no-cache build-base pkgconf libevent-dev openssl-dev curl
+RUN apk add --no-cache build-base pkgconf libevent=2.1.13-r2 libevent-dev=2.1.13-r2 python-3.14-base=3.14.8_git20261001-r0 openssl-dev=3.6.4-r4 curl libcurl-openssl4=8.22.0-r3 ngtcp2=1.25.0-r4 cyrus-sasl-heimdal-libs=2.1.28-r57
 WORKDIR /build
 RUN curl -fsSL -o pgbouncer.tar.gz "https://www.pgbouncer.org/downloads/files/${PGBOUNCER_VERSION}/pgbouncer-${PGBOUNCER_VERSION}.tar.gz" && \
     echo "${PGBOUNCER_SHA256}  pgbouncer.tar.gz" | sha256sum -c - && \
@@ -56,12 +56,12 @@ COPY --from=uvbin /uvx /usr/local/bin/uvx
 RUN apk add --no-cache \
     bash \
     gcc \
-    python-3.13 \
-    python-3.13-dev \
-    rustup \
-    openssl \
-    openssl-dev \
-    nodejs \
+    python-3.13=3.13.16_git20261002-r0 \
+    python-3.13-dev=3.13.16_git20261002-r0 \
+    rustup=1.29.1-r1 \
+    openssl=3.6.4-r4 \
+    openssl-dev=3.6.4-r4 \
+    nodejs-24=24.21.0-r3 \
     npm \
     libsndfile
 
@@ -127,7 +127,7 @@ USER root
 RUN echo "https://packages.wolfi.dev/os" >> /etc/apk/repositories
 
 # node (without npm) is required by the prisma CLI at runtime
-RUN apk add --no-cache bash openssl tzdata nodejs python-3.13 libsndfile libevent
+RUN apk add --no-cache bash openssl=3.6.4-r4 tzdata nodejs-24=24.21.0-r3 python-3.13=3.13.16_git20261002-r0 libsndfile libevent=2.1.13-r2
 COPY --from=pgbouncer-builder /usr/local/bin/pgbouncer /usr/local/bin/pgbouncer
 
 WORKDIR /app
