@@ -5342,6 +5342,22 @@ class TestTypeSafePassthroughRoute:
             assert sent.headers["authorization"] == "Bearer typesafe-test-key"
             assert json.loads(sent.content or b"{}") == (body or {})
 
+    @pytest.mark.parametrize("key", [None, "", "   "])
+    def test_refuses_without_a_key_and_sends_nothing_upstream(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, key: str | None
+    ) -> None:
+        monkeypatch.delenv("TYPESAFE_API_KEY")
+        if key is not None:
+            monkeypatch.setenv("TYPESAFE_API_KEY", key)
+        with respx.mock(assert_all_called=False) as upstream:
+            route: Final = upstream.post("https://typesafe.example/base/v1/systemone").mock(
+                return_value=httpx.Response(200, json={"id": "upstream_123"})
+            )
+            response: Final = client.post("/typesafe/v1/systemone", json={"model": "jev-1.13.0", "state": "x"})
+
+        assert (response.status_code, response.json()) == (404, {"detail": "TypeSafe is not configured on this proxy"})
+        assert not route.called
+
     @pytest.mark.parametrize(
         "sent_model, upstream_model, alias",
         [

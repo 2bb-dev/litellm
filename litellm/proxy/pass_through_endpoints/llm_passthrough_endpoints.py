@@ -75,7 +75,7 @@ from litellm.proxy.vector_store_endpoints.utils import (
     get_litellm_managed_vector_store,
     is_allowed_to_call_vector_store_endpoint,
 )
-from litellm.secret_managers.main import get_secret_str, str_to_bool
+from litellm.secret_managers.main import get_secret_str, normalize_nonempty_secret_str, str_to_bool
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY,
     LITELLM_PASS_THROUGH_RAW_BODY_STATE_KEY,
@@ -546,6 +546,8 @@ async def typesafe_proxy_route(
         custom_llm_provider="typesafe",
         region_name=None,
     )
+    if normalize_nonempty_secret_str(typesafe_api_key) is None:
+        raise HTTPException(status_code=404, detail="TypeSafe is not configured on this proxy")
     endpoint_func: Final = create_pass_through_route(
         endpoint=endpoint,
         target=str(updated_url),
