@@ -834,6 +834,31 @@ class TestChatGPTResponsesAPITransformation:
         assert request["store"] is False
 
     @pytest.mark.parametrize(
+        ("requested", "sent"),
+        [
+            ("priority", "priority"),
+            ("fast", "priority"),
+            ("FAST", "priority"),
+            ("default", "default"),
+            ("auto", None),
+            ("flex", None),
+            ("ultrafast", None),
+            (None, None),
+        ],
+    )
+    def test_chatgpt_forwards_fast_mode_service_tier(self, requested, sent):
+        config = ChatGPTResponsesAPIConfig()
+        request = config.transform_responses_api_request(
+            model="chatgpt/gpt-6.1-sol",
+            input="hi",
+            response_api_optional_request_params=({} if requested is None else {"service_tier": requested}),
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert request.get("service_tier") == sent
+
+    @pytest.mark.parametrize(
         ("model_name", "response_model"),
         [
             ("chatgpt/gpt-5.2-codex", "gpt-5.2-codex"),

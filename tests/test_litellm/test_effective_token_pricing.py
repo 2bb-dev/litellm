@@ -461,6 +461,83 @@ def test_finite_period_preserves_context_tiers_unless_explicitly_overridden(fini
     ) == pytest.approx(272001 * (4e-6 if finite_tier is None else finite_tier))
 
 
+STANDARD_RATES = (2e-6, 0.1e-6, 10e-6)
+LONG_STANDARD_RATES = (4e-6, 0.2e-6, 15e-6)
+PRIORITY_RATES = (4e-6, 0.2e-6, 20e-6)
+LONG_PRIORITY_RATES = (8e-6, 0.4e-6, 30e-6)
+
+
+@pytest.mark.parametrize("provider", ["openai", "litellm_proxy"])
+@pytest.mark.parametrize(
+    "service_tier,offset,tokens,rates",
+    [
+        ("priority", -1, 1000, STANDARD_RATES),
+        ("priority", 0, 1000, PRIORITY_RATES),
+        ("fast", 0, 1000, PRIORITY_RATES),
+        (None, 0, 1000, STANDARD_RATES),
+        ("priority", 0, 272001, LONG_PRIORITY_RATES),
+        (None, 0, 272001, LONG_STANDARD_RATES),
+    ],
+)
+def test_dated_period_adds_priority_rates(provider, service_tier, offset, tokens, rates):
+    pricing = {
+        "input_cost_per_token": 2e-6,
+        "cache_read_input_token_cost": 0.1e-6,
+        "output_cost_per_token": 10e-6,
+        "input_cost_per_token_above_272k_tokens": 4e-6,
+        "cache_read_input_token_cost_above_272k_tokens": 0.2e-6,
+        "output_cost_per_token_above_272k_tokens": 15e-6,
+        "pricing_periods": [
+            {
+                "effective_from": "2026-09-09T16:00:00Z",
+                "input_cost_per_token_priority": 4e-6,
+                "cache_read_input_token_cost_priority": 0.2e-6,
+                "output_cost_per_token_priority": 20e-6,
+                "input_cost_per_token_above_272k_tokens_priority": 8e-6,
+                "cache_read_input_token_cost_above_272k_tokens_priority": 0.4e-6,
+                "output_cost_per_token_above_272k_tokens_priority": 30e-6,
+            }
+        ],
+    }
+    _, _, uid = deployment(provider, pricing)
+    usage = Usage(
+        prompt_tokens=tokens,
+        completion_tokens=100,
+        prompt_tokens_details={"cached_tokens": 400},
+    )
+    input_rate, cache_read_rate, output_rate = rates
+    assert sum(
+        generic_cost_per_token(
+            uid,
+            usage,
+            provider,
+            service_tier=service_tier,
+            request_time=EXPIRY + timedelta(seconds=offset),
+        )
+    ) == pytest.approx((tokens - 400) * input_rate + 400 * cache_read_rate + 100 * output_rate)
+
+
+def test_requested_priority_outranks_reported_default_tier():
+    # The ChatGPT backend reports "default" on completed Fast responses.
+    _, model, uid = deployment(
+        "litellm_proxy",
+        {
+            "input_cost_per_token": 2e-6,
+            "cache_read_input_token_cost": 0.1e-6,
+            "output_cost_per_token": 10e-6,
+            "input_cost_per_token_priority": 4e-6,
+            "cache_read_input_token_cost_priority": 0.2e-6,
+            "output_cost_per_token_priority": 20e-6,
+        },
+    )
+    obj = logging_obj(model, "litellm_proxy", EXPIRY)
+    obj.optional_params = {"service_tier": "priority"}
+    result = response(model)
+    result.service_tier = "default"
+    result._hidden_params["model_id"] = uid
+    assert obj._response_cost_calculator(result) == pytest.approx(600 * 4e-6 + 400 * 0.2e-6 + 100 * 20e-6)
+
+
 def test_dated_cache_breakdown_matches_mixed_ttl_total_and_fast_multiplier():
     _, model, uid = deployment(
         "anthropic",

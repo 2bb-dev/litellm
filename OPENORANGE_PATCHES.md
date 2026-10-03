@@ -37,7 +37,9 @@ Upstream syncs must preserve these behaviors:
   transformation, the ChatGPT session header follows `prompt_cache_key`,
   string inputs are normalized for the subscription backend, client `system`
   messages are represented as `developer` messages without changing their
-  content or order, and
+  content or order, the Fast mode `service_tier` (`priority`, its `fast`
+  alias, or an explicit `default`) reaches the backend while other tiers stay
+  dropped, and
   provider-forced SSE is accumulated into one complete response for
   non-streaming callers without duplicate streaming hooks or spend logs.
   Requests still prepend the Codex CLI prompt for the backend, but response
@@ -109,6 +111,13 @@ datetime or Unix timestamp for historical calculations; without a logging
 object or explicit time they use the current time. Resolution never mutates
 the model registry.
 Other provider-specific calculators and non-token billing are not extended.
+
+A period can also carry Fast mode rates: the same per-token fields, including
+the `*_above_<n>k_tokens` ones, with a `_priority` suffix. They apply to
+requests with `service_tier` `priority` (or `fast`), so a Fast price can start
+at a dated instant. The requested tier is priced first: the ChatGPT backend
+reports `default` on Fast responses, so preferring the reported tier would
+bill every Fast call at the standard rate.
 
 `pricing_tier_threshold_inclusive: true` opts a deployment into inclusive
 generic token thresholds. For example, the existing `*_above_200k_tokens`
