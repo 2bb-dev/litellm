@@ -4491,29 +4491,43 @@ _INCOMPLETE_WRITE_CALL: Final = {
         "incomplete_details": {"reason": "max_output_tokens"},
     },
 }
+_TYPED_ERROR_EVENT: Final = {
+    "type": "error",
+    "sequence_number": 3,
+    "error": {"type": "server_error", "code": "server_error", "message": "Upstream server error", "param": None},
+}
+_FAILED_WRITE_CALL: Final = {
+    "type": "response.failed",
+    "sequence_number": 3,
+    "response": {
+        **_COMPLETED_WRITE_CALL["response"],
+        "status": "failed",
+        "error": {"code": "server_error", "message": "Upstream response failed"},
+    },
+}
 
 
 class _StreamOutcomeLogger(CustomLogger):
     def __init__(self) -> None:
         super().__init__()
-        self.outcomes: list[str] = []  # mutable-ok: callback sink appended by the logging worker
+        self.outcomes: list[tuple[str, str]] = []  # mutable-ok: callback sink appended by the logging worker
         self.logged = threading.Event()
 
-    def _record(self, outcome: str) -> None:
-        self.outcomes.append(outcome)
+    def _record(self, outcome: str, handler: str) -> None:
+        self.outcomes.append((outcome, handler))
         self.logged.set()
 
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
-        self._record("success")
+        self._record("success", "sync")
 
     def log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        self._record("failure")
+        self._record("failure", "sync")
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
-        self._record("success")
+        self._record("success", "async")
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        self._record("failure")
+        self._record("failure", "async")
 
 
 def _responses_sse_body(events: Sequence[Mapping[str, object] | str]) -> bytes:
@@ -4522,7 +4536,7 @@ def _responses_sse_body(events: Sequence[Mapping[str, object] | str]) -> bytes:
 
 async def _drain_bridge_stream(
     sse_body: bytes, *, use_async: bool, monkeypatch: pytest.MonkeyPatch
-) -> tuple[list[str | None], Exception | None, list[str]]:
+) -> tuple[list[str | None], Exception | None, list[tuple[str, str]]]:
     from unittest.mock import AsyncMock
 
     from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
@@ -4559,6 +4573,8 @@ async def _drain_bridge_stream(
         except Exception as error:
             raised = error
     await asyncio.to_thread(outcome_logger.logged.wait, 10)
+    # a duplicate log comes from another logging thread or task after the first one
+    await asyncio.sleep(0.5)
     return finish_reasons, raised, outcome_logger.outcomes
 
 
@@ -4580,14 +4596,17 @@ async def _drain_bridge_stream(
             429,
             id="upstream-proxy-error-frame-integer-code",
         ),
+        pytest.param((*_CUT_STREAM_PREFIX, _TYPED_ERROR_EVENT), "Upstream server error", 500, id="typed-error-event"),
+        pytest.param((*_CUT_STREAM_PREFIX, _FAILED_WRITE_CALL), "Upstream response failed", 500, id="response-failed"),
     ],
 )
-async def test_bridge_stream_without_terminal_event_fails_instead_of_finishing(
+async def test_bridge_stream_failure_reaches_client_and_logs_one_failure(
     events, expected_error, expected_status, use_async, monkeypatch
 ):
-    """A Responses stream cut before response.completed must reach the chat client as an error and be
-    logged as a failure. Before the fix the bridge ended it cleanly with a synthetic finish_reason="stop"
-    and a success log, so clients accepted a truncated tool call as a finished one"""
+    """A Responses stream that fails or is cut before response.completed must reach the chat client as an
+    error and be logged as exactly one failure. The bridge once ended a cut stream cleanly with
+    finish_reason="stop" and a success log, and the inner Responses iterator logged an upstream error
+    a second time next to CustomStreamWrapper, doubling the router's failure count for the deployment"""
     finish_reasons, raised, outcomes = await _drain_bridge_stream(
         _responses_sse_body(events), use_async=use_async, monkeypatch=monkeypatch
     )
@@ -4595,7 +4614,7 @@ async def test_bridge_stream_without_terminal_event_fails_instead_of_finishing(
     assert raised is not None, f"stream ended cleanly with finish reasons {finish_reasons}"
     assert expected_error in str(raised)
     assert [reason for reason in finish_reasons if reason is not None] == []
-    assert set(outcomes) == {"failure"}
+    assert outcomes == [("failure", "async" if use_async else "sync")]
     surfaced: Final = getattr(raised, "original_exception", raised)
     assert (surfaced.status_code, surfaced.model, surfaced.llm_provider) == (expected_status, "gpt-5.5", "openai")
 
@@ -4618,4 +4637,4 @@ async def test_bridge_stream_with_terminal_event_still_finishes(
 
     assert raised is None
     assert [reason for reason in finish_reasons if reason is not None] == [expected_finish_reason]
-    assert set(outcomes) == {"success"}
+    assert sorted(outcomes) == ([("success", "async")] if use_async else [("success", "async"), ("success", "sync")])

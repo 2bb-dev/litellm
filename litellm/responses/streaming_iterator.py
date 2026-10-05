@@ -1019,6 +1019,9 @@ class BaseResponsesAPIStreamingIterator:
         except Exception:
             pass
 
+    def leave_failure_logging_to_caller(self) -> None:
+        self._failure_handled = True
+
     def _handle_failure(self, exception: Exception):
         """
         Trigger failure handlers before bubbling the exception.

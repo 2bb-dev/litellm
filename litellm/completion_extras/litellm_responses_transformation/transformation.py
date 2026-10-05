@@ -1361,6 +1361,9 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
             if isinstance(streaming_response, BaseResponsesAPIStreamingIterator)
             else ("", "")
         )
+        if isinstance(streaming_response, BaseResponsesAPIStreamingIterator):
+            # CustomStreamWrapper logs the failure on the same logging object; a second log doubles router failures
+            streaming_response.leave_failure_logging_to_caller()
 
     def __next__(self) -> Union["GenericStreamingChunk", "ModelResponseStream"]:
         try:
