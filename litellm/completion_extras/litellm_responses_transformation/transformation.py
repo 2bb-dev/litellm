@@ -217,21 +217,6 @@ def _map_incomplete_reason_to_finish_reason(incomplete_reason: str | None) -> Li
     return "length"
 
 
-def _upstream_stream_error(chunk: Mapping[str, object]) -> litellm.APIError | None:
-    raw_error: Final = chunk.get("error")
-    if chunk.get("type") is not None or not isinstance(raw_error, Mapping):
-        return None
-    error_obj: Final = cast("Mapping[str, object]", raw_error)  # cast-ok: runtime Mapping checked, JSON keys are str
-    message: Final = error_obj.get("message")
-    code: Final = error_obj.get("code")
-    return litellm.APIError(
-        status_code=int(code) if isinstance(code, str) and code.isdecimal() else 500,
-        message=message if isinstance(message, str) else json.dumps(error_obj, default=str),
-        llm_provider="",
-        model="",
-    )
-
-
 def _input_file_from_file_value(file_value: object) -> dict[str, object]:
     if not isinstance(file_value, dict):
         return {"type": "input_file"}
@@ -1365,10 +1350,17 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         sync_stream: bool,
         json_mode: bool | None = False,
     ):
+        from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
+
         super().__init__(streaming_response, sync_stream, json_mode)
         self._chat_completion_id: str | None = None
         self._tool_call_index_map: dict[int, int] = {}  # mutable-ok: per-stream accumulator state
         self._saw_finish_reason = False
+        self._upstream_model, self._upstream_provider = (
+            (streaming_response.model, streaming_response.custom_llm_provider or "")
+            if isinstance(streaming_response, BaseResponsesAPIStreamingIterator)
+            else ("", "")
+        )
 
     def __next__(self) -> Union["GenericStreamingChunk", "ModelResponseStream"]:
         try:
@@ -1390,8 +1382,8 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         raise litellm.APIError(
             status_code=500,
             message="Upstream error: Responses API stream ended before a terminal event",
-            llm_provider="",
-            model="",
+            llm_provider=self._upstream_provider,
+            model=self._upstream_model,
         )
 
     def _handle_string_chunk(
@@ -1697,9 +1689,6 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
             ModelResponseStream: OpenAI-formatted streaming chunk
         """
         verbose_logger.debug("Chat provider: transform_streaming_response called with chunk: %s", chunk)
-        upstream_error: Final = _upstream_stream_error(chunk)
-        if upstream_error is not None:
-            raise upstream_error
         parsed: Final = self._with_stream_scoped_id(
             OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream(
                 chunk, tool_call_index_map=self._tool_call_index_map

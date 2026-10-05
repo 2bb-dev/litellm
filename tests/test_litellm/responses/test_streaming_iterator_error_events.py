@@ -425,3 +425,39 @@ def test_maybe_raise_for_error_event_maps_vector_store_timeout_to_retriable_504(
     with pytest.raises(MidStreamFallbackError) as exc_info:
         iterator._maybe_raise_for_error_event(chunk)
     assert exc_info.value.status_code == 504
+
+
+@pytest.mark.parametrize(
+    "code,expected_status",
+    [(429, 429), ("503", 503), ("rate_limit_exceeded", 429)],
+    ids=["integer-code", "numeric-string-code", "named-code"],
+)
+def test_native_stream_raises_on_typeless_upstream_proxy_error_frame(code, expected_status):
+    """An upstream LiteLLM proxy reports a mid-stream failure as a typeless {"error": {...}} frame. A native
+    /v1/responses stream must raise it like a typed error event instead of passing it through as a
+    GenericEvent and ending without a terminal event"""
+    import httpx
+
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+
+    events = (
+        {"type": "response.created", "sequence_number": 0, "response": {"id": "resp_1", "output": []}},
+        {"error": {"message": "Upstream response body was incomplete", "type": "None", "param": None, "code": code}},
+    )
+    sse_body = b"".join(f"data: {json.dumps(event)}\n\n".encode() for event in events) + b"data: [DONE]\n\n"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"}, request=request)
+
+    stream = litellm.responses(
+        model="openai/gpt-5.5",
+        input="hi",
+        stream=True,
+        api_key="fake-api-key",
+        client=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(respond))),
+    )
+    with pytest.raises(MidStreamFallbackError) as exc_info:
+        for _ in stream:
+            pass
+    assert exc_info.value.status_code == expected_status
+    assert "Upstream response body was incomplete" in str(exc_info.value)
