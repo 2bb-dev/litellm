@@ -208,11 +208,13 @@ def _error_event_fields(error_obj: object) -> tuple[str, str | None, str | None]
         raw_code = None
     message: Final = str(raw_message) if raw_message is not None else "Response API in-stream error"
     error_type: Final = raw_type if isinstance(raw_type, str) else None
-    code: Final = raw_code if isinstance(raw_code, str) else None
+    code: Final = str(raw_code) if isinstance(raw_code, (str, int)) else None
     return message, error_type, code
 
 
 def _status_code_for_error_fields(error_type: str | None, error_code: str | None) -> int:
+    if error_code is not None and error_code.isdecimal() and 400 <= int(error_code) < 600:
+        return int(error_code)
     fields: Final = tuple(field for field in (error_code, error_type) if field is not None)
     if any(field.startswith("rate_limit") or field == "insufficient_quota" for field in fields):
         return 429
@@ -790,7 +792,8 @@ class BaseResponsesAPIStreamingIterator:
 
     def _maybe_raise_for_error_event(self, result: object) -> None:
         chunk_type: Final = getattr(result, "type", None)
-        if chunk_type not in ("error", "response.failed"):
+        is_typeless_error_frame: Final = chunk_type is None and _is_json_object(getattr(result, "error", None))
+        if chunk_type not in ("error", "response.failed") and not is_typeless_error_frame:
             return
 
         error_obj: Final[object] = (
