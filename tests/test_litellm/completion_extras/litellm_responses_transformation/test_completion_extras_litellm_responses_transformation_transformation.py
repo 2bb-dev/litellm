@@ -1,7 +1,9 @@
+import asyncio
 import datetime
 import json
 import os
 import unittest
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Final, List, Literal, Optional, Tuple
 from unittest.mock import ANY, MagicMock, Mock, patch
 
@@ -12,6 +14,7 @@ import litellm
 from litellm.completion_extras.litellm_responses_transformation.transformation import (
     LiteLLMResponsesTransformationHandler,
 )
+from litellm.integrations.custom_logger import CustomLogger
 
 if TYPE_CHECKING:
     from openai.types.responses import ResponseOutputItem
@@ -4427,3 +4430,159 @@ def test_system_string_after_a_developer_message_stays_in_input_in_client_order(
     assert instructions is None
     assert [item["role"] for item in input_items] == ["developer", "system", "user"]
     assert input_items[1] == _system_input_item("Be brief.")
+
+
+_CUT_STREAM_PREFIX: Final = (
+    {"type": "response.created", "sequence_number": 0, "response": {"id": "resp_cut", "output": []}},
+    {
+        "type": "response.output_item.added",
+        "sequence_number": 1,
+        "output_index": 0,
+        "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "write", "arguments": ""},
+    },
+    {
+        "type": "response.function_call_arguments.delta",
+        "sequence_number": 2,
+        "output_index": 0,
+        "item_id": "fc_1",
+        "delta": '{"path": "notes.md", "content": "par',
+    },
+)
+_UPSTREAM_PROXY_ERROR_FRAME: Final = {
+    "error": {"message": "Upstream response body was incomplete", "type": "None", "param": None, "code": "500"}
+}
+_COMPLETED_WRITE_CALL: Final = {
+    "type": "response.completed",
+    "sequence_number": 3,
+    "response": {
+        "id": "resp_cut",
+        "object": "response",
+        "created_at": 1734366691,
+        "status": "completed",
+        "model": "gpt-5.5",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "write",
+                "arguments": '{"path": "notes.md", "content": "par"}',
+                "status": "completed",
+            }
+        ],
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "usage": {"input_tokens": 12, "output_tokens": 9, "total_tokens": 21},
+        "error": None,
+        "incomplete_details": None,
+    },
+}
+
+
+class _StreamOutcomeLogger(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.outcomes: list[str] = []  # mutable-ok: callback sink appended by the logging worker
+
+    def log_success_event(self, kwargs, response_obj, start_time, end_time):
+        self.outcomes.append("success")
+
+    def log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        self.outcomes.append("failure")
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        self.outcomes.append("success")
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        self.outcomes.append("failure")
+
+
+def _responses_sse_body(events: Sequence[Mapping[str, object] | str]) -> bytes:
+    return b"".join(f"data: {event if isinstance(event, str) else json.dumps(event)}\n\n".encode() for event in events)
+
+
+async def _drain_bridge_stream(
+    sse_body: bytes, *, use_async: bool, monkeypatch: pytest.MonkeyPatch
+) -> tuple[list[str | None], Exception | None, list[str]]:
+    from unittest.mock import AsyncMock
+
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
+
+    outcome_logger: Final = _StreamOutcomeLogger()
+    monkeypatch.setattr(litellm, "callbacks", [outcome_logger])
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"}, request=request)
+
+    request: Final = {
+        "model": "openai/responses/gpt-5.5",
+        "messages": [{"role": "user", "content": "write notes.md"}],
+        "api_key": "fake-api-key",
+        "stream": True,
+    }
+    finish_reasons: Final[list[str | None]] = []  # mutable-ok: collected while draining the stream
+    raised: Exception | None = None
+    if use_async:
+        wire_response: Final = respond(httpx.Request("POST", "https://upstream.invalid/v1/responses"))
+        with patch.object(  # test-quality-ok: the async bridge does not forward an injected client to aresponses()
+            AsyncHTTPHandler, "post", new_callable=AsyncMock, return_value=wire_response
+        ):
+            try:
+                async for chunk in await litellm.acompletion(**request):
+                    finish_reasons.extend(choice.finish_reason for choice in chunk.choices)
+            except Exception as error:
+                raised = error
+    else:
+        sync_client: Final = HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(respond)))
+        try:
+            for chunk in litellm.completion(**request, client=sync_client):
+                finish_reasons.extend(choice.finish_reason for choice in chunk.choices)
+        except Exception as error:
+            raised = error
+    for _ in range(50):
+        if outcome_logger.outcomes:
+            break
+        await asyncio.sleep(0.02)
+    return finish_reasons, raised, outcome_logger.outcomes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "events,expected_error",
+    [
+        pytest.param(_CUT_STREAM_PREFIX, "stream ended before a terminal event", id="cut-after-partial-tool-args"),
+        pytest.param(
+            (*_CUT_STREAM_PREFIX, _UPSTREAM_PROXY_ERROR_FRAME, "[DONE]"),
+            "Upstream response body was incomplete",
+            id="upstream-proxy-error-frame",
+        ),
+    ],
+)
+async def test_bridge_stream_without_terminal_event_fails_instead_of_finishing(
+    events, expected_error, use_async, monkeypatch
+):
+    """A Responses stream cut before response.completed must reach the chat client as an error and be
+    logged as a failure. Before the fix the bridge ended it cleanly with a synthetic finish_reason="stop"
+    and a success log, so clients accepted a truncated tool call as a finished one"""
+    finish_reasons, raised, outcomes = await _drain_bridge_stream(
+        _responses_sse_body(events), use_async=use_async, monkeypatch=monkeypatch
+    )
+
+    assert raised is not None, f"stream ended cleanly with finish reasons {finish_reasons}"
+    assert expected_error in str(raised)
+    assert [reason for reason in finish_reasons if reason is not None] == []
+    assert set(outcomes) == {"failure"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+async def test_bridge_stream_with_completed_event_still_finishes(use_async, monkeypatch):
+    finish_reasons, raised, outcomes = await _drain_bridge_stream(
+        _responses_sse_body((*_CUT_STREAM_PREFIX, _COMPLETED_WRITE_CALL)), use_async=use_async, monkeypatch=monkeypatch
+    )
+
+    assert raised is None
+    assert [reason for reason in finish_reasons if reason is not None] == ["tool_calls"]
+    assert set(outcomes) == {"success"}
