@@ -15,6 +15,7 @@ Pydantic ValidationError (previously typed as Optional[str]).
 """
 
 import json
+from collections.abc import Mapping
 from importlib import import_module
 from unittest.mock import Mock, patch
 
@@ -427,22 +428,43 @@ def test_maybe_raise_for_error_event_maps_vector_store_timeout_to_retriable_504(
     assert exc_info.value.status_code == 504
 
 
+def _typeless_upstream_proxy_error_frame(code: int | str) -> Mapping[str, object]:
+    return {"error": {"message": "Upstream response body was incomplete", "type": "None", "param": None, "code": code}}
+
+
 @pytest.mark.parametrize(
-    "code,expected_status",
-    [(429, 429), ("503", 503), ("rate_limit_exceeded", 429)],
-    ids=["integer-code", "numeric-string-code", "named-code"],
+    "error_event,expected_status,expected_message",
+    [
+        (_typeless_upstream_proxy_error_frame(429), 429, "Upstream response body was incomplete"),
+        (_typeless_upstream_proxy_error_frame("503"), 503, "Upstream response body was incomplete"),
+        (_typeless_upstream_proxy_error_frame("rate_limit_exceeded"), 429, "Upstream response body was incomplete"),
+        (
+            {
+                "type": "error",
+                "sequence_number": 1,
+                "code": "rate_limit_exceeded",
+                "message": "Slow down",
+                "param": None,
+            },
+            429,
+            "Slow down",
+        ),
+    ],
+    ids=["integer-code", "numeric-string-code", "named-code", "openai-top-level-error-event"],
 )
-def test_native_stream_raises_on_typeless_upstream_proxy_error_frame(code, expected_status):
-    """An upstream LiteLLM proxy reports a mid-stream failure as a typeless {"error": {...}} frame. A native
-    /v1/responses stream must raise it like a typed error event instead of passing it through as a
-    GenericEvent and ending without a terminal event"""
+def test_native_stream_raises_on_upstream_error_event(
+    error_event: Mapping[str, object], expected_status: int, expected_message: str
+):
+    """A native /v1/responses stream must raise an upstream in-stream error with the upstream status and message.
+    Covers the typeless {"error": {...}} frame of an upstream LiteLLM proxy and OpenAI's typed error event, which
+    carries code and message at the top level instead of in a nested error object"""
     import httpx
 
     from litellm.llms.custom_httpx.http_handler import HTTPHandler
 
     events = (
         {"type": "response.created", "sequence_number": 0, "response": {"id": "resp_1", "output": []}},
-        {"error": {"message": "Upstream response body was incomplete", "type": "None", "param": None, "code": code}},
+        error_event,
     )
     sse_body = b"".join(f"data: {json.dumps(event)}\n\n".encode() for event in events) + b"data: [DONE]\n\n"
 
@@ -460,4 +482,4 @@ def test_native_stream_raises_on_typeless_upstream_proxy_error_frame(code, expec
         for _ in stream:
             pass
     assert exc_info.value.status_code == expected_status
-    assert "Upstream response body was incomplete" in str(exc_info.value)
+    assert expected_message in str(exc_info.value)

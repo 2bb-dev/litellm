@@ -801,8 +801,15 @@ class BaseResponsesAPIStreamingIterator:
             if chunk_type == "response.failed"
             else getattr(result, "error", None)
         )
+        # OpenAI's typed error event carries code and message at the top level, which land in the extras
+        top_level_fields: Final[object] = getattr(result, "model_extra", None)
+        error_fields: Final[object] = (
+            top_level_fields
+            if chunk_type == "error" and error_obj is None and _is_json_object(top_level_fields)
+            else error_obj
+        )
 
-        error_message, error_type, error_code = _error_event_fields(error_obj)
+        error_message, error_type, error_code = _error_event_fields(error_fields)
         status_code: Final = _status_code_for_error_fields(error_type, error_code)
         mapped_exception: Final = litellm.APIError(
             status_code=status_code,

@@ -4496,6 +4496,13 @@ _TYPED_ERROR_EVENT: Final = {
     "sequence_number": 3,
     "error": {"type": "server_error", "code": "server_error", "message": "Upstream server error", "param": None},
 }
+_OPENAI_TOP_LEVEL_ERROR_EVENT: Final = {
+    "type": "error",
+    "sequence_number": 3,
+    "code": "rate_limit_exceeded",
+    "message": "Slow down",
+    "param": None,
+}
 _FAILED_WRITE_CALL: Final = {
     "type": "response.failed",
     "sequence_number": 3,
@@ -4597,6 +4604,9 @@ async def _drain_bridge_stream(
             id="upstream-proxy-error-frame-integer-code",
         ),
         pytest.param((*_CUT_STREAM_PREFIX, _TYPED_ERROR_EVENT), "Upstream server error", 500, id="typed-error-event"),
+        pytest.param(
+            (*_CUT_STREAM_PREFIX, _OPENAI_TOP_LEVEL_ERROR_EVENT), "Slow down", 429, id="openai-top-level-error-event"
+        ),
         pytest.param((*_CUT_STREAM_PREFIX, _FAILED_WRITE_CALL), "Upstream response failed", 500, id="response-failed"),
     ],
 )
