@@ -4542,20 +4542,25 @@ def _responses_sse_body(events: Sequence[Mapping[str, object] | str]) -> bytes:
 
 
 async def _drain_bridge_stream(
-    sse_body: bytes, *, use_async: bool, monkeypatch: pytest.MonkeyPatch
+    sse_body: bytes,
+    *,
+    use_async: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    logger: _StreamOutcomeLogger | None = None,
+    model: str = "gpt-5.5",
 ) -> tuple[list[str | None], Exception | None, list[tuple[str, str]]]:
     from unittest.mock import AsyncMock
 
     from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 
-    outcome_logger: Final = _StreamOutcomeLogger()
+    outcome_logger: Final = logger if logger is not None else _StreamOutcomeLogger()
     monkeypatch.setattr(litellm, "callbacks", [outcome_logger])
 
     def respond(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"}, request=request)
 
     request: Final = {
-        "model": "openai/responses/gpt-5.5",
+        "model": f"openai/responses/{model}",
         "messages": [{"role": "user", "content": "write notes.md"}],
         "api_key": "fake-api-key",
         "stream": True,
@@ -4627,6 +4632,68 @@ async def test_bridge_stream_failure_reaches_client_and_logs_one_failure(
     assert outcomes == [("failure", "async" if use_async else "sync")]
     surfaced: Final = getattr(raised, "original_exception", raised)
     assert (surfaced.status_code, surfaced.model, surfaced.llm_provider) == (expected_status, "gpt-5.5", "openai")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("token_counts", [(100000, 50000), (0, 0), None], ids=["reported", "zero", "missing"])
+async def test_bridge_stream_failure_preserves_reported_usage_and_cost(
+    token_counts: tuple[int, int] | None, use_async: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class UsageLogger(_StreamOutcomeLogger):
+        failure_details: Mapping[str, object] | None = None
+
+        def log_failure_event(
+            self, kwargs: Mapping[str, object], response_obj: object, start_time: object, end_time: object
+        ) -> None:
+            self.failure_details = dict(kwargs)
+            super().log_failure_event(kwargs, response_obj, start_time, end_time)
+
+        async def async_log_failure_event(
+            self, kwargs: Mapping[str, object], response_obj: object, start_time: object, end_time: object
+        ) -> None:
+            self.failure_details = dict(kwargs)
+            await super().async_log_failure_event(kwargs, response_obj, start_time, end_time)
+
+    logger: Final = UsageLogger()
+    failed_event: Final = {
+        **_FAILED_WRITE_CALL,
+        "response": {
+            **_FAILED_WRITE_CALL["response"],
+            "model": "gpt-4o",
+            "usage": (
+                None if token_counts is None else {
+                    "input_tokens": token_counts[0],
+                    "output_tokens": token_counts[1],
+                    "total_tokens": sum(token_counts),
+                }
+            ),
+        },
+    }
+    _, raised, outcomes = await _drain_bridge_stream(
+        _responses_sse_body((*_CUT_STREAM_PREFIX, failed_event)),
+        use_async=use_async,
+        monkeypatch=monkeypatch,
+        logger=logger,
+        model="gpt-4o",
+    )
+
+    assert raised is not None
+    assert "Upstream response failed" in str(raised)
+    assert outcomes == [("failure", "async" if use_async else "sync")]
+    assert logger.failure_details is not None
+    usage: Final = logger.failure_details["combined_usage_object"]
+    assert isinstance(usage, litellm.Usage)
+    cost: Final = logger.failure_details["response_cost"]
+    if token_counts is None:
+        assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (10, 33, 43)
+        assert cost == pytest.approx(0.000355)
+    else:
+        assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (*token_counts, sum(token_counts))
+        assert cost == pytest.approx(0.75 if token_counts == (100000, 50000) else 0.0)
+    standard_log: Final = logger.failure_details["standard_logging_object"]
+    assert isinstance(standard_log, Mapping)
+    assert standard_log["response_cost"] == cost
 
 
 @pytest.mark.asyncio

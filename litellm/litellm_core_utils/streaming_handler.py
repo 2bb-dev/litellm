@@ -2105,6 +2105,7 @@ class CustomStreamWrapper:
         except Exception as e:
             traceback_exception: Final = traceback.format_exc()
             # LOG FAILURE - handle streaming failure logging in the _next_ object, remove `handle_failure` once it's deprecated
+            self._record_partial_usage_for_failure()
             threading.Thread(target=self.logging_obj.failure_handler, args=(e, traceback_exception)).start()
             self._handle_stream_fallback_error(e)
 
@@ -2377,6 +2378,8 @@ class CustomStreamWrapper:
         success log on the same request id, so this never double counts.
         """
         if self.logging_obj is None or not self.chunks:
+            return
+        if self.logging_obj.model_call_details.get("combined_usage_object") is not None:
             return
         try:
             partial_response: Final = litellm.stream_chunk_builder(
