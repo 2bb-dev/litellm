@@ -130,9 +130,10 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         into string content); a list with no extractable text stays
         unchanged, matching what DeepSeek historically received.
         """
-        forward_images: Final = any(
-            isinstance(message.get("content"), list) for message in messages
-        ) and (model.removeprefix("deepseek/") == "deepseek-flash" or supports_vision(model=model, custom_llm_provider="deepseek"))
+        forward_images: Final = any(isinstance(message.get("content"), list) for message in messages) and (
+            model.removeprefix("deepseek/") == "deepseek-flash"
+            or supports_vision(model=model, custom_llm_provider="deepseek")
+        )
         transformed: Final = [  # mutable-ok: provider messages must stay JSON-array lists the base transform mutates
             self._forward_or_collapse_content(message=message, forward_images=forward_images) for message in messages
         ]

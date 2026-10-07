@@ -22,6 +22,7 @@ from litellm.proxy.auth.auth_utils import (
 from litellm.proxy.auth.budget_throttle import throttled_limit
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
+from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 from litellm.types.utils import Usage
 
 if TYPE_CHECKING:
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
 
     from litellm.proxy.utils import InternalUsageCache as _InternalUsageCache
 
-    Span = _Span | Any
+    Span = _Span
     InternalUsageCache = _InternalUsageCache
 else:
     Span = Any
@@ -77,7 +78,7 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
         current: dict | None,
         request_count_api_key: str,
         rate_limit_type: Literal["key", "model_per_key", "user", "customer", "team"],
-        values_to_update_in_cache: list[tuple[Any, Any]],
+        values_to_update_in_cache: list[tuple[str, object]],
         write_to_local_cache: bool = True,
     ) -> dict:
         verbose_proxy_logger.info("Current Usage of %s in this minute: %s", rate_limit_type, current)
@@ -254,7 +255,7 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
         call_type: str,
     ):
         self.print_verbose("Inside Max Parallel Request Pre-Call Hook")
-        api_key: Final = user_api_key_dict.api_key
+        api_key: Final = LiteLLMProxyRequestSetup.get_logged_api_key(user_api_key_dict)
         max_parallel_requests = user_api_key_dict.max_parallel_requests
         if max_parallel_requests is None:
             max_parallel_requests = sys.maxsize
@@ -270,7 +271,7 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
             rpm_limit = sys.maxsize
 
         values_to_update_in_cache: list[
-            tuple[Any, Any]
+            tuple[str, object]
         ] = []  # values that need to get updated in cache, will run a batch_set_cache after this function
 
         # ------------
@@ -364,9 +365,11 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
                     data=data,
                     call_type=call_type,
                     max_parallel_requests=sys.maxsize,
-                    current=cache_objects["request_count_api_key_model"] if scope == _model else
-                    await self.internal_usage_cache.async_get_cache(
-                        key=counter_key, litellm_parent_otel_span=user_api_key_dict.parent_otel_span,
+                    current=cache_objects["request_count_api_key_model"]
+                    if scope == _model
+                    else await self.internal_usage_cache.async_get_cache(
+                        key=counter_key,
+                        litellm_parent_otel_span=user_api_key_dict.parent_otel_span,
                     ),
                     request_count_api_key=counter_key,
                     tpm_limit=tpm_cap if tpm_cap is not None else sys.maxsize,
@@ -382,20 +385,29 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
             for tpm_limits in (get_key_model_tpm_limit(user_api_key_dict, scope),)
             for rpm_limits in (get_key_model_rpm_limit(user_api_key_dict, scope),)
             if tpm_limits is not None or rpm_limits is not None
-            for counter_key, tpm_cap, rpm_cap in ((
-                f"{api_key}::{scope}::{precise_minute}::request_count",
-                tpm_limits.get(scope) if tpm_limits else None,
-                rpm_limits.get(scope) if rpm_limits else None,
-            ),)
+            for counter_key, tpm_cap, rpm_cap in (
+                (
+                    f"{api_key}::{scope}::{precise_minute}::request_count",
+                    tpm_limits.get(scope) if tpm_limits else None,
+                    rpm_limits.get(scope) if rpm_limits else None,
+                ),
+            )
         ):
             if "metadata" not in data:
                 data["metadata"] = {}
-            data["metadata"].update(MappingProxyType({
-                f"litellm-key-remaining-tokens-{model_scope}":
-                    tpm_limit_for_model - model_counts["current_tpm"] if tpm_limit_for_model is not None else None,
-                f"litellm-key-remaining-requests-{model_scope}":
-                    rpm_limit_for_model - model_counts["current_rpm"] if rpm_limit_for_model is not None else None,
-            }))
+            data["metadata"].update(
+                MappingProxyType(
+                    {
+                        f"litellm-key-remaining-tokens-{model_scope}": tpm_limit_for_model - model_counts["current_tpm"]
+                        if tpm_limit_for_model is not None
+                        else None,
+                        f"litellm-key-remaining-requests-{model_scope}": rpm_limit_for_model
+                        - model_counts["current_rpm"]
+                        if rpm_limit_for_model is not None
+                        else None,
+                    }
+                )
+            )
         if len(model_scopes) > 1 and values_to_update_in_cache:
             await self.internal_usage_cache.async_batch_set_cache(
                 cache_list=values_to_update_in_cache,
@@ -578,11 +590,16 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
             # ------------
             model_group: Final = get_model_group_from_litellm_kwargs(kwargs)
             for model_scope, success_tpm_limit, success_rpm_limit in (
-                (scope, get_key_model_tpm_limit(user_api_key_dict, scope), get_key_model_rpm_limit(user_api_key_dict, scope))
+                (
+                    scope,
+                    get_key_model_tpm_limit(user_api_key_dict, scope),
+                    get_key_model_rpm_limit(user_api_key_dict, scope),
+                )
                 for scope in get_model_rate_limit_scopes(model_group)
             ):
                 if user_api_key is None or (
-                    success_tpm_limit is None and success_rpm_limit is None
+                    success_tpm_limit is None
+                    and success_rpm_limit is None
                     and "model_rpm_limit" not in user_api_key_metadata
                     and "model_tpm_limit" not in user_api_key_metadata
                     and user_api_key_model_max_budget is None
@@ -801,7 +818,7 @@ class _PROXY_MaxParallelRequestsHandler(CustomLogger):
         """
         Retrieve the key's remaining rate limits.
         """
-        api_key: Final = user_api_key_dict.api_key
+        api_key: Final = LiteLLMProxyRequestSetup.get_logged_api_key(user_api_key_dict)
         current_date: Final = datetime.now().strftime("%Y-%m-%d")
         current_hour: Final = datetime.now().strftime("%H")
         current_minute: Final = datetime.now().strftime("%M")

@@ -1,0 +1,235 @@
+[
+  {
+    "package": "crc32c",
+    "version": "0.6.8",
+    "license": "Apache-2.0/MIT",
+    "notices": [
+      {
+        "file": "crc32c-0.6.8-LICENSE-GRANT.txt",
+        "source": "https://github.com/zowens/crc32c/blob/254a861f7cc71bfe455e86f0e1d86e3c83c33390/README.md",
+        "sha256": "1f00fd9cdf9dad190b99ac84c49a55530c7a2b03868d2ad93fda3f4dace7f091"
+      },
+      {
+        "file": "crc32c-0.6.8-LICENSE-APACHE.txt",
+        "source": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-auth",
+    "version": "1.16.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-4ae1bfd6813b-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/4ae1bfd6813b4687f8af5494a6795b07a12ba341/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-gax",
+    "version": "1.14.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-4ae1bfd6813b-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/4ae1bfd6813b4687f8af5494a6795b07a12ba341/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-gax-internal",
+    "version": "0.7.18",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-4ae1bfd6813b-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/4ae1bfd6813b4687f8af5494a6795b07a12ba341/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-iam-v1",
+    "version": "1.12.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-4ae1bfd6813b-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/4ae1bfd6813b4687f8af5494a6795b07a12ba341/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-kms-v1",
+    "version": "1.14.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-4ae1bfd6813b-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/4ae1bfd6813b4687f8af5494a6795b07a12ba341/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-location",
+    "version": "1.11.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-544a5d8f2911-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/544a5d8f29117f2611aeadc4b3d30843710371e2/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-longrunning",
+    "version": "1.13.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-4ae1bfd6813b-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/4ae1bfd6813b4687f8af5494a6795b07a12ba341/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-lro",
+    "version": "1.10.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-4ae1bfd6813b-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/4ae1bfd6813b4687f8af5494a6795b07a12ba341/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-rpc",
+    "version": "1.6.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-544a5d8f2911-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/544a5d8f29117f2611aeadc4b3d30843710371e2/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-type",
+    "version": "1.6.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-544a5d8f2911-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/544a5d8f29117f2611aeadc4b3d30843710371e2/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "google-cloud-wkt",
+    "version": "1.7.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "googleapis-google-cloud-rust-25e0da468d47-LICENSE",
+        "source": "https://github.com/googleapis/google-cloud-rust/blob/25e0da468d47057a9ea244f039f8d79d5228d2f1/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "opentelemetry",
+    "version": "0.32.0",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "open-telemetry-opentelemetry-rust-ec289cb3c6f8-LICENSE",
+        "source": "https://github.com/open-telemetry/opentelemetry-rust/blob/ec289cb3c6f8260951699c51df968560943c1451/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "opentelemetry-semantic-conventions",
+    "version": "0.32.1",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "open-telemetry-opentelemetry-rust-74cb6f3a4129-LICENSE",
+        "source": "https://github.com/open-telemetry/opentelemetry-rust/blob/74cb6f3a4129bf11fa3191f28d38c518c4ec4ae6/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "opentelemetry_sdk",
+    "version": "0.32.1",
+    "license": "Apache-2.0",
+    "notices": [
+      {
+        "file": "open-telemetry-opentelemetry-rust-284a37d93b38-LICENSE",
+        "source": "https://github.com/open-telemetry/opentelemetry-rust/blob/284a37d93b3856e1975c2807ba3af1421ebd9b52/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "rustify_derive",
+    "version": "0.5.5",
+    "license": "MIT",
+    "notices": [
+      {
+        "file": "jmgilman-rustify-1de071288ded-LICENSE",
+        "source": "https://github.com/jmgilman/rustify/blob/1de071288ded430103f1cb1954275a842596867a/LICENSE",
+        "sha256": "ac7a73d66c281294bd1c2ab92064c00252e1aaebf1bcb55c5cb5d5c41b06203a"
+      }
+    ]
+  },
+  {
+    "package": "tiktoken-rs",
+    "version": "0.12.0",
+    "license": "MIT",
+    "notices": [
+      {
+        "file": "zurawiki-tiktoken-rs-32de8dc0526d-LICENSE",
+        "source": "https://github.com/zurawiki/tiktoken-rs/blob/32de8dc0526d67f2c266c4e5e7c6a8ec5a0ce3d7/LICENSE",
+        "sha256": "f7c6ddf9d84fd7b8ad5917e4074d4c05e4c1dfb752a28a0058f06bd0f5e2edcc"
+      }
+    ]
+  },
+  {
+    "package": "tonic-prost",
+    "version": "0.14.6",
+    "license": "MIT",
+    "notices": [
+      {
+        "file": "hyperium-tonic-6cb6056b5a74-LICENSE",
+        "source": "https://github.com/hyperium/tonic/blob/6cb6056b5a748bc5a29bd48f4602dbc4e552bb7d/LICENSE",
+        "sha256": "e24a56698aa6feaf3a02272b3624f9dc255d982970c5ed97ac4525a95056a5b3"
+      }
+    ]
+  },
+  {
+    "package": "vaultrs",
+    "version": "0.8.0",
+    "license": "MIT",
+    "notices": [
+      {
+        "file": "jmgilman-vaultrs-342816da2a1f-LICENSE",
+        "source": "https://github.com/jmgilman/vaultrs/blob/342816da2a1fffa945db134b1b7ee5585f005e8b/LICENSE",
+        "sha256": "ac7a73d66c281294bd1c2ab92064c00252e1aaebf1bcb55c5cb5d5c41b06203a"
+      }
+    ]
+  }
+]

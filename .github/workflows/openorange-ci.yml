@@ -66,40 +66,40 @@ jobs:
       - name: Run focused fork regressions
         run: |
           uv run --no-sync pytest -q \
-            tests/test_litellm/responses/test_responses_utils.py \
+            tests/unit/responses/test_responses_utils.py \
             tests/test_litellm/test_effective_token_pricing.py \
-            tests/test_litellm/litellm_core_utils/llm_cost_calc/test_off_peak_pricing.py \
-            tests/test_litellm/litellm_core_utils/llm_cost_calc/test_llm_cost_calc_utils.py \
-            tests/test_litellm/litellm_core_utils/test_get_model_cost_map.py \
-            tests/test_litellm/litellm_core_utils/test_safe_json_dumps.py \
-            tests/test_litellm/litellm_core_utils/test_redact_messages.py \
-            tests/test_litellm/llms/chatgpt/chat/test_chatgpt_transformation.py \
-            tests/test_litellm/llms/chatgpt/responses/test_chatgpt_responses_transformation.py \
-            tests/test_litellm/llms/deepseek/chat/test_deepseek_chat_transformation.py \
-            tests/test_litellm/llms/custom_httpx/test_llm_http_handler.py \
+            tests/unit/litellm_core_utils/llm_cost_calc/test_off_peak_pricing.py \
+            tests/unit/litellm_core_utils/llm_cost_calc/test_llm_cost_calc_utils.py \
+            tests/unit/litellm_core_utils/test_get_model_cost_map.py \
+            tests/unit/litellm_core_utils/test_safe_json_dumps.py \
+            tests/unit/litellm_core_utils/test_redact_messages.py \
+            tests/unit/llms/chatgpt/chat/test_chatgpt_transformation.py \
+            tests/unit/llms/chatgpt/responses/test_chatgpt_responses_transformation.py \
+            tests/unit/llms/deepseek/chat/test_deepseek_chat_transformation.py \
+            tests/unit/llms/custom_httpx/test_llm_http_handler.py \
             tests/llm_responses_api_testing/test_base_responses_api_streaming_iterator.py \
             tests/test_litellm/proxy/test_litellm_pre_call_utils.py \
             tests/test_litellm/proxy/test_lazy_feature_imports.py \
             tests/test_litellm/proxy/anthropic_endpoints/test_endpoints.py \
-            tests/test_litellm/router_utils/pre_call_checks/test_encrypted_content_affinity_check.py \
-            tests/test_litellm/router_utils/test_fallback_event_handlers.py \
-            tests/test_litellm/router_utils/test_chatgpt_rate_limit.py \
-            tests/test_litellm/litellm_core_utils/test_credential_ownership.py \
-            tests/test_litellm/litellm_core_utils/test_native_credential_ownership.py \
+            tests/unit/router_utils/pre_call_checks/test_encrypted_content_affinity_check.py \
+            tests/unit/router_utils/test_fallback_event_handlers.py \
+            tests/unit/router_utils/test_chatgpt_rate_limit.py \
+            tests/unit/litellm_core_utils/test_credential_ownership.py \
+            tests/unit/litellm_core_utils/test_native_credential_ownership.py \
             tests/test_litellm/proxy/spend_tracking/test_spend_tracking_utils.py \
             tests/test_litellm/proxy/spend_tracking/test_request_content_encryption.py \
             tests/test_litellm/proxy/spend_tracking/test_request_content_policy.py \
-            tests/test_litellm/integrations/test_langfuse.py \
+            tests/unit/integrations/test_langfuse.py \
             tests/test_litellm/proxy/db/test_db_spend_update_writer.py \
-            tests/proxy_unit_tests/test_update_spend.py \
+            tests/unit/proxy/test_update_spend.py \
             tests/test_litellm/proxy/test_spend_log_cleanup.py
           uv run --no-sync pytest -q \
-            tests/test_litellm/litellm_core_utils/test_litellm_logging.py \
+            tests/unit/litellm_core_utils/test_litellm_logging.py \
             -k test_responses_usage_callback_survives_redacted_transport_state
           uv run --no-sync pytest -q \
-            tests/test_litellm/test_router.py \
-            tests/test_litellm/test_utils.py \
-            tests/test_litellm/litellm_core_utils/test_core_helpers.py \
+            tests/unit/test_router/test_router.py \
+            tests/unit/test_utils.py \
+            tests/unit/litellm_core_utils/test_core_helpers.py \
             -k 'retry_history or request_retry_cap or request_retry_state or retry_breadcrumbs or context_window_pre_call_check or registered_pre_routing_callback'
 
       - name: Check rate-limit-only paid fallback and shared transport budgets
@@ -107,10 +107,10 @@ jobs:
           LITELLM_LOCAL_MODEL_COST_MAP: "True"
         run: |
           uv run --no-sync pytest -q \
-            tests/test_litellm/test_router.py \
+            tests/unit/test_router/test_router.py \
             -k 'order_paid_fallback or native_anthropic_messages_paid_fallback_rejects_unapproved_stream_errors or native_anthropic_messages_pre_content_429_cools_selected_deployment'
           uv run --no-sync pytest -q \
-            tests/proxy_unit_tests/test_unit_test_max_model_budget_limiter.py \
+            tests/unit/proxy/hooks/test_unit_test_max_model_budget_limiter.py \
             tests/test_litellm/proxy/auth/test_auth_checks.py
 
       - name: Verify OSS dependency graph and imports
