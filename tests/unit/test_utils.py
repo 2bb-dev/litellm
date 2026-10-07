@@ -19,6 +19,7 @@ import httpx
 import pytest
 import respx
 from jsonschema import validate
+from openai import AsyncOpenAI, OpenAI
 
 import litellm
 from litellm._internal_context import is_internal_call
@@ -3070,6 +3071,165 @@ class TestAdditionalDropParamsForNonOpenAIProviders:
         # All params should be present when additional_drop_params is empty
         assert result.get("prompt_cache_key") == "test_key"
         assert result.get("custom_param") == "value"
+
+
+class TestJSONProviderSDKBody:
+    @staticmethod
+    async def complete(
+        provider: str,
+        use_async: bool,
+        stream: bool,
+        handler: Callable[[httpx.Request], httpx.Response],
+        additional_drop_params: list[str],
+    ) -> str:
+        transport: Final = httpx.MockTransport(handler)
+        sdk: Final = (
+            AsyncOpenAI(
+                api_key="synthetic-key",
+                base_url="https://provider.test/v1",
+                max_retries=0,
+                http_client=httpx.AsyncClient(transport=transport),
+            )
+            if use_async
+            else OpenAI(
+                api_key="synthetic-key",
+                base_url="https://provider.test/v1",
+                max_retries=0,
+                http_client=httpx.Client(transport=transport),
+            )
+        )
+        params: Final = {
+            "model": f"{provider}/synthetic-model",
+            "messages": [{"role": "user", "content": "Reply OK"}],
+            "client": sdk,
+            "api_key": "synthetic-key",
+            "api_base": "https://provider.test/v1",
+            "num_retries": 0,
+            "max_retries": 0,
+            "timeout": 1.0,
+            "stream": stream,
+            "venice_parameters": {"include_venice_system_prompt": False},
+            "unset_field": None,
+            "extra_body": {"model": "wrong-model", "retained_field": "kept", "dropped_field": "remove"},
+            "extra_headers": {"X-Test-Transport": "sdk"},
+            "additional_drop_params": additional_drop_params,
+        }
+        try:
+            result: Final = await litellm.acompletion(**params) if use_async else litellm.completion(**params)
+            if not stream:
+                return result.choices[0].message.content
+            if use_async:
+                return "".join([chunk.choices[0].delta.content or "" async for chunk in result])
+            return "".join(chunk.choices[0].delta.content or "" for chunk in result)
+        finally:
+            if isinstance(sdk, AsyncOpenAI):
+                await sdk.close()
+            else:
+                sdk.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider", ["veniceai", "publicai"])
+    @pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
+    @pytest.mark.parametrize("drop", [None, "dropped_field", "venice_parameters", "extra_body"])
+    async def test_body_reaches_sdk_transport(
+        self, provider: str, use_async: bool, stream: bool, drop: str | None
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            body: Final = json.loads(request.content)
+            assert request.url == "https://provider.test/v1/chat/completions"
+            assert request.headers["X-Test-Transport"] == "sdk"
+            assert body["model"] == "synthetic-model"
+            assert body["messages"] == [{"role": "user", "content": "Reply OK"}]
+            assert (
+                not {
+                    "client",
+                    "api_key",
+                    "api_base",
+                    "num_retries",
+                    "max_retries",
+                    "timeout",
+                    "extra_headers",
+                    "unset_field",
+                }
+                & body.keys()
+            )
+            assert "extra_body" not in body
+            if drop == "extra_body":
+                assert not {"venice_parameters", "retained_field", "dropped_field"} & body.keys()
+            else:
+                assert body["retained_field"] == "kept"
+                if drop is not None:
+                    assert drop not in body
+                if drop != "venice_parameters":
+                    assert body["venice_parameters"] == {"include_venice_system_prompt": False}
+                if drop != "dropped_field":
+                    assert body["dropped_field"] == "remove"
+            if stream:
+                chunk: Final = {
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "synthetic-model",
+                    "choices": [{"index": 0, "delta": {"content": "OK"}, "finish_reason": "stop"}],
+                }
+                return httpx.Response(
+                    200,
+                    text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                    headers={"Content-Type": "text/event-stream"},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "synthetic-model",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+                },
+            )
+
+        transport: Final = MagicMock(side_effect=handler)
+        assert await self.complete(provider, use_async, stream, transport, [drop] if drop else []) == "OK"
+        assert transport.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider", ["veniceai", "publicai"])
+    @pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
+    @pytest.mark.parametrize(
+        "status,exception_type",
+        [
+            (400, litellm.BadRequestError),
+            (401, litellm.AuthenticationError),
+            (429, litellm.RateLimitError),
+            (503, litellm.ServiceUnavailableError),
+        ],
+    )
+    async def test_sdk_errors_keep_status_headers_and_call_bound(
+        self,
+        provider: str,
+        use_async: bool,
+        stream: bool,
+        status: int,
+        exception_type: type[Exception],
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status, request=request, json={"error": {"message": "synthetic failure"}}, headers={"Retry-After": "7"}
+            )
+
+        transport: Final = MagicMock(side_effect=handler)
+        with pytest.raises(exception_type) as error:
+            await self.complete(provider, use_async, stream, transport, [])
+        assert error.value.status_code == status
+        headers: Final = error.value.litellm_response_headers
+        assert headers["retry-after"] == "7"
+        assert litellm.utils._get_retry_after_from_exception_header(response_headers=headers) == 7
+        assert transport.call_count == 1
 
 
 class TestExtraBodyCannotOverrideModel:
