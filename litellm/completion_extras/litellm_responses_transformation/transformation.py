@@ -43,12 +43,13 @@ from litellm.types.llms.openai import (
     ChatCompletionToolCallChunk,
     ChatCompletionToolCallFunctionChunk,
     ChatCompletionToolParamFunctionChunk,
+    FunctionCallArgumentsDeltaEvent,
     Reasoning,
     ResponsesAPIOptionalRequestParams,
     ResponsesAPIResponse,
     ResponsesAPIStreamEvents,
 )
-from litellm.types.utils import GenericStreamingChunk, ModelResponseStream
+from litellm.types.utils import ChatCompletionDeltaToolCall, GenericStreamingChunk, ModelResponseStream
 
 if TYPE_CHECKING:
     from openai.types.responses import ResponseInputImageParam, ResponseOutputItem
@@ -1378,6 +1379,7 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         super().__init__(streaming_response, sync_stream, json_mode)
         self._chat_completion_id: str | None = None
         self._tool_call_index_map: dict[int, int] = {}  # mutable-ok: per-stream accumulator state
+        self._tool_call_arguments_emitted: frozenset[int] = frozenset()
         self._saw_finish_reason = False
         self._upstream_model, self._upstream_provider = (
             (streaming_response.model, streaming_response.custom_llm_provider or "")
@@ -1715,11 +1717,46 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
             ModelResponseStream: OpenAI-formatted streaming chunk
         """
         verbose_logger.debug("Chat provider: transform_streaming_response called with chunk: %s", chunk)
+        output_index: Final = chunk.get("output_index", 0)
+        event_type: Final = chunk.get("type")
+        output_item: Final = chunk.get("item")
+        done_arguments: Final = (
+            chunk.get("arguments")
+            if event_type == ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE
+            else chunk.get("input")
+            if event_type == ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE
+            else output_item.get("input" if output_item.get("type") == "custom_tool_call" else "arguments")
+            if event_type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+            and isinstance(output_item, dict)
+            and output_item.get("type") in ("function_call", "custom_tool_call")
+            else None
+        )
+        translation_chunk: Final = (
+            FunctionCallArgumentsDeltaEvent(
+                type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA,
+                item_id="",
+                output_index=output_index,
+                delta=done_arguments,
+            )
+            if isinstance(output_index, int)
+            and output_index in self._tool_call_index_map
+            and output_index not in self._tool_call_arguments_emitted
+            and isinstance(done_arguments, str)
+            and done_arguments
+            else chunk
+        )
         parsed: Final = self._with_stream_scoped_id(
             OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream(
-                chunk, tool_call_index_map=self._tool_call_index_map
+                translation_chunk, tool_call_index_map=self._tool_call_index_map
             )
         )
+        if isinstance(output_index, int) and any(
+            tool_call.function.arguments
+            for choice in parsed.choices
+            for tool_call in choice.delta.tool_calls or ()
+            if isinstance(tool_call, ChatCompletionDeltaToolCall)
+        ):
+            self._tool_call_arguments_emitted = self._tool_call_arguments_emitted | frozenset((output_index,))
         if any(choice.finish_reason for choice in parsed.choices):
             self._saw_finish_reason = True
         return parsed

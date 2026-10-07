@@ -2266,6 +2266,62 @@ def test_streaming_parallel_tool_calls_have_distinct_indices():
 # =============================================================================
 
 
+@pytest.mark.parametrize("mode", ("captured", "mixed", "item_done", "added", "custom"))
+def test_parallel_done_only_arguments_are_emitted_once(mode: str):
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    custom: Final = mode == "custom"
+    payload_key: Final = "input" if custom else "arguments"
+    event_prefix: Final = "response.custom_tool_call_input" if custom else "response.function_call_arguments"
+    arguments: Final = ('{"value":1}', '{"value":2}', '{"value":3}')
+    output_indices: Final = (2, 4, 6) if mode == "mixed" else (0, 1, 2)
+    items: Final = tuple(
+        {
+            "type": "custom_tool_call" if custom else "function_call",
+            "name": f"tool_{index}",
+            "call_id": f"call_{index}",
+            payload_key: value,
+        }
+        for index, value in enumerate(arguments)
+    )
+    events: Final = tuple(
+        event
+        for index, item in zip(output_indices, items)
+        for event in (
+            {
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": {**item, payload_key: item[payload_key] if mode == "added" else ""},
+            },
+            *(
+                ({"type": f"{event_prefix}.delta", "output_index": index, "delta": item[payload_key]},)
+                if mode == "mixed" and index == 4
+                else ()
+            ),
+            *(
+                ({"type": f"{event_prefix}.done", "output_index": index, payload_key: item[payload_key]},)
+                if mode != "item_done"
+                else ()
+            ),
+            {"type": "response.output_item.done", "output_index": index, "item": item},
+        )
+    ) + ({"type": "response.completed", "response": {"status": "completed", "output": items}},)
+    iterator: Final = OpenAiResponsesToChatCompletionStreamIterator(streaming_response=None, sync_stream=True)
+    results: Final = tuple(iterator.chunk_parser(event) for event in events)
+    calls: Final = tuple(call for result in results for call in (result.choices[0].delta.tool_calls or ()))
+
+    assert (
+        tuple("".join(call.function.arguments or "" for call in calls if call.index == index) for index in range(3))
+        == arguments
+    )
+    assert tuple(call.id for call in calls if call.id) == ("call_0", "call_1", "call_2")
+    assert tuple(call.function.name for call in calls if call.function.name) == ("tool_0", "tool_1", "tool_2")
+    assert all(result.choices[0].finish_reason is None for result in results[:-1])
+    assert results[-1].choices[0].finish_reason == "tool_calls"
+
+
 def test_parallel_tool_calls_comprehensive_streaming_integration():
     """
     Comprehensive integration test for parallel tool calls via Responses API streaming.
