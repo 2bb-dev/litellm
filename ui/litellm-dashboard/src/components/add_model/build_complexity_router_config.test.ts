@@ -5,6 +5,9 @@ import {
   normalizeClassifierLlmConfig,
   getKeywordTierRulesError,
   getClassifierModelError,
+  getHeuristicV2SuccessThresholdError,
+  getReminderMarkersError,
+  getClassifierPluginTimeoutError,
   getClassifierReasoningEffortError,
   getMissingTiersError,
   hydrateCustomTierSet,
@@ -147,6 +150,63 @@ describe("buildComplexityRouterConfig", () => {
     expect(llm).not.toHaveProperty("jev_classifier_config");
   });
 
+  it("forwards preset references and explicit overrides without materializing absent text on create", () => {
+    const settings = {
+      efficient_profile_preset: "efficient-v1",
+      capable_profile_preset: "capable-v1",
+      harness_preset: "runtime-v1",
+      efficient_profile: "Explicit efficient override",
+      capable_profile: "Explicit capable override",
+      harness: "Explicit harness override",
+      max_quality_gap: 0.05,
+    };
+    const config = buildComplexityRouterConfig({ ...baseParams, classifierType: "llm_v2", llmV2Config: settings });
+    expect(config.llm_v2_config).toEqual(settings);
+    const { efficient_profile: _efficient, capable_profile: _capable, harness: _harness, ...refs } = settings;
+    const refConfig = buildComplexityRouterConfig({ ...baseParams, classifierType: "llm_v2", llmV2Config: refs });
+    expect(JSON.parse(JSON.stringify(refConfig)).llm_v2_config).toEqual(refs);
+  });
+
+  it.each(["capability", "llm_v2", "heuristic"] as const)(
+    "preserves explicit context-window opt-in beside forecast restrictions: %s",
+    (classifierType) => {
+      const forecast = classifierType !== "heuristic";
+      const params = {
+        ...baseParams,
+        classifierType,
+        adaptive: true,
+        enableContextWindowEscalation: true,
+        contextWindowEscalationBuffer: 0.9,
+      };
+      const config = buildComplexityRouterConfig(params);
+      expect(config.adaptive).toBe(!forecast);
+      expect(config.enable_context_window_escalation).toBe(true);
+      expect(config.context_window_escalation_buffer).toBe(0.9);
+      expect(config.escalation_keywords).toEqual(forecast ? [] : ["LITELLM ESCALATE"]);
+      for (const key of ["adaptive_weights", "adaptive_eligible", "tier_distance_penalty"]) {
+        expect(Object.hasOwn(config, key)).toBe(!forecast);
+      }
+      if (forecast) {
+        const untouched = buildComplexityRouterConfig({ ...baseParams, classifierType });
+        expect(untouched.enable_context_window_escalation).toBe(false);
+        expect(untouched.escalation_keywords).toEqual([]);
+      }
+    },
+  );
+
+  it("carries Fast and reasoning overrides independently into a new router payload", () => {
+    const params = { speed: "fast", reasoning_effort: "high", max_tokens: 1024 };
+    const config = buildComplexityRouterConfig({
+      ...baseParams,
+      tiers: { ...tiers, COMPLEX: ["primary"], REASONING: ["secondary"] },
+      tierModelParams: { COMPLEX: { primary: params }, REASONING: { secondary: { speed: "fast" } } },
+    });
+    expect(config.tier_model_configs).toEqual({
+      COMPLEX: [{ model_name: "primary", litellm_params: params }],
+      REASONING: [{ model_name: "secondary", litellm_params: { speed: "fast" } }],
+    });
+  });
+
   it("emits tiers, classifier_type, and escalation_keywords when nothing else is configured", () => {
     const config = buildComplexityRouterConfig(baseParams);
     const expected = {
@@ -162,13 +222,14 @@ describe("buildComplexityRouterConfig", () => {
     expect(config).toEqual(expected);
   });
 
-  it("carries an explicit context-window escalation opt-out and buffer, false included", () => {
+  it.each([undefined, false, true])("preserves the context-window escalation setting: %s", (enabled) => {
     const config = buildComplexityRouterConfig({
       ...baseParams,
-      enableContextWindowEscalation: false,
+      enableContextWindowEscalation: enabled,
       contextWindowEscalationBuffer: 0.9,
     });
-    expect(config.enable_context_window_escalation).toBe(false);
+    expect(config.enable_context_window_escalation).toBe(enabled);
+    expect(Object.hasOwn(config, "enable_context_window_escalation")).toBe(enabled !== undefined);
     expect(config.context_window_escalation_buffer).toBe(0.9);
   });
 
@@ -249,7 +310,27 @@ describe("buildComplexityRouterConfig", () => {
     expect(config.classifier_llm_config).toBeUndefined();
     expect(config.classifier_context_window_size).toBeUndefined();
     expect(config.classifier_fallback).toBeUndefined();
+    expect(config).not.toHaveProperty("heuristic_v2_success_threshold");
   });
+
+  it.each([0, 0.95, 1])("serializes a heuristic v2 success threshold of %s", (heuristicV2SuccessThreshold) => {
+    const config = buildComplexityRouterConfig({
+      ...baseParams,
+      classifierType: "heuristic_v2",
+      heuristicV2SuccessThreshold,
+    });
+    expect(config.heuristic_v2_success_threshold).toBe(heuristicV2SuccessThreshold);
+  });
+
+  it.each(["heuristic", "llm", "heuristic_first", "hybrid", "capability", "llm_v2"] as const)(
+    "retains the inactive success threshold under %s",
+    (classifierType) => {
+      expect(
+        buildComplexityRouterConfig({ ...baseParams, classifierType, heuristicV2SuccessThreshold: 0.91 })
+          .heuristic_v2_success_threshold,
+      ).toBe(0.91);
+    },
+  );
 
   it("includes classifier_context_window_size and classifier_context_budget_chars only when classifier_type is llm", () => {
     const params: BuildComplexityRouterConfigParams = {
@@ -922,6 +1003,19 @@ describe("buildComplexityRouterConfig tier model params", () => {
   });
 });
 
+describe("getHeuristicV2SuccessThresholdError", () => {
+  it.each([undefined, 0, 0.95, 1])("accepts the optional probability %s", (threshold) => {
+    expect(getHeuristicV2SuccessThresholdError(threshold)).toBeNull();
+  });
+
+  it.each([-0.01, 1.01, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "rejects invalid success threshold %s",
+    (threshold) => {
+      expect(getHeuristicV2SuccessThresholdError(threshold)).toBe("Success threshold must be a number between 0 and 1");
+    },
+  );
+});
+
 describe("getClassifierModelError", () => {
   it("stays quiet for a heuristic router, which needs no classifier model", () => {
     expect(getClassifierModelError({ classifier_type: "heuristic" })).toBeNull();
@@ -1385,5 +1479,77 @@ describe("classifier vision wire payload", () => {
     });
 
     expect(payload.classifier_llm_config).not.toHaveProperty("vision");
+  });
+});
+
+describe("advanced complexity router fields", () => {
+  it("normalizes lists, reminder markers, and explicit false values", () => {
+    const payload = buildComplexityRouterConfig({
+      ...baseParams,
+      codeKeywords: [" async ", "  "],
+      reasoningKeywords: ["prove"],
+      technicalKeywords: ["api"],
+      simpleKeywords: ["hello"],
+      planModePatterns: [" plan "],
+      routeHousekeepingToCheapestTier: false,
+      housekeepingPatterns: [" title "],
+      reminderMarkers: [{ open: " <SYSTEM> ", close: " </SYSTEM> " }],
+      maxTokensFromTierModel: false,
+      classifierType: "custom",
+      classifierPluginTimeoutMs: 3000,
+    });
+    expect(payload).toMatchObject({
+      code_keywords: ["async"],
+      reasoning_keywords: ["prove"],
+      technical_keywords: ["api"],
+      simple_keywords: ["hello"],
+      plan_mode_patterns: ["plan"],
+      route_housekeeping_to_cheapest_tier: false,
+      housekeeping_patterns: ["title"],
+      reminder_markers: [{ open: "<system>", close: "</system>" }],
+      max_tokens_from_tier_model: false,
+      classifier_plugin_timeout_ms: 3000,
+    });
+  });
+
+  it("omits defaults, empty lists, and timeout values for non-custom classifiers", () => {
+    const payload = buildComplexityRouterConfig({
+      ...baseParams,
+      codeKeywords: [" ", ""],
+      reminderMarkers: [],
+      routeHousekeepingToCheapestTier: true,
+      maxTokensFromTierModel: true,
+      classifierPluginTimeoutMs: 3000,
+    });
+    expect(payload).not.toHaveProperty("code_keywords");
+    expect(payload).not.toHaveProperty("reminder_markers");
+    expect(payload).not.toHaveProperty("route_housekeeping_to_cheapest_tier");
+    expect(payload).not.toHaveProperty("max_tokens_from_tier_model");
+    expect(payload).not.toHaveProperty("classifier_plugin_timeout_ms");
+  });
+
+  it.each([
+    "code_keywords",
+    "reasoning_keywords",
+    "technical_keywords",
+    "simple_keywords",
+    "plan_mode_patterns",
+    "route_housekeeping_to_cheapest_tier",
+    "housekeeping_patterns",
+    "reminder_markers",
+    "max_tokens_from_tier_model",
+    "classifier_plugin_timeout_ms",
+  ])("omits unset advanced field %s", (key) => {
+    const payload = buildComplexityRouterConfig(baseParams);
+    expect(payload).not.toHaveProperty(key);
+  });
+
+  it("validates marker pairs and custom classifier timeout", () => {
+    expect(getReminderMarkersError([{ open: " <X> ", close: " <x> " }])).toContain("different");
+    expect(getReminderMarkersError([{ open: "", close: "</x>" }])).toContain("needs both");
+    expect(getReminderMarkersError([{ open: "<x>", close: "</x>" }])).toBeNull();
+    expect(getClassifierPluginTimeoutError("custom", 0)).toContain("whole number");
+    expect(getClassifierPluginTimeoutError("custom", 3000)).toBeNull();
+    expect(getClassifierPluginTimeoutError("heuristic", 0)).toBeNull();
   });
 });

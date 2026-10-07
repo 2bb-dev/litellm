@@ -17,6 +17,13 @@ LiteLLM MIT `LICENSE`:
 [this exact upstream source revision](https://github.com/Nugine/simd/blob/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE).
 The notice generator verifies the retained text's SHA-256.
 
+`registry-supplements.json` binds additional missing published-crate notices to
+exact package versions, license declarations, upstream revisions and local
+SHA-256 values. The retained texts come from those revisions. The crc32c 0.6.8
+revision contains no license files: its pinned README explicitly offers
+Apache-2.0 or MIT. Its retained grant and the official Apache-2.0 text document
+the Apache option used for this distribution. No license allowlist is relaxed.
+
 After a native dependency or compiler update, review changed license terms,
 refresh the compiler inventory from the newly pinned toolchain if necessary,
 then run from the repository root:

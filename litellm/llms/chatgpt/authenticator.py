@@ -40,6 +40,7 @@ _JSON_OBJECT_ADAPTER: Final = TypeAdapter(JsonObject)
 def _optional_str(value: JsonValue | None) -> str | None:
     return value if isinstance(value, str) else None
 
+
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.terminal_receipt_oauth import AccountSnapshot
 

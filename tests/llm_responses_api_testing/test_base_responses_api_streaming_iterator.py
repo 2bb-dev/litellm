@@ -2,12 +2,12 @@
 Unit tests for BaseResponsesAPIStreamingIterator
 
 Tests core functionality including:
-1. Processing chunks and handling ResponseCompletedEvent 
+1. Processing chunks and handling ResponseCompletedEvent
 2. Ensuring _update_responses_api_response_id_with_model_id is called for final chunk
 3. Verifying ID update is NOT called for non-final chunks (delta events)
 4. Edge case handling for invalid JSON, empty chunks, and [DONE] markers
 
-These tests ensure the streaming iterator correctly processes response chunks 
+These tests ensure the streaming iterator correctly processes response chunks
 and applies model ID updates only to completed responses, as required for proper
 response tracking and logging.
 """
@@ -26,6 +26,7 @@ from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfi
 from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.openai import (
+    ResponseAPIUsage,
     ResponseCompletedEvent,
     ResponseFailedEvent,
     ResponseIncompleteEvent,
@@ -69,6 +70,7 @@ class TestBaseResponsesAPIStreamingIterator:
 
         mock_responses_api_response = Mock(spec=ResponsesAPIResponse)
         mock_responses_api_response.id = "resp_u2028"
+        mock_responses_api_response.usage = ResponseAPIUsage(input_tokens=3, output_tokens=2, total_tokens=5)
         mock_completed_event = Mock(spec=ResponseCompletedEvent)
         mock_completed_event.type = ResponsesAPIStreamEvents.RESPONSE_COMPLETED
         mock_completed_event.response = mock_responses_api_response
@@ -123,6 +125,7 @@ class TestBaseResponsesAPIStreamingIterator:
         # Mock the _update_responses_api_response_id_with_model_id method
         updated_response = Mock(spec=ResponsesAPIResponse)
         updated_response.id = "updated_response_id"
+        updated_response.usage = ResponseAPIUsage(input_tokens=3, output_tokens=2, total_tokens=5)
 
         # Create the iterator instance
         iterator = BaseResponsesAPIStreamingIterator(
@@ -186,11 +189,7 @@ class TestBaseResponsesAPIStreamingIterator:
         mock_delta_event.type = ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA
         mock_delta_event.delta = "Hello"
         # Delta events don't have a response attribute
-        (
-            delattr(mock_delta_event, "response")
-            if hasattr(mock_delta_event, "response")
-            else None
-        )
+        (delattr(mock_delta_event, "response") if hasattr(mock_delta_event, "response") else None)
 
         # Set up the mock transform method to return our delta event
         mock_config.transform_streaming_response.return_value = mock_delta_event
@@ -246,10 +245,9 @@ class TestBaseResponsesAPIStreamingIterator:
         mock_logging_obj.completion_start_time = None
         mock_config = Mock(spec=BaseResponsesAPIConfig)
 
-        completed_response = Mock(spec=ResponsesAPIResponse)
-        completed_response.id = "resp_terminal_123"
-        completed_response.output = []
-        completed_response.usage = None
+        completed_response = ResponsesAPIResponse(
+            id="resp_terminal_123", created_at=0, model="gpt-4", status="completed", output=[]
+        )
 
         output_item_added_event = Mock()
         output_item_added_event.type = ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
@@ -268,9 +266,9 @@ class TestBaseResponsesAPIStreamingIterator:
         text_delta_event.content_index = 0
         text_delta_event.delta = "Hello world"
 
-        completed_event = Mock(spec=ResponseCompletedEvent)
-        completed_event.type = ResponsesAPIStreamEvents.RESPONSE_COMPLETED
-        completed_event.response = completed_response
+        completed_event = ResponseCompletedEvent(
+            type="response.completed", sequence_number=0, response=completed_response
+        )
 
         event_by_type = {
             ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED: output_item_added_event,
@@ -281,9 +279,7 @@ class TestBaseResponsesAPIStreamingIterator:
         def transform_streaming_response_side_effect(*, parsed_chunk, **kwargs):
             return event_by_type[parsed_chunk["type"]]
 
-        mock_config.transform_streaming_response.side_effect = (
-            transform_streaming_response_side_effect
-        )
+        mock_config.transform_streaming_response.side_effect = transform_streaming_response_side_effect
 
         iterator = BaseResponsesAPIStreamingIterator(
             response=mock_response,
@@ -343,9 +339,9 @@ class TestBaseResponsesAPIStreamingIterator:
                 )
             )
 
-        assert result is completed_event
-        assert iterator.completed_response is completed_event
-        assert completed_response.output == [
+        assert result.type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+        assert iterator.completed_response is result
+        assert result.response.output == [
             {
                 "id": "msg_123",
                 "type": "message",
@@ -367,10 +363,9 @@ class TestBaseResponsesAPIStreamingIterator:
         mock_logging_obj.completion_start_time = None
         mock_config = Mock(spec=BaseResponsesAPIConfig)
 
-        completed_response = Mock(spec=ResponsesAPIResponse)
-        completed_response.id = "resp_terminal_456"
-        completed_response.output = []
-        completed_response.usage = None
+        completed_response = ResponsesAPIResponse(
+            id="resp_terminal_456", created_at=0, model="gpt-4", status="completed", output=[]
+        )
 
         output_item_added_event = Mock()
         output_item_added_event.type = ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
@@ -408,9 +403,9 @@ class TestBaseResponsesAPIStreamingIterator:
         text_done_event.content_index = 0
         text_done_event.text = "See source"
 
-        completed_event = Mock(spec=ResponseCompletedEvent)
-        completed_event.type = ResponsesAPIStreamEvents.RESPONSE_COMPLETED
-        completed_event.response = completed_response
+        completed_event = ResponseCompletedEvent(
+            type="response.completed", sequence_number=0, response=completed_response
+        )
 
         event_by_type = {
             ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED: output_item_added_event,
@@ -423,9 +418,7 @@ class TestBaseResponsesAPIStreamingIterator:
         def transform_streaming_response_side_effect(*, parsed_chunk, **kwargs):
             return event_by_type[parsed_chunk["type"]]
 
-        mock_config.transform_streaming_response.side_effect = (
-            transform_streaming_response_side_effect
-        )
+        mock_config.transform_streaming_response.side_effect = transform_streaming_response_side_effect
 
         iterator = BaseResponsesAPIStreamingIterator(
             response=mock_response,
@@ -506,7 +499,7 @@ class TestBaseResponsesAPIStreamingIterator:
                 )
             )
 
-        assert completed_response.output == [
+        assert iterator.completed_response.response.output == [
             {
                 "id": "msg_456",
                 "type": "message",
@@ -670,9 +663,7 @@ class TestBaseResponsesAPIStreamingIterator:
                 iterator._handle_logging_completed_response()
             except TypeError as e:
                 if "pickle" in str(e):
-                    pytest.fail(
-                        f"_handle_logging_completed_response failed with pickle error: {e}"
-                    )
+                    pytest.fail(f"_handle_logging_completed_response failed with pickle error: {e}")
                 raise
 
     @pytest.mark.asyncio
@@ -821,7 +812,7 @@ class TestBaseResponsesAPIStreamingIterator:
             "type": "server_error",
             "message": "The model encountered an error",
         }
-        mock_responses_api_response.usage = None
+        mock_responses_api_response.usage = ResponseAPIUsage(input_tokens=3, output_tokens=2, total_tokens=5)
 
         mock_failed_event = Mock(spec=ResponseFailedEvent)
         mock_failed_event.type = ResponsesAPIStreamEvents.RESPONSE_FAILED
@@ -855,9 +846,7 @@ class TestBaseResponsesAPIStreamingIterator:
                 "_update_responses_api_response_id_with_model_id",
                 return_value=mock_responses_api_response,
             ),
-            patch(
-                "litellm.responses.streaming_iterator.run_async_function"
-            ) as mock_run_async,
+            patch("litellm.responses.streaming_iterator.run_async_function") as mock_run_async,
             patch("litellm.responses.streaming_iterator.executor") as mock_executor,
         ):
             result = iterator._process_chunk(json.dumps(test_chunk_data))
@@ -869,10 +858,7 @@ class TestBaseResponsesAPIStreamingIterator:
             # Failure handler should have been called via _handle_failure
             mock_run_async.assert_called_once()
             call_kwargs = mock_run_async.call_args
-            assert (
-                call_kwargs[1]["async_function"]
-                == mock_logging_obj.async_failure_handler
-            )
+            assert call_kwargs[1]["async_function"] == mock_logging_obj.async_failure_handler
 
             mock_executor.submit.assert_called_once()
             submit_args = mock_executor.submit.call_args
@@ -901,7 +887,7 @@ class TestBaseResponsesAPIStreamingIterator:
         mock_responses_api_response = Mock(spec=ResponsesAPIResponse)
         mock_responses_api_response.id = "resp_incomplete_123"
         mock_responses_api_response.incomplete_details = {"reason": "max_output_tokens"}
-        mock_responses_api_response.usage = None
+        mock_responses_api_response.usage = ResponseAPIUsage(input_tokens=3, output_tokens=2, total_tokens=5)
 
         mock_incomplete_event = Mock(spec=ResponseIncompleteEvent)
         mock_incomplete_event.type = ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE

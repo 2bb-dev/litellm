@@ -22,7 +22,11 @@ from litellm.utils import _is_custom_pricing_deployment
 
 
 def cost_per_token(
-    model: str, usage: "Usage", service_tier: str | None = None, request_time: datetime | float | None = None
+    model: str,
+    usage: "Usage",
+    service_tier: str | None = None,
+    request_time: datetime | float | None = None,
+    model_info: "ModelInfo | None" = None,
 ) -> tuple[float, float]:
     """
     Calculates the cost per token for a given model, prompt tokens, and completion tokens.
@@ -32,6 +36,7 @@ def cost_per_token(
         - usage: LiteLLM Usage block, containing anthropic caching information
         - service_tier: the service tier the request was served at (e.g. "priority"),
           read from the Anthropic response usage and used to select tier-specific pricing
+        - model_info: effective deployment prices, when they override public rates
 
     Returns:
         Tuple[float, float] - prompt_cost_in_usd, completion_cost_in_usd
@@ -42,20 +47,27 @@ def cost_per_token(
         custom_llm_provider="anthropic",
         service_tier=service_tier,
         request_time=request_time,
+        model_info=model_info,
     )
 
     # Apply provider_specific_entry multipliers for geo/speed routing
     try:
-        model_info: Final = litellm.get_model_info(model=model, custom_llm_provider="anthropic")
-        provider_specific_entry: Final[dict] = model_info.get("provider_specific_entry") or {}
+        effective_info: Final = (
+            model_info
+            if model_info is not None
+            else litellm.get_model_info(model=model, custom_llm_provider="anthropic")
+        )
+        provider_specific_entry: Final = effective_info.get("provider_specific_entry")
 
-        geo_multiplier: Final = get_provider_specific_geo_multiplier(model_info=model_info, usage=usage)
+        geo_multiplier: Final = get_provider_specific_geo_multiplier(model_info=effective_info, usage=usage)
         speed_multiplier: Final = (
-            provider_specific_entry.get("fast", 1.0) if getattr(usage, "speed", None) == "fast" else 1.0
+            provider_specific_entry.get("fast", 1.0)
+            if provider_specific_entry and getattr(usage, "speed", None) == "fast"
+            else 1.0
         )
 
         if _is_custom_pricing_deployment(model):
-            cache_cost: Final = sum(calculate_cache_costs(model_info, usage, service_tier, request_time))
+            cache_cost: Final = sum(calculate_cache_costs(effective_info, usage, service_tier, request_time))
             multiplier: Final = speed_multiplier * geo_multiplier
             prompt_cost = (prompt_cost - cache_cost) * multiplier + cache_cost
             completion_cost *= multiplier

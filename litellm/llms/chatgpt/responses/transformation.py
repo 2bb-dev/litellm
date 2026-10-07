@@ -4,6 +4,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, Final, List, Optional, cast
 from urllib.parse import urlsplit
 
+import httpx
+
 from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.core_helpers import process_response_headers
 from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response import (
@@ -17,6 +19,7 @@ from litellm.responses.sse_output_recovery import (
     record_output_text_chunk,
 )
 from litellm.types.llms.openai import (
+    ResponseInputParam,
     ResponsesAPIResponse,
     ResponsesAPIStreamEvents,
     ResponsesAPIStreamingResponse,
@@ -138,7 +141,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     def transform_responses_api_request(
         self,
         model: str,
-        input: Any,
+        input: str | ResponseInputParam,
         response_api_optional_request_params: dict[str, object],
         litellm_params: GenericLiteLLMParams,
         headers: dict[str, str],
@@ -206,9 +209,9 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     def transform_response_api_response(
         self,
         model: str,
-        raw_response: Any,
+        raw_response: httpx.Response,
         logging_obj: "LiteLLMLoggingObj",
-    ):
+    ) -> ResponsesAPIResponse:
         body_text: Final = raw_response.text or ""
         if not self._should_parse_as_sse(raw_response=raw_response, body_text=body_text):
             response: Final = super().transform_response_api_response(
@@ -251,7 +254,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             response.instructions = _caller_instructions(response.instructions)
         return event
 
-    def _should_parse_as_sse(self, raw_response: Any, body_text: str) -> bool:
+    def _should_parse_as_sse(self, raw_response: httpx.Response, body_text: str) -> bool:
         content_type: Final = (raw_response.headers or {}).get("content-type", "")
         if "text/event-stream" in content_type.lower():
             return True
@@ -266,8 +269,8 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     def _extract_completed_response_from_sse(self, body_text: str) -> tuple[ResponsesAPIResponse | None, str | None]:
         completed_response = None
         error_message = None
-        streamed_output_items: Final[dict[int, dict]] = {}
-        text_only_output_items: Final[dict[int, dict]] = {}
+        streamed_output_items: Final[dict[int, dict[str, object]]] = {}
+        text_only_output_items: Final[dict[int, dict[str, object]]] = {}
         for chunk in body_text.splitlines():
             parsed_chunk = parse_sse_json_chunk(chunk)
             if parsed_chunk is None:
@@ -294,7 +297,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 # output_index, but text-only items at indices without a
                 # matching OUTPUT_ITEM_DONE must still be preserved (e.g.
                 # providers that emit only OUTPUT_TEXT_DONE for some indices).
-                merged_items: dict[int, dict] = {**text_only_output_items}
+                merged_items: dict[int, dict[str, object]] = {**text_only_output_items}
                 merged_items.update(streamed_output_items)
                 completed_response = self._build_completed_response_from_chunk(
                     parsed_chunk=parsed_chunk,
@@ -313,7 +316,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         return completed_response, error_message
 
     def _build_completed_response_from_chunk(
-        self, parsed_chunk: dict[str, Any], streamed_output_items: dict[int, dict]
+        self, parsed_chunk: Mapping[str, object], streamed_output_items: Mapping[int, dict[str, object]]
     ) -> ResponsesAPIResponse | None:
         response_payload = parsed_chunk.get("response")
         if not isinstance(response_payload, dict):
@@ -339,7 +342,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     def _attach_response_headers(
         self,
         completed_response: ResponsesAPIResponse,
-        raw_response: Any,
+        raw_response: httpx.Response,
     ) -> None:
         raw_headers: Final = dict(raw_response.headers)
         processed_headers: Final = process_response_headers(raw_headers, custom_llm_provider="chatgpt")

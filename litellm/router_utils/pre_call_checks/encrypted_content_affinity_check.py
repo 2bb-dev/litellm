@@ -50,7 +50,9 @@ from litellm.exceptions import (
     ServiceUnavailableError,
 )
 from litellm.integrations.custom_logger import CustomLogger, Span
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    anthropic_content_lists,
     encrypted_content_of_block,
     strip_encrypted_reasoning_from_messages,
 )
@@ -156,10 +158,7 @@ class EncryptedContentAffinityCheck(CustomLogger):
             return iter(())
         return (
             cast(Mapping[str, object], block)  # cast-ok: narrowed by isinstance
-            for message in cast(list[object], messages)  # cast-ok: narrowed by isinstance
-            if isinstance(message, Mapping)
-            for content in (cast(Mapping[str, object], message).get("content"),)  # cast-ok: narrowed by isinstance
-            if isinstance(content, list)
+            for content in anthropic_content_lists(cast(list[object], messages))  # cast-ok: narrowed by isinstance
             for block in cast(list[object], content)  # cast-ok: narrowed by isinstance
             if isinstance(block, Mapping)
         )
@@ -198,30 +197,13 @@ class EncryptedContentAffinityCheck(CustomLogger):
         return None
 
     @staticmethod
-    def _request_team_id(request_kwargs: Mapping[str, object]) -> str | None:
-        containers: Final = (request_kwargs.get("metadata"), request_kwargs.get("litellm_metadata"))
-        team_ids: Final = (c.get("user_api_key_team_id") for c in containers if isinstance(c, Mapping))
-        return next((tid for tid in team_ids if isinstance(tid, str)), None)
-
-    def _routed_group_candidate_model_ids(self, request_kwargs: Mapping[str, object], model: str) -> frozenset[str]:
-        """
-        Deployment ids that could serve this turn's routed ``model``, as the router
-        resolves a route (model_group_alias / routing group / model_name / team /
-        pattern). Delegates to the router so the full precedence is not re-derived here
-        and no deployment ids are written into request kwargs bound for the provider.
-        """
-        if self.router is None:
-            return frozenset()
-        return self.router.get_candidate_model_ids_for_route(model=model, team_id=self._request_team_id(request_kwargs))
-
-    @staticmethod
     def _encryption_boundary_key(
         litellm_params: object,
-    ) -> tuple | None:
+    ) -> tuple[object, object] | None:
         """
-        ``(api_base, api_key)`` pair identifying an Azure resource. Two
-        deployments sharing both are interchangeable for ``encrypted_content``
-        follow-ups; Azure rejects content produced by any other resource.
+        ``(api_base, api_key)`` identifies an upstream encryption boundary.
+        The values are resolved from the deployment and its named credential
+        without modifying the deployment.
 
         Accepts any object exposing dict-style ``.get(key, default)``: plain
         dicts (the common case in ``healthy_deployments``) as well as
@@ -236,9 +218,25 @@ class EncryptedContentAffinityCheck(CustomLogger):
             return None
         api_base: Final = getter("api_base")
         api_key: Final = getter("api_key")
-        if not api_base or not api_key:
+        credential_name: Final = getter("litellm_credential_name")
+        credential_values: Final[Mapping[str, object] | None] = (
+            CredentialAccessor.get_credential_values(credential_name)
+            if isinstance(credential_name, str) and credential_name
+            else None
+        )
+        effective_api_base: Final = (
+            credential_values.get("api_base")
+            if credential_values is not None and "api_base" in credential_values
+            else api_base
+        )
+        effective_api_key: Final = (
+            credential_values.get("api_key")
+            if credential_values is not None and "api_key" in credential_values
+            else api_key
+        )
+        if not effective_api_base or not effective_api_key:
             return None
-        return (api_base, api_key)
+        return (effective_api_base, effective_api_key)
 
     def _find_deployments_on_same_encryption_boundary(
         self,
@@ -249,9 +247,6 @@ class EncryptedContentAffinityCheck(CustomLogger):
         Deployments in ``healthy_deployments`` sharing the originating
         deployment's ``(api_base, api_key)``, alongside the originating
         deployment object (or ``None`` if it was removed / router unavailable).
-        Returns ``([], originating_or_None)`` when no boundary match exists,
-        so the caller can reuse the looked-up ``originating`` rather than
-        re-querying the router.
         """
         if self.router is None:
             return [], None
@@ -279,6 +274,73 @@ class EncryptedContentAffinityCheck(CustomLogger):
     # ------------------------------------------------------------------
     # Request routing  (pre-call filter)
     # ------------------------------------------------------------------
+
+    async def _unavailable_origin_error(
+        self,
+        model: str,
+        model_id: str,
+        parent_otel_span: Span | None,
+    ) -> Exception:
+        # Public error messages intentionally omit the originating ``model_id`` so
+        # an authenticated caller forging encrypted-content markers cannot use the
+        # error surface to enumerate which deployment IDs exist on this router.
+        cooldown: Final = await self._get_origin_cooldown(model_id=model_id, parent_otel_span=parent_otel_span)
+
+        if cooldown is not None and str(cooldown.get("status_code")) == "429":
+            retry_after: Final = self._cooldown_seconds_remaining(cooldown)
+            return RateLimitError(
+                message=(
+                    "The deployment that produced this encrypted_content is "
+                    f"rate-limited (cooling down for ~{retry_after}s), and no "
+                    "deployment on the same encryption boundary is configured. "
+                    "Retry after the Retry-After window or configure a deployment "
+                    "with the same (api_base, api_key)."
+                ),
+                llm_provider="",
+                model=model,
+                response=httpx.Response(
+                    status_code=429,
+                    headers={"retry-after": str(retry_after)},
+                    request=httpx.Request("POST", "https://litellm.ai/"),
+                ),
+            )
+
+        return ServiceUnavailableError(
+            message=(
+                "The deployment that produced this encrypted_content is "
+                "currently unavailable (likely cooled down), and no deployment "
+                "on the same encryption boundary is configured. Retry later or "
+                "configure a deployment with the same (api_base, api_key)."
+            ),
+            llm_provider="",
+            model=model,
+        )
+
+    async def _get_origin_cooldown(
+        self,
+        model_id: str,
+        parent_otel_span: Span | None,
+    ) -> CooldownCacheValue | None:
+        if self.router is None:
+            return None
+        cooldown_cache: Final[_SupportsActiveCooldowns | None] = getattr(self.router, "cooldown_cache", None)
+        if cooldown_cache is None:
+            return None
+        try:
+            active: Final = await cooldown_cache.async_get_active_cooldowns(
+                model_ids=[model_id], parent_otel_span=parent_otel_span
+            )
+        except Exception:
+            return None
+        for cached_model_id, value in active:
+            if cached_model_id == model_id:
+                return value
+        return None
+
+    @staticmethod
+    def _cooldown_seconds_remaining(cooldown: CooldownCacheValue) -> int:
+        remaining = float(cooldown.get("timestamp", 0.0)) + float(cooldown.get("cooldown_time", 0.0)) - time.time()
+        return max(1, int(remaining))
 
     async def async_filter_deployments(
         self,
@@ -398,99 +460,15 @@ class EncryptedContentAffinityCheck(CustomLogger):
 
         # The origin cannot serve this turn's routed group and no peer shares the boundary, so its
         # encrypted reasoning can never decrypt here. Strip it, keep the readable history, and dispatch
-        # to the routed group instead of failing. Membership is tested by deployment id against the set
-        # the router actually resolved for this route, not by model-group name, so an alias, a
-        # provider-qualified spelling, a team-public name, or a pattern route of the same group is not
-        # mistaken for a tier change. An unknown origin (a removed deployment, or a forged marker) is
-        # treated the same as a cross-group one, which also denies an authenticated caller a
-        # deployment-id existence oracle: a real cross-group id and a nonexistent id both strip and
-        # dispatch rather than returning distinguishable responses. Only a genuine same-group member
-        # that is currently unavailable falls through to the fail-fast, preserving the cooldown contract.
-        routed_group_model_ids: Final = (
-            self._routed_group_candidate_model_ids(request_kwargs, model) if originating is not None else frozenset()
+        # to the healthy pool instead of failing the request. This also denies an authenticated caller a
+        # deployment-id existence oracle: a same-group id, a cross-group id, a removed id and a forged
+        # marker all strip and dispatch rather than returning distinguishable responses.
+        verbose_router_logger.warning(
+            "EncryptedContentAffinityCheck: model_id=%s cannot serve group %s and no deployment on the same "
+            "encryption boundary is configured; forwarding without its encrypted reasoning",
+            model_id[:64],
+            model,
         )
-        if str(model_id) not in routed_group_model_ids:
-            verbose_router_logger.debug(
-                "EncryptedContentAffinityCheck: model_id=%s is not a candidate for the routed group %s; "
-                "forwarding without its encrypted reasoning",
-                model_id,
-                model,
-            )
-            ResponsesAPIRequestUtils.strip_encrypted_reasoning_from_input(request_input)
-            strip_encrypted_reasoning_from_messages(anthropic_messages)
-            return typed_healthy_deployments
-
-        # The origin is a member of the routed group but currently unavailable (cooled down); fail fast
-        # rather than dispatching to a non-peer, which would guarantee an upstream 400.
-        raise await self._unavailable_origin_error(
-            model=model,
-            model_id=model_id,
-            parent_otel_span=parent_otel_span,
-        )
-
-    async def _unavailable_origin_error(
-        self,
-        model: str,
-        model_id: str,
-        parent_otel_span: Span | None,
-    ) -> Exception:
-        # Public error messages intentionally omit the originating ``model_id`` so
-        # an authenticated caller forging encrypted-content markers cannot use the
-        # error surface to enumerate which deployment IDs exist on this router.
-        cooldown: Final = await self._get_origin_cooldown(model_id=model_id, parent_otel_span=parent_otel_span)
-
-        if cooldown is not None and str(cooldown.get("status_code")) == "429":
-            retry_after: Final = self._cooldown_seconds_remaining(cooldown)
-            return RateLimitError(
-                message=(
-                    "The deployment that produced this encrypted_content is "
-                    f"rate-limited (cooling down for ~{retry_after}s), and no "
-                    "deployment on the same encryption boundary is configured. "
-                    "Retry after the Retry-After window or configure a deployment "
-                    "with the same (api_base, api_key)."
-                ),
-                llm_provider="",
-                model=model,
-                response=httpx.Response(
-                    status_code=429,
-                    headers={"retry-after": str(retry_after)},
-                    request=httpx.Request("POST", "https://litellm.ai/"),
-                ),
-            )
-
-        return ServiceUnavailableError(
-            message=(
-                "The deployment that produced this encrypted_content is "
-                "currently unavailable (likely cooled down), and no deployment "
-                "on the same encryption boundary is configured. Retry later or "
-                "configure a deployment with the same (api_base, api_key)."
-            ),
-            llm_provider="",
-            model=model,
-        )
-
-    async def _get_origin_cooldown(
-        self,
-        model_id: str,
-        parent_otel_span: Span | None,
-    ) -> CooldownCacheValue | None:
-        if self.router is None:
-            return None
-        cooldown_cache: Final[_SupportsActiveCooldowns | None] = getattr(self.router, "cooldown_cache", None)
-        if cooldown_cache is None:
-            return None
-        try:
-            active: Final = await cooldown_cache.async_get_active_cooldowns(
-                model_ids=[model_id], parent_otel_span=parent_otel_span
-            )
-        except Exception:
-            return None
-        for cached_model_id, value in active:
-            if cached_model_id == model_id:
-                return value
-        return None
-
-    @staticmethod
-    def _cooldown_seconds_remaining(cooldown: CooldownCacheValue) -> int:
-        remaining = float(cooldown.get("timestamp", 0.0)) + float(cooldown.get("cooldown_time", 0.0)) - time.time()
-        return max(1, int(remaining))
+        ResponsesAPIRequestUtils.strip_encrypted_reasoning_from_input(request_input)
+        strip_encrypted_reasoning_from_messages(anthropic_messages)
+        return typed_healthy_deployments
