@@ -340,12 +340,50 @@ def test_ui_discovery_endpoints_hide_default_credentials_hint_default_false():
         patch.dict(os.environ, {"DISABLE_ADMIN_UI": "false"}, clear=False),
     ):
         os.environ.pop("LITELLM_HIDE_DEFAULT_CREDENTIALS_HINT", None)
+        os.environ.pop("UI_PASSWORD", None)
 
         response = client.get("/.well-known/litellm-ui-config")
 
         assert response.status_code == 200
         data = response.json()
         assert data["hide_default_credentials_hint"] is False
+
+
+def test_ui_discovery_endpoints_hide_default_credentials_hint_when_ui_password_set():
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+
+    with patch.dict(os.environ, {"UI_PASSWORD": "s3cret-pass", "DISABLE_ADMIN_UI": "false"}, clear=False):
+        os.environ.pop("LITELLM_HIDE_DEFAULT_CREDENTIALS_HINT", None)
+
+        response = client.get("/.well-known/litellm-ui-config")
+
+        assert response.status_code == 200
+        assert response.json()["hide_default_credentials_hint"] is True
+
+
+@pytest.mark.parametrize(
+    "env_overrides",
+    [
+        pytest.param({"UI_USERNAME": "opsadmin"}, id="username_only_keeps_master_key_password"),
+        pytest.param({"UI_PASSWORD": ""}, id="empty_password_is_not_set"),
+    ],
+)
+def test_ui_discovery_endpoints_keeps_default_credentials_hint_without_real_ui_password(env_overrides):
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+
+    with patch.dict(os.environ, {"DISABLE_ADMIN_UI": "false", **env_overrides}, clear=False):
+        os.environ.pop("LITELLM_HIDE_DEFAULT_CREDENTIALS_HINT", None)
+        if "UI_PASSWORD" not in env_overrides:
+            os.environ.pop("UI_PASSWORD", None)
+
+        response = client.get("/.well-known/litellm-ui-config")
+
+        assert response.status_code == 200
+        assert response.json()["hide_default_credentials_hint"] is False
 
 
 def test_ui_discovery_endpoints_hide_default_credentials_hint_via_env_var():
@@ -422,3 +460,23 @@ def test_ui_discovery_endpoints_is_control_plane_false_when_no_workers():
         data = response.json()
         assert data["is_control_plane"] is False
         assert data["workers"] == []
+
+
+@pytest.mark.parametrize(("flag", "expected"), [(None, False), ("false", False), ("true", True)])
+def test_ui_config_tells_the_dashboard_whether_stdio_mcp_servers_are_enabled(monkeypatch, flag, expected):
+    if flag is None:
+        monkeypatch.delenv("LITELLM_ENABLE_MCP_STDIO", raising=False)
+    else:
+        monkeypatch.setenv("LITELLM_ENABLE_MCP_STDIO", flag)
+    app = FastAPI()
+    app.include_router(router)
+
+    with (
+        patch("litellm.proxy.utils.get_server_root_path", return_value="/"),
+        patch("litellm.proxy.utils.get_proxy_base_url", return_value=None),
+        patch("litellm.proxy.auth.auth_utils.has_user_setup_sso", return_value=False),
+    ):
+        response = TestClient(app).get("/.well-known/litellm-ui-config")
+
+    assert response.status_code == 200
+    assert response.json()["mcp_stdio_enabled"] is expected

@@ -637,10 +637,10 @@ async def test_real_writer_encrypts_before_sqlite_and_daily_copies_and_keeps_bil
     )
     kwargs["litellm_params"]["metadata"]["model_info"] = {"id": "completed-deployment"}
     kwargs["litellm_params"]["metadata"][FIELD] = {**registration, "source": "forged"}
-    from tests.test_litellm.litellm_core_utils.test_terminal_receipt_evidence import signed_session
+    from tests.unit.litellm_core_utils.test_terminal_receipt_evidence import signed_session
     from litellm.litellm_core_utils.terminal_receipt_evidence import FIELD as TERMINAL_FIELD, STAMP as TERMINAL_STAMP
 
-    from tests.test_litellm.litellm_core_utils.test_terminal_usage_evidence import signed_usage
+    from tests.unit.litellm_core_utils.test_terminal_usage_evidence import signed_usage
     from litellm.litellm_core_utils.terminal_usage_evidence import FIELD as USAGE_EVIDENCE_FIELD, usage_shell
 
     terminal_session, measurement, _, _, _ = signed_usage(local_source)
@@ -934,7 +934,7 @@ async def test_receipt_failure_recovery_uses_private_context_and_durable_ack(
     from litellm.proxy._types import UserAPIKeyAuth
     from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
     from litellm.litellm_core_utils.terminal_receipt_evidence import STAMP, FIELD
-    from tests.test_litellm.litellm_core_utils.test_terminal_receipt_evidence import signed_session
+    from tests.unit.litellm_core_utils.test_terminal_receipt_evidence import signed_session
 
     session, _, _, _ = signed_session("unknown")
     response, kwargs = make_call(True)

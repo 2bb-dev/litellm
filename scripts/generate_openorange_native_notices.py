@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Final
 
 import tomllib
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 ROOT: Final = Path(__file__).resolve().parents[1]
 OUTPUT: Final = ROOT / "litellm-rust/THIRD_PARTY_NOTICES.txt"
@@ -44,6 +44,8 @@ AZURE_COMMITS: Final = MappingProxyType(
         ("azure_core", "1.1.0"): "9a8a5f7bdb986e4c3ba230ad26b99996aae467d9",
         ("azure_core_macros", "1.0.0"): "c3c92ed4349125e25d176f13faa9ef016b790b3e",
         ("azure_identity", "1.0.0"): "c3c92ed4349125e25d176f13faa9ef016b790b3e",
+        ("azure_storage_blob", "1.1.0"): "a0262a0c2b9753e9ff5091a7d5c14cdaf778f576",
+        ("azure_storage_common", "1.0.0"): "a0262a0c2b9753e9ff5091a7d5c14cdaf778f576",
         ("typespec", "1.1.0"): "9a8a5f7bdb986e4c3ba230ad26b99996aae467d9",
         ("typespec_client_core", "1.1.0"): "9a8a5f7bdb986e4c3ba230ad26b99996aae467d9",
         ("typespec_macros", "1.0.0"): "c3c92ed4349125e25d176f13faa9ef016b790b3e",
@@ -70,6 +72,26 @@ class CargoPackage(BaseModel):
 
 class CargoMetadata(BaseModel):
     packages: tuple[CargoPackage, ...]
+
+
+class SupplementalText(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    file: str
+    source: str
+    sha256: str
+
+
+class SupplementalPackage(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    package: str
+    version: str
+    license: str
+    notices: tuple[SupplementalText, ...]
+
+
+REGISTERED_SUPPLEMENTS: Final = TypeAdapter(tuple[SupplementalPackage, ...]).validate_json(
+    (ROOT / "litellm-rust/notices/registry-supplements.json").read_text()
+)
 
 
 @dataclass(frozen=True)
@@ -123,6 +145,21 @@ def package_notices(package: CargoPackage) -> tuple[Notice, ...]:
     assert package.license, f"Missing native license: {package.name}"
     directory: Final = Path(package.manifest_path).parent
     identity: Final = f"{package.name} {package.version} ({package.license})"
+    registered: Final = next(
+        (
+            entry
+            for entry in REGISTERED_SUPPLEMENTS
+            if (entry.package, entry.version) == (package.name, package.version)
+        ),
+        None,
+    )
+    if registered is not None:
+        assert package.license == registered.license
+        assert registered.notices
+        assert all(Path(notice.file).name == notice.file for notice in registered.notices)
+        return tuple(
+            supplemental_notice(identity, notice.file, notice.source, notice.sha256) for notice in registered.notices
+        )
     if package.name in {"base64-simd", "vsimd"} and package.version == "0.8.0":
         return (supplemental_notice(identity, "simd-0.8.0-LICENSE", SIMD_SOURCE, SIMD_SHA256),)
     if azure_commit := AZURE_COMMITS.get((package.name, package.version)):

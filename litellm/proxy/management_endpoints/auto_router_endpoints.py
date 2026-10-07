@@ -8,7 +8,6 @@ POST /auto_router/validate_complexity_router_config - Dry-run the complexity-rou
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from itertools import chain, groupby
-from operator import attrgetter
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Final, Protocol
 from uuid import uuid4
@@ -59,6 +58,8 @@ from litellm.router_utils.auto_router_model_naming import (
 )
 from litellm.types.management_endpoints.auto_router_endpoints import (
     SHADOW_EVAL_TURN_VALVE,
+    AutoRouterAvailabilityRequest,
+    AutoRouterAvailabilityResponse,
     AutoRouterBenchmarkGroup,
     AutoRouterBenchmarksResponse,
     AutoRouterBenchmarkTotals,
@@ -427,6 +428,88 @@ async def _resolve_saved_routing_test(
 
 
 @router.post(
+    "/auto_router/availability",
+    tags=["model management"],  # mutable-ok: FastAPI requires a list
+    response_model=AutoRouterAvailabilityResponse,
+)
+async def get_auto_router_availability(
+    data: AutoRouterAvailabilityRequest,
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+) -> AutoRouterAvailabilityResponse:
+    from litellm.proxy.management_helpers.auto_router_availability import auto_router_availability
+    from litellm.proxy.proxy_server import (
+        _license_check,  # pyright: ignore[reportPrivateUsage]  # same entitlement owner as the model write gate
+        heuristic_v1_tuning_baselines,
+        llm_router,
+        proxy_config,
+    )
+
+    member_team: Final = await _authorize_router_dry_run(user_api_key_dict, data.team_id)
+    rows: Final = proxy_config.auto_router_db_catalog
+    if rows is None or llm_router is None:
+        raise HTTPException(status_code=503, detail="Auto-router availability is unavailable")
+    saved: Final = next((row for row in rows if row.model_id == data.saved_model_id), None)
+    if data.saved_model_id is not None:
+        if saved is None:
+            raise HTTPException(status_code=404, detail="Saved auto router is unavailable")
+        if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN and (
+            saved.team_id != data.team_id or (member_team is not None and saved.created_by != user_api_key_dict.user_id)
+        ):
+            raise HTTPException(status_code=403, detail="Cannot check another user's auto router")
+    existing: Final = saved.deployment if saved is not None else None
+    others: Final = tuple(row.deployment for row in rows if row is not saved) + tuple(llm_router.config_deployments())
+    candidate: Final = MappingProxyType(
+        {
+            "litellm_params": MappingProxyType(
+                {"model": "auto_router/complexity_router", "complexity_router_config": data.complexity_router_config}
+            ),
+            "model_info": MappingProxyType({"id": data.saved_model_id or "availability-new-router", "db_model": True}),
+        }
+    )
+    return auto_router_availability(
+        others=others,
+        existing=existing,
+        candidate=candidate,
+        baselines=heuristic_v1_tuning_baselines,
+        limit=_license_check.auto_router_capability_limit(),
+    )
+
+
+async def _resolve_saved_routing_test(
+    data: AutoRouterRoutingTestRequest,
+    user_api_key_dict: UserAPIKeyAuth,
+    llm_router: "Router",
+) -> AutoRouterRoutingTestRequest:
+    if data.saved_model_id is None:
+        return data
+    deployment: Final = llm_router.get_deployment(data.saved_model_id)
+    if deployment is None or deployment.model_info.blocked:
+        raise HTTPException(status_code=404, detail="Saved auto router is unavailable")
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN and deployment.model_info.team_id != data.team_id:
+        raise HTTPException(status_code=403, detail="Saved auto router belongs to a different team")
+    await can_key_call_resolved_model(
+        model=deployment.model_info.team_public_model_name or deployment.model_name,
+        llm_model_list=llm_router.model_list,
+        valid_token=user_api_key_dict,
+        llm_router=llm_router,
+    )
+    params: Final = deployment.litellm_params
+    if classify_strategy_router_model(params.model or "") != "complexity" or params.complexity_router_config is None:
+        raise HTTPException(status_code=400, detail="Saved deployment is not a complexity auto router")
+    return data.model_copy(
+        update=MappingProxyType(
+            {
+                "complexity_router_config": RequestComplexityRouterConfig.model_validate(
+                    params.complexity_router_config
+                ),
+                "default_model": params.complexity_router_default_model,
+                "router_name": deployment.model_name,
+            }
+        )
+    )
+
+
+@router.post(
     "/auto_router/test_routing",
     tags=["model management"],  # mutable-ok: fastapi's decorator signature types tags as a list
     dependencies=[Depends(user_api_key_auth)],  # mutable-ok: fastapi's decorator signature types dependencies as a list
@@ -600,6 +683,9 @@ class _SessionAggRow(BaseModel):
     total_tokens: int
     spend: float
     saved_spend: float
+    savings_estimated_turns: int = 0
+    savings_estimated_actual_spend: float = 0.0
+    savings_estimated_saved_spend: float = 0.0
     classifier_cost: float
     classifier_cost_recorded_turns: int
     session_seconds: float
@@ -626,9 +712,19 @@ def _cache_bucket(turns: int, hits: int) -> AutoRouterCacheBucket:
     return AutoRouterCacheBucket(turns=turns, hits=hits, hit_rate_pct=_pct(hits, turns))
 
 
+def _savings_cohort(
+    turns: int, estimated_turns: int, actual_spend: float, saved_spend: float
+) -> tuple[float | None, float | None]:
+    if turns > 0 and estimated_turns == 0:
+        return None, None
+    return saved_spend, actual_spend + saved_spend
+
+
 def _benchmark_totals(row: _SessionAggRow) -> AutoRouterBenchmarkTotals:
     return_misses: Final = row.return_turns - row.return_hits
-    baseline_spend: Final = row.spend + row.saved_spend
+    saved_spend, baseline_spend = _savings_cohort(
+        row.turns, row.savings_estimated_turns, row.savings_estimated_actual_spend, row.savings_estimated_saved_spend
+    )
     sessions: Final = row.sessions
     return AutoRouterBenchmarkTotals(
         sessions=sessions,
@@ -637,11 +733,15 @@ def _benchmark_totals(row: _SessionAggRow) -> AutoRouterBenchmarkTotals:
         avg_session_seconds=row.session_seconds / sessions if sessions else 0.0,
         avg_tokens_per_session=row.total_tokens / sessions if sessions else 0.0,
         spend=row.spend,
-        saved_spend=row.saved_spend,
+        savings_estimated_turns=row.savings_estimated_turns,
+        savings_estimated_actual_spend=row.savings_estimated_actual_spend,
+        saved_spend=saved_spend,
         classifier_cost=row.classifier_cost if row.classifier_cost_recorded_turns == row.turns else None,
         baseline_spend=baseline_spend,
-        saved_pct=_pct(row.saved_spend, baseline_spend),
-        saved_per_session=row.saved_spend / sessions if sessions else 0.0,
+        saved_pct=_pct(saved_spend, baseline_spend) if saved_spend is not None and baseline_spend is not None else None,
+        saved_per_session=(row.savings_estimated_saved_spend / sessions if sessions else 0.0)
+        if row.savings_estimated_turns == row.turns
+        else None,
         cache=AutoRouterCacheStats(
             coverage_pct=_pct(row.covered_turns, row.turns),
             hit_rate_pct=_pct(row.cache_hits, row.covered_turns),
@@ -671,6 +771,8 @@ def _benchmark_group(row: _SessionAggRow) -> AutoRouterBenchmarkGroup:
         avg_tokens_per_session=totals.avg_tokens_per_session,
         spend=totals.spend,
         saved_spend=totals.saved_spend,
+        savings_estimated_turns=totals.savings_estimated_turns,
+        savings_estimated_actual_spend=totals.savings_estimated_actual_spend,
         classifier_cost=totals.classifier_cost,
         baseline_spend=totals.baseline_spend,
         saved_pct=totals.saved_pct,
@@ -702,6 +804,9 @@ def _summed_agg_row(rows: Sequence[_SessionAggRow]) -> _SessionAggRow:
         total_tokens=sum(row.total_tokens for row in rows),
         spend=sum(row.spend for row in rows),
         saved_spend=sum(row.saved_spend for row in rows),
+        savings_estimated_turns=sum(row.savings_estimated_turns for row in rows),
+        savings_estimated_actual_spend=sum(row.savings_estimated_actual_spend for row in rows),
+        savings_estimated_saved_spend=sum(row.savings_estimated_saved_spend for row in rows),
         classifier_cost=sum(row.classifier_cost for row in rows),
         classifier_cost_recorded_turns=sum(row.classifier_cost_recorded_turns for row in rows),
         session_seconds=sum(row.session_seconds for row in rows),
@@ -768,14 +873,18 @@ async def get_auto_router_benchmarks(
     ] = None,
     end_date: Annotated[str | None, Query(description="YYYY-MM-DD UTC, inclusive (defaults to today)")] = None,
     api_key: Annotated[str | None, Query(description="Filter to one virtual key token hash")] = None,
+    user_id: Annotated[
+        str | None, Query(min_length=1, description="Filter to one canonical internal user recorded on each turn")
+    ] = None,
 ) -> AutoRouterBenchmarksResponse:
     """
     Benchmarks for the auto-router dashboard: session shape, savings against the configured
     baseline, and prompt-caching behaviour bucketed by what the router did.
 
-    Reads the LiteLLM_AutoRouterSession rollup, folded once per request at spend-write time,
-    so this endpoint never scans LiteLLM_SpendLogs. A session is in the window when it
-    overlaps it: its last turn is on or after start_date and its first turn is on or before
+    Reads session rollups folded once per request at spend-write time, so this endpoint
+    never scans LiteLLM_SpendLogs. A user filter selects only turns attributed to that
+    internal user when written; older key-only history remains outside user views. A session
+    is in the window when it overlaps it: its last turn is on or after start_date and its first turn is on or before
     end_date. Overall hit rate is over telemetry-bearing turns; each bucket's hit rate is
     over that bucket's turns.
 
@@ -805,6 +914,7 @@ async def get_auto_router_benchmarks(
         start_day.isoformat(),
         (end_day + timedelta(days=1)).isoformat(),
         api_key,
+        user_id,
     )
     rows: Final = _SESSION_AGG_ROWS.validate_python(raw_rows or ())
     groups: Final = (
@@ -851,6 +961,9 @@ async def get_auto_router_session(
         raise HTTPException(
             status_code=404, detail=f"No auto-routed turns recorded for session {session_id!r} under this key"
         )
+    saved_spend, baseline_spend = _savings_cohort(
+        row.turns, row.savings_estimated_turns, row.savings_estimated_actual_spend, row.savings_estimated_saved_spend
+    )
     return AutoRouterSessionResponse(
         session_id=session_id,
         router_name=row.router_name,
@@ -858,10 +971,13 @@ async def get_auto_router_session(
         turns=row.turns,
         last_model=row.last_model,
         spend=row.spend,
-        saved_spend=row.saved_spend,
-        baseline_spend=row.spend + row.saved_spend,
+        savings_estimated_turns=row.savings_estimated_turns,
+        savings_estimated_actual_spend=row.savings_estimated_actual_spend,
+        saved_spend=saved_spend,
+        baseline_spend=baseline_spend if row.savings_estimated_turns == row.turns else None,
+        savings_estimated_baseline_spend=baseline_spend,
         baseline_model=row.baseline_model,
-        baseline_models=row.baseline_models,
+        baseline_models=row.savings_estimated_baseline_models,
     )
 
 
@@ -1255,6 +1371,10 @@ def _slices(rows: Sequence[_AttemptAggRow]) -> tuple[ShadowEvalSlice, ...]:
     )
 
 
+def _leg_group_id(leg: "_LegRow") -> str:
+    return leg.group_id
+
+
 class _LegRow(BaseModel):
     """One LiteLLM_ShadowEvalJob row, validated off the untyped prisma record. A row is
     one target's leg of a job; the legs of a job share group_id and identical config,
@@ -1362,7 +1482,7 @@ def _target_labels(
     """Display labels by (target_type, target_id): a key's (alias, masked name), a
     team's (alias, None), a user's (email, None)."""
     return MappingProxyType(
-        {  # mutable-ok: MappingProxyType needs a dict to wrap
+        {
             key: value
             for key, value in chain(
                 ((("key", row.token), (row.key_alias, row.key_name)) for row in key_rows),
@@ -1462,7 +1582,7 @@ async def _shadow_eval_results(
         await _query_raw(prisma_client, _ATTEMPT_AGG_BY_LEG_SQL, leg_ids) or ()
     )
     verdicts_by_target: Final[Mapping[tuple[str, str], ShadowEvalSlice]] = MappingProxyType(
-        {  # mutable-ok: MappingProxyType needs a dict to wrap
+        {
             target_by_leg[slice.group]: slice.model_copy(
                 update={"group": target_by_leg[slice.group][1]}  # mutable-ok: pydantic update payload
             )
@@ -1674,7 +1794,7 @@ async def start_shadow_eval(
                     "id": leg_id,
                     "target_type": target_type,
                     "target_id": target_id,
-                }  # mutable-ok: Prisma payload
+                }
                 for leg_id, (target_type, target_id) in zip(leg_ids, requested_targets)
             ]
         )
@@ -1759,10 +1879,7 @@ async def list_shadow_eval_jobs(
         or ()
     )
     by_group: Final[Mapping[str, tuple[_LegRow, ...]]] = MappingProxyType(
-        {
-            group_id: tuple(group)
-            for group_id, group in groupby(sorted(legs, key=attrgetter("group_id")), key=attrgetter("group_id"))
-        }
+        {group_id: tuple(group) for group_id, group in groupby(sorted(legs, key=_leg_group_id), key=_leg_group_id)}
     )
     newest_first: Final = sorted(
         by_group, key=lambda group_id: max(leg.created_at for leg in by_group[group_id]), reverse=True

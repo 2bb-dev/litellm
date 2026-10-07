@@ -71,9 +71,11 @@ def is_anthropic_content_chunk(chunk: object) -> bool:
     ):
         return True
     candidates: Final = (
-        (chunk,) if isinstance(chunk, dict) else
-        tuple(_decoded_sse_data_line(line) for line in chunk.splitlines())
-        if isinstance(chunk, (bytes, bytearray)) else ()
+        (chunk,)
+        if isinstance(chunk, dict)
+        else tuple(_decoded_sse_data_line(line) for line in chunk.splitlines())
+        if isinstance(chunk, (bytes, bytearray))
+        else ()
     )
     return any(
         (isinstance(block.get("type"), str) and block.get("type") not in ("text", "thinking"))
@@ -197,7 +199,7 @@ def _sse_event(event_type: str, payload: Mapping[str, object]) -> bytes:
 
 
 def _incomplete_stream_error_sse_event() -> bytes:
-    return _sse_event(  # mutable-ok: one-shot JSON payload, never mutated after construction
+    return _sse_event(
         "error",
         {"type": "error", "error": {"type": "api_error", "message": INCOMPLETE_STREAM_ERROR_MESSAGE}},
     )
@@ -689,7 +691,7 @@ class BaseAnthropicMessagesStreamingIterator:
         """
         from litellm.proxy.pass_through_endpoints.streaming_handler import PassThroughStreamingHandler
 
-        PassThroughStreamingHandler.schedule_stream_failure_logging(
+        await PassThroughStreamingHandler.schedule_stream_failure_logging(
             litellm_logging_obj=self.litellm_logging_obj,
             endpoint_type=EndpointType.ANTHROPIC,
             request_body=self.request_body,

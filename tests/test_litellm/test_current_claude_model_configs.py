@@ -17,9 +17,7 @@ CURRENT_CLAUDE_MODELS = {
 
 @pytest.mark.parametrize("model", sorted(CURRENT_CLAUDE_MODELS))
 def test_current_claude_cost_and_capabilities_match_backup(model):
-    root_map = json.loads(
-        (Path(__file__).resolve().parents[2] / "model_prices_and_context_window.json").read_text()
-    )
+    root_map = json.loads((Path(__file__).resolve().parents[2] / "model_prices_and_context_window.json").read_text())
     backup_map = GetModelCostMap.load_local_model_cost_map()
     context, output, input_cost, output_cost, cache_read, cache_write, cache_write_1h, always_thinks = (
         CURRENT_CLAUDE_MODELS[model]

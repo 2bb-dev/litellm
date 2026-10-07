@@ -5,11 +5,10 @@ import httpx
 from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel
 
-import litellm
-
 if TYPE_CHECKING:
     from aiohttp import ClientSession
 from litellm.litellm_core_utils.audio_utils.utils import get_audio_file_name
+from litellm.litellm_core_utils.core_helpers import set_provider_response_headers_in_hidden_params
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.base_llm.audio_transcription.transformation import (
     BaseAudioTranscriptionConfig,
@@ -33,11 +32,6 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
         timeout: float | httpx.Timeout,
         extra_headers: Mapping[str, str] | None = None,
     ):
-        """
-        Helper to:
-        - call openai_aclient.audio.transcriptions.with_raw_response when litellm.return_response_headers is True
-        - call openai_aclient.audio.transcriptions.create by default
-        """
         try:
             raw_response = await openai_aclient.audio.transcriptions.with_raw_response.create(
                 **data, timeout=timeout, extra_headers=extra_headers
@@ -56,24 +50,13 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
         timeout: float | httpx.Timeout,
         extra_headers: Mapping[str, str] | None = None,
     ):
-        """
-        Helper to:
-        - call openai_aclient.audio.transcriptions.with_raw_response when litellm.return_response_headers is True
-        - call openai_aclient.audio.transcriptions.create by default
-        """
         try:
-            if litellm.return_response_headers is True:
-                raw_response = openai_client.audio.transcriptions.with_raw_response.create(
-                    **data, timeout=timeout, extra_headers=extra_headers
-                )
-                headers: Final = dict(raw_response.headers)
-                response = raw_response.parse()
-                return headers, response
-            else:
-                response = openai_client.audio.transcriptions.create(
-                    **data, timeout=timeout, extra_headers=extra_headers
-                )
-                return None, response
+            raw_response: Final = openai_client.audio.transcriptions.with_raw_response.create(
+                **data, timeout=timeout, extra_headers=extra_headers
+            )
+            headers: Final = dict(raw_response.headers)
+            response: Final = raw_response.parse()
+            return headers, response
         except Exception as e:
             raise e
 
@@ -144,12 +127,13 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
                 "complete_input_dict": data,
             },
         )
-        _, response = self.make_sync_openai_audio_transcriptions_request(
+        headers, response = self.make_sync_openai_audio_transcriptions_request(
             openai_client=openai_client,
             data=data,
             timeout=timeout,
             extra_headers=extra_headers,
         )
+        logging_obj.model_call_details["response_headers"] = headers
 
         if isinstance(response, BaseModel):
             stringified_response = response.model_dump()
@@ -170,6 +154,7 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
             hidden_params=hidden_params,
             response_type="audio_transcription",
         )
+        set_provider_response_headers_in_hidden_params(final_response, headers)
         return final_response
 
     async def async_audio_transcriptions(
@@ -231,12 +216,14 @@ class OpenAIAudioTranscription(OpenAIChatCompletion):
             actual_model: Final = data.get("model", "whisper-1")
             hidden_params: Final = {"model": actual_model, "custom_llm_provider": "openai"}
 
-            return convert_to_model_response_object(
+            final_response: Final[TranscriptionResponse] = convert_to_model_response_object(
                 response_object=stringified_response,
                 model_response_object=model_response,
                 hidden_params=hidden_params,
                 response_type="audio_transcription",
             )
+            set_provider_response_headers_in_hidden_params(final_response, headers)
+            return final_response
         except Exception as e:
             ## LOGGING
             logging_obj.post_call(
