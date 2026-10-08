@@ -40,12 +40,11 @@ def encode_video_id_with_provider(video_id: str, provider: str, model_id: str | 
     if not provider or not video_id:
         return video_id
 
-    # Try to decode the ID first to check if it's already encoded
-    # This handles the case where Azure/OpenAI return IDs that start with "video_"
-    # but are not yet encoded with provider information
+    # Azure and OpenAI IDs start with "video_" without carrying provider information, so only a decoded
+    # provider proves an ID is encoded. An ID another LiteLLM proxy encoded for a different provider is
+    # wrapped: this proxy must route the job back to its own deployment, and pass the upstream ID on intact.
     decoded: Final = decode_video_id_with_provider(video_id)
-    if decoded.get("custom_llm_provider") is not None:
-        # ID is already encoded, return as-is
+    if decoded.get("custom_llm_provider") == provider:
         return video_id
 
     # ID is not encoded (even if it starts with video_), so encode it

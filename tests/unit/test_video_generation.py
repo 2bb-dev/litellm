@@ -1269,6 +1269,28 @@ def test_encode_video_id_with_provider_handles_azure_video_prefix():
     assert encoded_twice == encoded_id  # Should return the same encoded ID
 
 
+def test_encode_video_id_wraps_an_id_another_proxy_encoded_for_a_different_provider():
+    """A proxy forwarding video jobs to another LiteLLM proxy must route polls back to its own deployment."""
+    from litellm.types.videos.utils import (
+        decode_video_id_with_provider,
+        encode_video_id_with_provider,
+        extract_original_video_id,
+    )
+
+    upstream_id = encode_video_id_with_provider(video_id="task-1", provider="runwayml", model_id="gen4.5")
+    downstream_id = encode_video_id_with_provider(
+        video_id=upstream_id, provider="openai", model_id="runwayml/gen4.5"
+    )
+
+    assert downstream_id != upstream_id
+    decoded = decode_video_id_with_provider(downstream_id)
+    assert decoded.get("custom_llm_provider") == "openai"
+    assert decoded.get("model_id") == "runwayml/gen4.5"
+    assert extract_original_video_id(downstream_id) == upstream_id
+    assert decode_video_id_with_provider(upstream_id).get("video_id") == "task-1"
+    assert encode_video_id_with_provider(video_id=downstream_id, provider="openai") == downstream_id
+
+
 class TestVideoListTransformation:
     """Tests for video list request/response transformation with provider ID encoding."""
 

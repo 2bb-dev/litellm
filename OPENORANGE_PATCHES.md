@@ -53,6 +53,14 @@ Upstream syncs must preserve these behaviors:
   `insufficient_quota` codes trigger quota cooldown and skip retries, including
   through a `litellm_proxy/chatgpt/` sidecar. Native-provider and non-429 error
   policies are unchanged.
+- **Video jobs through a second proxy:** a workspace LiteLLM forwards video
+  jobs to the central LiteLLM through an OpenAI-compatible deployment. A video
+  ID the upstream proxy encoded for a different provider is wrapped once more
+  with the forwarding deployment, so status, content and remix calls reach that
+  deployment and pass the upstream ID on unchanged. An ID already encoded for
+  the same provider is never wrapped twice. The
+  `test_encode_video_id_wraps_an_id_another_proxy_encoded_for_a_different_provider`
+  test covers both.
 - **Retry privacy and limits:** history is request-local, contains at most four
   flat allowlisted records, and excludes prompts, credentials and exception
   text. A private request counter survives ordinary and streaming fallbacks
