@@ -2086,6 +2086,16 @@ class CostCalculatorUtils:
             cost_calculator as vertex_ai_image_cost_calculator,
         )
 
+        if custom_llm_provider == litellm.LlmProviders.LITELLM_PROXY.value:
+            # OpenOrange: a deployment forwarded to another LiteLLM proxy names the provider that
+            # makes the image (litellm_proxy/openai/gpt-image-2). Price it as that provider is
+            # priced, so a token-priced model is charged by the tokens its answer reports instead
+            # of falling to the per-image default, which knows no token prices.
+            forwarded = model.removeprefix(f"{custom_llm_provider}/")
+            inner_provider, _, inner_model = forwarded.partition("/")
+            if inner_model and inner_provider in litellm.provider_list:
+                custom_llm_provider, model = inner_provider, inner_model
+
         resolved_size: Final = (
             size or completion_response.size or _requested_image_size(optional_params) or "1024-x-1024"
         )

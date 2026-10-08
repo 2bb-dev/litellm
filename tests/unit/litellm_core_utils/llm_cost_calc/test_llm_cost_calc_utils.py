@@ -3680,6 +3680,76 @@ def test_route_image_generation_cost_bills_deployment_image_price_when_unlisted_
     assert cost == pytest.approx(0.10)
 
 
+_FORWARDED_IMAGE_USAGE: Final = ImageUsage(
+    input_tokens=50,
+    input_tokens_details=ImageUsageInputTokensDetails(image_tokens=0, text_tokens=50),
+    output_tokens=1756,
+    total_tokens=1806,
+)
+
+
+@pytest.mark.parametrize(
+    ("forwarded_model", "provider", "direct_model", "model_info"),
+    [
+        ("openai/gpt-image-2", "openai", "gpt-image-2", {
+            "input_cost_per_token": 0.000005, "cache_read_input_token_cost": 0.00000125,
+            "input_cost_per_image_token": 0.000008, "output_cost_per_image_token": 0.00003}),
+        ("litellm_proxy/openai/gpt-image-2", "openai", "gpt-image-2", {
+            "input_cost_per_token": 0.000005, "input_cost_per_image_token": 0.000008, "output_cost_per_image_token": 0.00003}),
+        ("gemini/gemini-3.1-flash-image", "gemini", "gemini-3.1-flash-image", {
+            "input_cost_per_token": 0.0000005, "output_cost_per_token": 0.000003,
+            "output_cost_per_image_token": 0.00006, "output_cost_per_image": 0.0672}),
+    ],
+)
+def test_route_image_generation_cost_prices_a_forwarded_route_as_its_provider(
+    _local_model_cost_map: None,
+    forwarded_model: str,
+    provider: str,
+    direct_model: str,
+    model_info: ModelInfo,
+) -> None:
+    """OpenOrange: a workspace reaches the central proxy's image route as litellm_proxy/<provider>/<model>."""
+
+    def priced(model: str, custom_llm_provider: str) -> float:
+        return CostCalculatorUtils.route_image_generation_cost_calculator(
+            model=model,
+            completion_response=_image_response(usage=_FORWARDED_IMAGE_USAGE),
+            custom_llm_provider=custom_llm_provider,
+            call_type="image_generation",
+            model_info=model_info,
+        )
+
+    forwarded = priced(forwarded_model, "litellm_proxy")
+    assert forwarded > 0
+    assert forwarded == pytest.approx(priced(direct_model, provider))
+
+
+def test_route_image_generation_cost_prices_forwarded_gpt_image_by_its_tokens(_local_model_cost_map: None) -> None:
+    cost = CostCalculatorUtils.route_image_generation_cost_calculator(
+        model="openai/gpt-image-2",
+        completion_response=_image_response(usage=_FORWARDED_IMAGE_USAGE),
+        custom_llm_provider="litellm_proxy",
+        call_type="image_generation",
+        model_info={"input_cost_per_token": 0.000005, "output_cost_per_image_token": 0.00003},
+    )
+
+    assert cost == pytest.approx(50 * 0.000005 + 1756 * 0.00003)
+
+
+def test_route_image_generation_cost_keeps_the_default_for_a_forwarded_alias_without_a_provider(
+    _local_model_cost_map: None,
+) -> None:
+    cost = CostCalculatorUtils.route_image_generation_cost_calculator(
+        model="house-image-model",
+        completion_response=_image_response(num_images=2),
+        custom_llm_provider="litellm_proxy",
+        call_type="image_generation",
+        model_info={"output_cost_per_image": 0.04},
+    )
+
+    assert cost == pytest.approx(0.08)
+
+
 def _batch_rates_model_info(**rates: object) -> ModelInfo:
     return cast(ModelInfo, dict(rates))
 

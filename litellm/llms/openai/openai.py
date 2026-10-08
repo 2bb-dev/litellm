@@ -1479,7 +1479,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         data = {}
         try:
             data = {"model": model, "prompt": prompt, **optional_params}
-            max_retries: Final = data.pop("max_retries", 2)
+            # OpenOrange: the SDK never retries an image generation unless the caller asks. A
+            # retry is a second paid generation, and the router's own retry policy covers the rest.
+            max_retries: Final = data.pop("max_retries", 0)
             if not isinstance(max_retries, int):
                 raise OpenAIError(status_code=422, message="max retries must be an int")
 
