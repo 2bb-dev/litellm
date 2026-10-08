@@ -61,6 +61,19 @@ Upstream syncs must preserve these behaviors:
   the same provider is never wrapped twice. The
   `test_encode_video_id_wraps_an_id_another_proxy_encoded_for_a_different_provider`
   test covers both.
+- **Images through a second proxy:** a workspace LiteLLM reaches the central
+  LiteLLM's image routes as `litellm_proxy/<provider>/<model>`. Their cost is
+  computed by that provider's calculator with the deployment's own prices, so a
+  token-priced model (GPT Image, Gemini) is charged by the tokens its answer
+  reports, as on the central proxy. Without it the per-image default found no
+  price and logged $0, so budgets never counted those images. An alias without a
+  known provider keeps the default. Covered by
+  `test_route_image_generation_cost_prices_a_forwarded_route_as_its_provider`.
+- **Image generation is never retried by the SDK:** the OpenAI image handler
+  builds its client with `max_retries` 0 unless the caller passes one. Each
+  retry is a second paid generation, and a timed-out first attempt can still
+  finish and bill. The router's retry policy decides everything else. Covered by
+  `test_openai_image_generation_retries.py`.
 - **Retry privacy and limits:** history is request-local, contains at most four
   flat allowlisted records, and excludes prompts, credentials and exception
   text. A private request counter survives ordinary and streaming fallbacks
