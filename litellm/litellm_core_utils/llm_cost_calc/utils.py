@@ -2060,6 +2060,7 @@ class CostCalculatorUtils:
         optional_params: dict | None = None,
         call_type: str | None = None,
         model_info: ModelInfo | None = None,
+        deployment_model: str | None = None,
     ) -> float:
         """
         Route the image generation cost calculator based on the custom_llm_provider
@@ -2090,11 +2091,15 @@ class CostCalculatorUtils:
             # OpenOrange: a deployment forwarded to another LiteLLM proxy names the provider that
             # makes the image (litellm_proxy/openai/gpt-image-2). Price it as that provider is
             # priced, so a token-priced model is charged by the tokens its answer reports instead
-            # of falling to the per-image default, which knows no token prices.
-            forwarded = model.removeprefix(f"{custom_llm_provider}/")
-            inner_provider, _, inner_model = forwarded.partition("/")
+            # of falling to the per-image default, which knows no token prices. `model` may be
+            # the deployment's ID; `deployment_model` is the model the deployment names.
+            prefix = f"{custom_llm_provider}/"
+            inner_provider, _, inner_model = (deployment_model or model).removeprefix(prefix).partition("/")
             if inner_model and inner_provider in litellm.provider_list:
-                custom_llm_provider, model = inner_provider, inner_model
+                named = model.removeprefix(prefix)
+                if named.startswith(f"{inner_provider}/"):
+                    model = named.split("/", 1)[1]
+                custom_llm_provider = inner_provider
 
         resolved_size: Final = (
             size or completion_response.size or _requested_image_size(optional_params) or "1024-x-1024"

@@ -1437,6 +1437,10 @@ def completion_cost(
         ]
         if model is not None:
             potential_model_names.append(model)
+        # OpenOrange: the model the deployment names. A route forwarded to another proxy
+        # (litellm_proxy/<provider>/<model>) is priced as its provider for every candidate name,
+        # the deployment ID included.
+        deployment_model: Final = model
 
         for idx, model in enumerate(potential_model_names):
             try:
@@ -1562,6 +1566,7 @@ def completion_cost(
                         optional_params=optional_params,
                         call_type=call_type,
                         model_info=_deployment_model_info(litellm_logging_obj, custom_pricing, router_model_id),
+                        deployment_model=deployment_model,
                     )
                 elif call_type in _VIDEO_CALL_TYPES:
                     ### VIDEO GENERATION COST CALCULATION ###
