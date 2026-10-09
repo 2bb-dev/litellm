@@ -61,6 +61,19 @@ Upstream syncs must preserve these behaviors:
   the same provider is never wrapped twice. The
   `test_encode_video_id_wraps_an_id_another_proxy_encoded_for_a_different_provider`
   test covers both.
+- **xAI video jobs:** `xai/grok-imagine-video` serves the OpenAI video API
+  (create, status, content) from xAI's `/v1/videos/generations` and
+  `/v1/videos/{request_id}`. Every create names its seconds and resolution, so
+  the per-second price charged at create (`output_cost_per_second_<resolution>`)
+  is for what xAI renders. Seconds outside 1 to 15, a resolution the model can't
+  render, an unknown aspect ratio, or no prompt and no image are refused before
+  xAI accepts a job that would fail. Only fields the per-second price covers are
+  sent: stored outputs, upload URLs, reference media and keyframes stay out.
+  Polls and downloads carry no usage and are never priced; the download fetches
+  xAI's temporary file URL without the API key. A deployment forwarding video to
+  another LiteLLM proxy keeps the `video_resolution` that proxy priced, so its
+  own cost uses the same tier. Covered by
+  `tests/unit/llms/xai/videos/test_xai_video_transformation.py`.
 - **Images through a second proxy:** a workspace LiteLLM reaches the central
   LiteLLM's image routes as `litellm_proxy/<provider>/<model>`. Their cost is
   computed by that provider's calculator with the deployment's own prices, so a
@@ -152,6 +165,7 @@ Without the flag, existing exclusive thresholds are unchanged.
 - `tests/test_litellm/proxy/db/test_db_spend_update_writer.py`
 - `tests/proxy_unit_tests/test_update_spend.py`
 - `tests/test_litellm/proxy/test_spend_log_cleanup.py`
+- `tests/unit/llms/xai/videos/test_xai_video_transformation.py`
 
 ## Stable v1.101.0 integration
 
