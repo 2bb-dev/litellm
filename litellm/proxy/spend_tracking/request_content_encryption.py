@@ -10,13 +10,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Final, Literal, TypedDict
 from uuid import UUID
 
 from joserfc import jwe
 from joserfc.jwk import RSAKey
 from joserfc.registry import HeaderParameter
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, field_validator
+from typing_extensions import ReadOnly
 
 from litellm.litellm_core_utils.request_content_mode import (
     CONFIG_ENV,
@@ -28,6 +29,37 @@ INSTANCE_ENV = "OPENORANGE_INSTANCE_UID"
 CONTENT_FORMAT = "openorange.request-log.v1"
 MAX_CONTENT_BYTES = 16 * 1024 * 1024
 MAX_CONFIG_BYTES = 16 * 1024
+# Physical provider/spend-row ID: same UTF-8 byte bound as the consuming API.
+REQUEST_LOG_MAX_RECORD_ID_BYTES: Final = 2048
+
+
+class _ProtectedHeader(TypedDict):
+    alg: ReadOnly[Literal["RSA-OAEP-256"]]
+    enc: ReadOnly[Literal["A256GCM"]]
+    typ: ReadOnly[Literal["openorange-request-content+jwe"]]
+    kid: ReadOnly[str]
+    v: ReadOnly[Literal[1]]
+    instanceUid: ReadOnly[str]
+    purpose: ReadOnly[Literal["request-log"]]
+    recordId: ReadOnly[str]
+
+
+def _protected_header(instance_uid: str, kid: str, record_id: str) -> _ProtectedHeader:
+    return {
+        "alg": "RSA-OAEP-256",
+        "enc": "A256GCM",
+        "typ": "openorange-request-content+jwe",
+        "kid": kid,
+        "v": 1,
+        "instanceUid": instance_uid,
+        "purpose": "request-log",
+        "recordId": record_id,
+    }
+
+
+# joserfc bounds the encoded header on decrypt. JSON expands at most 3x UTF-8.
+_HEADER_OVERHEAD: Final = len(json.dumps(_protected_header("0" * 36, "A" * 43, ""), separators=(",", ":")))
+REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES: Final = 4 * ((3 * REQUEST_LOG_MAX_RECORD_ID_BYTES + _HEADER_OVERHEAD + 2) // 3)
 _B64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -105,7 +137,7 @@ def jwe_registry() -> jwe.JWERegistry:
         algorithms=("RSA-OAEP-256", "A256GCM"),
     )
     registry.max_ciphertext_length = MAX_CONTENT_BYTES
-    registry.max_protected_header_length = 2048
+    registry.max_protected_header_length = REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES
     return registry
 
 
@@ -138,23 +170,22 @@ def parse_public_config(raw: bytes, instance_uid: str) -> EncryptionKey | Captur
 def encrypt_content(
     key: EncryptionKey, record_id: str, content: Mapping[str, JsonValue]
 ) -> ContentEnvelope | CaptureFailure:
-    if not 1 <= len(record_id) <= 1024 or any(ord(char) < 32 or ord(char) == 127 for char in record_id):
+    try:
+        record_id_bytes: Final = record_id.encode("utf-8")
+    except UnicodeError:
+        return CaptureFailure("invalid_record_id")
+    if not 1 <= len(record_id_bytes) <= REQUEST_LOG_MAX_RECORD_ID_BYTES or any(
+        ord(char) < 32 or ord(char) == 127 for char in record_id
+    ):
         return CaptureFailure("invalid_record_id")
     try:
         plaintext = json.dumps(content, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         if len(plaintext) > MAX_CONTENT_BYTES:
             return CaptureFailure("content_too_large")
-        protected = {
-            "alg": "RSA-OAEP-256",
-            "enc": "A256GCM",
-            "typ": "openorange-request-content+jwe",
-            "kid": key.kid,
-            "v": 1,
-            "instanceUid": key.instance_uid,
-            "purpose": "request-log",
-            "recordId": record_id,
-        }
+        protected: Final = _protected_header(key.instance_uid, key.kid, record_id)
         token = jwe.encrypt_compact(protected, plaintext, key.key, registry=jwe_registry())
+        if len(token.split(".", 1)[0]) > REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES:
+            return CaptureFailure("encryption_failed")
     except Exception:
         return CaptureFailure("encryption_failed")
     else:

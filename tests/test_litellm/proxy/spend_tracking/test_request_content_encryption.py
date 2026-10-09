@@ -24,6 +24,9 @@ from litellm.proxy.spend_tracking.request_content_encryption import (
     CaptureFailure,
     EncryptionKey,
     RequestContentEncryptor,
+    REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES,
+    _HEADER_OVERHEAD,
+    _protected_header,
     configured_encryptor,
     encrypt_content,
     encryption_readiness,
@@ -85,14 +88,33 @@ def test_python_encrypts_with_public_key_only(protected_config):
     assert content == FIXTURE["content"]
 
 
-@pytest.mark.parametrize("length", [697, 1024])
-def test_wrapped_response_record_id_survives_capture(protected_config, monkeypatch, length):
+@pytest.mark.parametrize(
+    "record_id",
+    [
+        "resp_" + "A" * 692,
+        "resp_" + "A" * 1019,
+        "resp_" + "A" * 1160,
+        "resp_" + "A" * 2043,
+        "é" * 1024,
+        "😀" * 512,
+        "\\" * 2048,
+    ],
+    ids=[
+        "697-ascii",
+        "1024-ascii",
+        "1165-ascii",
+        "2048-ascii",
+        "2048-utf8-bytes",
+        "astral-2048-bytes",
+        "json-escaping-bound",
+    ],
+)
+def test_wrapped_response_record_id_survives_capture(protected_config, monkeypatch, record_id):
     from litellm.proxy import proxy_server
     from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
 
     monkeypatch.setattr(proxy_server, "general_settings", {"store_prompts_in_spend_logs": True})
     response, kwargs = make_call()
-    record_id = "resp_" + "A" * (length - 5)
     response.id = record_id
     raw = get_logging_payload(
         kwargs, response, datetime(2026, 9, 7, tzinfo=timezone.utc), datetime(2026, 9, 7, 0, 0, 1, tzinfo=timezone.utc)
@@ -106,10 +128,64 @@ def test_wrapped_response_record_id_survives_capture(protected_config, monkeypat
     assert header["recordId"] == record_id
     assert CANARY in json.dumps(content)
     assert CANARY not in json.dumps(protected, default=str)
-    assert len(envelope["jwe"].split(".")[0]) <= 2048
+    assert len(envelope["jwe"].split(".")[0]) <= REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES
 
 
-@pytest.mark.parametrize("record_id", ["", "r" * 1025, "resp_\ninvalid", "resp_\x7finvalid"])
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [1165, 2048, 2049])
+async def test_long_record_id_writer_retains_identity_and_enqueues_only_protected_content(
+    protected_config, monkeypatch, tmp_path, length
+):
+    from litellm.proxy import proxy_server
+
+    response, kwargs = make_call()
+    response.id = "resp_" + "A" * (length - 5)
+    spool_path = str(tmp_path / "writer.sqlite")
+    spool = SQLiteSpendLogSpool(spool_path)
+    client = SimpleNamespace(
+        _spend_log_spool=spool, _spend_log_transactions_lock=asyncio.Lock(), spend_log_transactions=[]
+    )
+    writer = DBSpendUpdateWriter()
+    writer._batch_database_updates = AsyncMock()
+    monkeypatch.setattr(proxy_server, "prisma_client", client)
+    monkeypatch.setattr(proxy_server, "disable_spend_logs", False)
+    monkeypatch.setattr(proxy_server, "general_settings", {"store_prompts_in_spend_logs": True})
+    await writer.update_database(
+        token="a" * 64,
+        user_id="user-1",
+        end_user_id=None,
+        team_id=None,
+        org_id=None,
+        kwargs=kwargs,
+        completion_response=response,
+        start_time=datetime(2026, 10, 9, tzinfo=timezone.utc),
+        end_time=datetime(2026, 10, 9, 0, 0, 1, tzinfo=timezone.utc),
+        response_cost=0.25,
+    )
+    await asyncio.sleep(0)  # finish the existing accounting task before asserting its copy
+    reopened = SQLiteSpendLogSpool(spool_path)
+    (row,) = (await reopened.peek_batch(10, 100000)).logs
+    assert row["request_id"] == response.id
+    assert row["spend"] == 0.25
+    assert CANARY not in json.dumps(row)
+    marker = json.loads(row["metadata"])["openorange_request_log"]
+    if length <= 2048:
+        assert marker["content_status"] == "encrypted"
+        header, content = decrypt(json.loads(row["proxy_server_request"]))
+        assert header["recordId"] == response.id
+        assert CANARY in json.dumps(content)
+    else:
+        assert marker["content_status"] == "capture_failed"
+        assert marker["failure_code"] == "invalid_record_id"
+        assert row["proxy_server_request"] == "{}"
+    assert writer._batch_database_updates.await_args.kwargs["payload"]["request_id"] == response.id
+
+
+@pytest.mark.parametrize(
+    "record_id",
+    ["", "r" * 2049, "é" * 1024 + "A", "resp_\ninvalid", "resp_\x7finvalid"],
+    ids=["empty", "ascii-over", "utf8-over", "newline", "del"],
+)
 def test_request_record_id_limit_remains_fail_closed(protected_config, record_id):
     encryptor = configured_encryptor()
     assert isinstance(encryptor, RequestContentEncryptor)
@@ -1009,3 +1085,9 @@ async def test_receipt_failure_recovery_uses_private_context_and_durable_ack(
         )
     )
     assert (await spool.stats()).count == 1
+
+
+def test_header_budget_uses_the_actual_maximum_context_constructor():
+    header = _protected_header("0" * 36, "A" * 43, "")
+    assert len(json.dumps(header, separators=(",", ":"))) == _HEADER_OVERHEAD == 226
+    assert REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES == 4 * ((3 * 2048 + _HEADER_OVERHEAD + 2) // 3)
