@@ -188,6 +188,8 @@ class OpenAIVideoConfig(BaseVideoConfig):
         if custom_llm_provider and video_obj.id:
             video_obj.id = encode_video_id_with_provider(video_obj.id, custom_llm_provider, model)
 
+        # Another LiteLLM proxy reports the resolution it priced, so a forwarding deployment prices the same tier.
+        upstream_resolution: Final = video_obj.usage.get("video_resolution") if video_obj.usage else None
         usage_data: Final = {}
         if video_obj:
             if hasattr(video_obj, "seconds") and video_obj.seconds:
@@ -195,6 +197,8 @@ class OpenAIVideoConfig(BaseVideoConfig):
                     usage_data["duration_seconds"] = float(video_obj.seconds)
                 except (ValueError, TypeError):
                     pass
+        if isinstance(upstream_resolution, str) and upstream_resolution:
+            usage_data["video_resolution"] = upstream_resolution
         video_obj.usage = usage_data
 
         return video_obj
