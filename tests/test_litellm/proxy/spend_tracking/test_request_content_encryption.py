@@ -7,10 +7,12 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Final
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from joserfc import jwe
+from joserfc.errors import ExceededSizeError
 from joserfc.jwk import RSAKey
 
 import litellm
@@ -21,12 +23,10 @@ from litellm.proxy.db.spend_log_queue import SQLiteSpendLogSpool
 from litellm.proxy.spend_tracking.request_content_encryption import (
     CONFIG_ENV,
     INSTANCE_ENV,
+    REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES,
     CaptureFailure,
     EncryptionKey,
     RequestContentEncryptor,
-    REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES,
-    _HEADER_OVERHEAD,
-    _protected_header,
     configured_encryptor,
     encrypt_content,
     encryption_readiness,
@@ -36,6 +36,9 @@ from litellm.proxy.spend_tracking.request_content_encryption import (
 from litellm.proxy.spend_tracking.request_content_metadata import protect_spend_payload, safe_metadata
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures/browser_jwe_test_only.json").read_text())
+REQUEST_ID_FIXTURE: Final = json.loads(
+    (Path(__file__).parent / "fixtures/request_id_contract_test_only.json").read_text()
+)
 CANARY = "SYNTHETIC_SECRET_DO_NOT_RETAIN_IN_PLAINTEXT with spaces"
 
 
@@ -143,13 +146,16 @@ async def test_long_record_id_writer_retains_identity_and_enqueues_only_protecte
     spool_path = str(tmp_path / "writer.sqlite")
     spool = SQLiteSpendLogSpool(spool_path)
     client = SimpleNamespace(
-        _spend_log_spool=spool, _spend_log_transactions_lock=asyncio.Lock(), spend_log_transactions=[]
+        _spend_log_spool=spool,
+        _spend_log_transactions_lock=asyncio.Lock(),
+        spend_log_transactions=[],
+        get_request_status=lambda payload: payload["status"],
     )
     writer = DBSpendUpdateWriter()
-    writer._batch_database_updates = AsyncMock()
     monkeypatch.setattr(proxy_server, "prisma_client", client)
     monkeypatch.setattr(proxy_server, "disable_spend_logs", False)
     monkeypatch.setattr(proxy_server, "general_settings", {"store_prompts_in_spend_logs": True})
+    running_before: Final = asyncio.all_tasks()
     await writer.update_database(
         token="a" * 64,
         user_id="user-1",
@@ -162,7 +168,7 @@ async def test_long_record_id_writer_retains_identity_and_enqueues_only_protecte
         end_time=datetime(2026, 10, 9, 0, 0, 1, tzinfo=timezone.utc),
         response_cost=0.25,
     )
-    await asyncio.sleep(0)  # finish the existing accounting task before asserting its copy
+    await asyncio.gather(*(asyncio.all_tasks() - running_before))
     reopened = SQLiteSpendLogSpool(spool_path)
     (row,) = (await reopened.peek_batch(10, 100000)).logs
     assert row["request_id"] == response.id
@@ -178,13 +184,12 @@ async def test_long_record_id_writer_retains_identity_and_enqueues_only_protecte
         assert marker["content_status"] == "capture_failed"
         assert marker["failure_code"] == "invalid_record_id"
         assert row["proxy_server_request"] == "{}"
-    assert writer._batch_database_updates.await_args.kwargs["payload"]["request_id"] == response.id
 
 
 @pytest.mark.parametrize(
     "record_id",
-    ["", "r" * 2049, "é" * 1024 + "A", "resp_\ninvalid", "resp_\x7finvalid"],
-    ids=["empty", "ascii-over", "utf8-over", "newline", "del"],
+    ["", "r" * 2049, "é" * 1024 + "A", "resp_\ninvalid", "resp_\x7finvalid", "resp_\ud800"],
+    ids=["empty", "ascii-over", "utf8-over", "newline", "del", "lone-high-surrogate"],
 )
 def test_request_record_id_limit_remains_fail_closed(protected_config, record_id):
     encryptor = configured_encryptor()
@@ -1087,7 +1092,59 @@ async def test_receipt_failure_recovery_uses_private_context_and_durable_ack(
     assert (await spool.stats()).count == 1
 
 
-def test_header_budget_uses_the_actual_maximum_context_constructor():
-    header = _protected_header("0" * 36, "A" * 43, "")
-    assert len(json.dumps(header, separators=(",", ":"))) == _HEADER_OVERHEAD == 226
-    assert REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES == 4 * ((3 * 2048 + _HEADER_OVERHEAD + 2) // 3)
+def test_maximum_utf8_record_id_round_trips_with_maximum_key_and_instance_context() -> None:
+    key: Final = EncryptionKey(
+        "ffffffff-ffff-ffff-ffff-ffffffffffff", FIXTURE["publicKey"]["kid"], RSAKey.import_key(FIXTURE["publicKey"])
+    )
+    record_id: Final = "é" * 1024
+    assert len(key.instance_uid) == 36
+    assert len(key.kid) == 43
+    assert len(record_id.encode("utf-8")) == 2048
+    envelope: Final = encrypt_content(key, record_id, {"v": 1})
+    assert not isinstance(envelope, CaptureFailure)
+    assert len(envelope["jwe"].split(".")[0]) <= REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES
+    header, content = decrypt(envelope)
+    assert header == {
+        "alg": "RSA-OAEP-256",
+        "enc": "A256GCM",
+        "typ": "openorange-request-content+jwe",
+        "kid": key.kid,
+        "v": 1,
+        "instanceUid": key.instance_uid,
+        "purpose": "request-log",
+        "recordId": record_id,
+    }
+    assert content == {"v": 1}
+    assert encrypt_content(key, record_id + "A", {"v": 1}) == CaptureFailure("invalid_record_id")
+
+
+def test_oversized_protected_header_is_rejected_by_writer_and_reader() -> None:
+    key: Final = EncryptionKey(
+        FIXTURE["instanceUid"], FIXTURE["publicKey"]["kid"], RSAKey.import_key(FIXTURE["publicKey"])
+    )
+    envelope: Final = encrypt_content(key, "header-budget", {"v": 1})
+    assert not isinstance(envelope, CaptureFailure)
+    header, _ = decrypt(envelope)
+    oversized_key: Final = EncryptionKey(key.instance_uid, "A" * REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES, key.key)
+    assert encrypt_content(oversized_key, "header-budget", {"v": 1}) == CaptureFailure("encryption_failed")
+    oversized_token: Final = jwe.encrypt_compact(
+        header | {"kid": oversized_key.kid}, b'{"v":1}', key.key, registry=jwe_registry()
+    )
+    assert len(oversized_token.split(".")[0]) > REQUEST_LOG_MAX_PROTECTED_HEADER_BYTES
+    with pytest.raises(ExceededSizeError):
+        jwe.decrypt_compact(oversized_token, RSAKey.import_key(FIXTURE["privateKey"]), registry=jwe_registry())
+
+
+@pytest.mark.parametrize(
+    "vector_index",
+    range(len(REQUEST_ID_FIXTURE["vectors"])),
+    ids=tuple(v["name"] for v in REQUEST_ID_FIXTURE["vectors"]),
+)
+def test_shared_request_id_contract_vectors_decrypt_with_the_fork_reader(vector_index: int) -> None:
+    vector: Final = REQUEST_ID_FIXTURE["vectors"][vector_index]
+    assert REQUEST_ID_FIXTURE["testOnly"] is True
+    assert 1 <= len(vector["recordId"].encode("utf-8")) <= REQUEST_ID_FIXTURE["recordIdMaxUtf8Bytes"]
+    assert len(vector["envelope"]["jwe"].split(".")[0]) <= REQUEST_ID_FIXTURE["maxProtectedHeaderBytes"]
+    header, content = decrypt(vector["envelope"])
+    assert header["recordId"] == vector["recordId"]
+    assert content == FIXTURE["content"]
