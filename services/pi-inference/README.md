@@ -160,12 +160,39 @@ These rates and `pricing_label` are operator-owned **examples**, not authoritati
 catalog or subscription prices; verify your contract before accounting against
 them
 
+A Claude subscription that is out of quota is not load. When Anthropic's 429
+carries `anthropic-ratelimit-unified-status: rejected`, the slot remembers the
+model as exhausted until `anthropic-ratelimit-unified-reset` (unix seconds; five
+minutes when the reset is missing, at most eight days) and answers 429 with
+`x-openorange-subscription-exhausted-until: <reset>` and error code
+`subscription_exhausted`. Until then it answers that model at once, without
+calling Anthropic; other models on the account still ask, since some limits are
+per model. A restart forgets the mark. Every other 429, a 529 and a rejection
+whose reset already passed pass through unchanged and retryable, with
+`retry-after` when Anthropic sent one. Traces record
+`upstream_unified_status` and `subscription_exhausted_until`. The slot's own
+concurrency refusal (more than 16 calls in flight) is a 429 with
+`retry-after: 1`, `x-openorange-pi-slot-at-capacity: 1` and code
+`slot_at_capacity`: the account is full, not out of quota
+
+LiteLLM never retries that answer on the same deployment. Deployments marked
+`model_info.rate_limit_fallback_requires_exhaustion: true` (a proxy's
+subscription accounts) fall back on a 429 or an overload only with that header,
+or when the slot is at capacity: Anthropic's load is retried with backoff on the
+same account and stays there. Other errors fall back as before. The proxy
+repeats the header to its caller when the accounts it reached were out of quota
+or could not answer; when one of them was only busy or full, its answer stands
+
 Async Router groups can opt into a Pi-first policy with
 `model_info.order_fallback_on_rate_limit_only: true` on their ordered deployments
 and `litellm_params.num_retries: 0` on each hop. The policy also rejects caller
-retry overrides. Higher-order routes are allowed only after a pre-content 429,
-including explicit rate-limit SSE errors. Authentication, request errors, unknown
-transport failures and errors after content do not permit a paid hop
+retry overrides. Higher-order routes are allowed only after a pre-content 429
+carrying `x-openorange-subscription-exhausted-until`: no subscription account
+behind the first route can serve the call, and at least one is out of quota.
+Any other 429, overloads, rate limits inside a stream, authentication, request
+errors, unknown transport failures and errors after content do not permit a paid
+hop. The policy assumes `cooldown_time: 0` on its routes: a cooled-down first
+route would send calls to the next order without it
 
 For a shared proxy, `litellm_settings.model_access_alias_map` can map the exact
 Pi transport name to its canonical model name. This affects scope checks and

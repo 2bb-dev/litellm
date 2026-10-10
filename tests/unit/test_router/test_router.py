@@ -126,6 +126,13 @@ from litellm.router_utils.fallback_event_handlers import DISABLE_FALLBACKS_METAD
 
 
 from litellm.router_utils.router_callbacks.track_deployment_metrics import get_deployment_successes_for_current_minute
+from litellm.router_utils.subscription_exhaustion import (
+    PI_SLOT_AT_CAPACITY_HEADER,
+    SUBSCRIPTION_ACCOUNT_FLAG,
+    SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER,
+    subscription_exhausted_until,
+    subscription_exhaustion_headers,
+)
 
 
 from litellm.types.llms.openai import ChatCompletionRequest
@@ -18316,6 +18323,7 @@ async def test_anthropic_messages_pre_content_sse_rate_limit_cools_selected_depl
 
 @pytest.mark.asyncio
 async def test_native_anthropic_messages_pre_content_429_cools_selected_deployment(monkeypatch: pytest.MonkeyPatch):
+    """A rate limit inside the stream says nothing about quota: no paid hop, the deployment still cools down."""
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
     router = Router(
         model_list=[
@@ -18356,10 +18364,10 @@ async def test_native_anthropic_messages_pre_content_429_cools_selected_deployme
             response = await router.aanthropic_messages(
                 model="primary", messages=[{"role": "user", "content": "hi"}], max_tokens=10, stream=True
             )
-            chunks = [chunk async for chunk in response]
+            with pytest.raises(litellm.APIError, match="Too many requests"):
+                _ = [chunk async for chunk in response]
             assert primary_route.call_count == 1
-            assert fallback_route.call_count == 1
-        assert b"fallback answer" in b"".join(chunks)
+            assert fallback_route.call_count == 0
         key = router.cooldown_cache.get_cooldown_cache_key("subscription")
         assert router.cooldown_cache.cooldown_store.get_cache(key=key)["cooldown_time"] == 300
     finally:
@@ -18487,7 +18495,8 @@ async def test_order_paid_fallback_gates_stream_errors(
         else content_payload.replace(b"primary answer", b"paid answer") + b"data: [DONE]\n\n"
     )
     endpoint: Final = "v1/messages" if api_surface == "messages" else "chat/completions"
-    expected_paid_attempts: Final = int(not after_content and error_status == 429)
+    # A stream error carries no "out of quota" signal, so none of them buys the paid hop.
+    expected_paid_attempts: Final = 0
     try:
         with respx.mock as mock:
             primary: Final = mock.post(f"https://central.invalid/{endpoint}", json__model=f"{alias}/pi").mock(
@@ -18594,19 +18603,23 @@ async def test_anthropic_chat_pre_content_sse_error_records_one_failure(monkeypa
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("request_retries", [None, 2])
 @pytest.mark.parametrize(
-    "status,error_type,paid_status,paid_attempts",
+    "status,error_type,exhausted,paid_status,paid_attempts",
     [
-        (200, "", 200, 0),
-        (400, "invalid_request_error", 200, 0),
-        (400, "rate_limit_error", 200, 0),
-        (401, "authentication_error", 200, 0),
-        (403, "permission_error", 200, 0),
-        (429, "rate_limit_error", 200, 1),
-        (429, "rate_limit_error", 429, 1),
-        (429, "rate_limit_error", 502, 1),
-        (502, "api_error", 200, 0),
-        (504, "api_error", 200, 0),
-        (None, "timeout", 200, 0),
+        (200, "", False, 200, 0),
+        (400, "invalid_request_error", False, 200, 0),
+        (400, "rate_limit_error", False, 200, 0),
+        (401, "authentication_error", False, 200, 0),
+        (403, "permission_error", False, 200, 0),
+        # Load: a plain 429 never pays.
+        (429, "rate_limit_error", False, 200, 0),
+        # Every subscription account out of quota: the paid route is tried once.
+        (429, "rate_limit_error", True, 200, 1),
+        (429, "rate_limit_error", True, 429, 1),
+        (429, "rate_limit_error", True, 502, 1),
+        (502, "api_error", False, 200, 0),
+        (504, "api_error", False, 200, 0),
+        (529, "overloaded_error", False, 200, 0),
+        (None, "timeout", False, 200, 0),
     ],
 )
 @pytest.mark.asyncio
@@ -18616,6 +18629,7 @@ async def test_order_paid_fallback_only_on_primary_rate_limit(
     stream: bool,
     status: int | None,
     error_type: str,
+    exhausted: bool,
     paid_status: int,
     paid_attempts: int,
     request_retries: int | None,
@@ -18679,7 +18693,11 @@ async def test_order_paid_fallback_only_on_primary_rate_limit(
         if status is None
         else ok
         if status == 200
-        else httpx.Response(status, json={"error": {"message": "primary failed", "type": error_type}})
+        else httpx.Response(
+            status,
+            headers={SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER: "1800003600"} if exhausted else None,
+            json={"error": {"message": "primary failed", "type": error_type}},
+        )
     )
     paid_result: Final = (
         ok
@@ -18740,15 +18758,17 @@ async def test_order_paid_fallback_only_on_primary_rate_limit(
 
 @pytest.mark.parametrize("api_surface", ["chat", "messages"])
 @pytest.mark.parametrize(
-    "primary_status,error_type,paid_status,paid_attempts",
+    "primary_status,error_type,exhausted,paid_status,paid_attempts",
     [
-        (200, "", 200, 0),
-        (400, "rate_limit_error", 200, 0),
-        (401, "authentication_error", 200, 0),
-        (429, "rate_limit_error", 200, 1),
-        (429, "rate_limit_error", 429, 1),
-        (429, "rate_limit_error", 502, 1),
-        (503, "overloaded_error", 200, 0),
+        (200, "", False, 200, 0),
+        (400, "rate_limit_error", False, 200, 0),
+        (401, "authentication_error", False, 200, 0),
+        (429, "rate_limit_error", False, 200, 0),
+        (429, "rate_limit_error", True, 200, 1),
+        (429, "rate_limit_error", True, 429, 1),
+        (429, "rate_limit_error", True, 502, 1),
+        (503, "overloaded_error", False, 200, 0),
+        (529, "overloaded_error", False, 200, 0),
     ],
 )
 @pytest.mark.asyncio
@@ -18757,6 +18777,7 @@ async def test_order_paid_fallback_across_instance_and_central_routers(
     api_surface: str,
     primary_status: int,
     error_type: str,
+    exhausted: bool,
     paid_status: int,
     paid_attempts: int,
 ):
@@ -18826,6 +18847,7 @@ async def test_order_paid_fallback_across_instance_and_central_routers(
         except openai.APIError as error:
             return httpx.Response(
                 error.status_code,
+                headers=dict(subscription_exhaustion_headers(error)),
                 json={
                     "error": {
                         "message": str(error),
@@ -18844,6 +18866,7 @@ async def test_order_paid_fallback_across_instance_and_central_routers(
                 if primary_status == 200
                 else httpx.Response(
                     primary_status,
+                    headers={SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER: "1800003600"} if exhausted else None,
                     json={"error": {"type": error_type, "message": "primary failed"}},
                 )
             )
@@ -18924,7 +18947,11 @@ async def test_order_paid_fallback_retries_subscription_first_on_next_request(mo
         with respx.mock as mock:
             primary = mock.post("https://subscription.local/v1/chat/completions").mock(
                 side_effect=[
-                    httpx.Response(429, json={"error": {"message": "quota reached", "type": "rate_limit_error"}}),
+                    httpx.Response(
+                        429,
+                        headers={SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER: "1800003600"},
+                        json={"error": {"message": "quota reached", "type": "rate_limit_error"}},
+                    ),
                     httpx.Response(200, json=answer),
                 ]
             )
@@ -19682,3 +19709,433 @@ async def test_registered_pre_routing_callback_denial_stops_routing():
     ):  # test-quality-ok: router reads this global
         with pytest.raises(PermissionError, match="route denied"):
             await router.async_pre_routing_hook(model="callback-route", request_kwargs={})
+
+
+_SUB_ALIAS: Final = "anthropic/claude-opus-5-5"
+_SUB_UNTIL: Final = 1_800_003_600
+_SUB_LATER: Final = 1_800_018_000
+_SUB_MESSAGE: Final = {
+    "id": "msg_1",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-opus-5-5",
+    "content": [{"type": "text", "text": "ok"}],
+    "stop_reason": "end_turn",
+    "stop_sequence": None,
+    "usage": {"input_tokens": 1, "output_tokens": 1},
+}
+_SUB_STREAM: Final = "".join(
+    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+    for event in (
+        {"type": "message_start", "message": {**_SUB_MESSAGE, "content": [], "stop_reason": None}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ok"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
+        {"type": "message_stop"},
+    )
+).encode()
+
+
+def _sub_error(status: int, error_type: str, message: str, headers: Mapping[str, str] | None = None) -> httpx.Response:
+    return httpx.Response(
+        status, headers=dict(headers or {}), json={"type": "error", "error": {"type": error_type, "message": message}}
+    )
+
+
+def _sub_slot_answer(kind: str, stream: bool, until: int = _SUB_UNTIL) -> httpx.Response:
+    match kind:
+        case "ok":
+            if stream:
+                return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=_SUB_STREAM)
+            return httpx.Response(200, json=_SUB_MESSAGE)
+        case "exhausted":
+            return _sub_error(
+                429,
+                "rate_limit_error",
+                "Claude subscription usage limit reached (five_hour)",
+                {SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER: str(until)},
+            )
+        case "busy":
+            return _sub_error(429, "rate_limit_error", "Too many requests", {"retry-after": "1"})
+        case "overloaded":
+            return _sub_error(529, "overloaded_error", "Overloaded")
+        case "full":
+            return _sub_error(
+                429,
+                "rate_limit_error",
+                "Backend concurrency limit reached",
+                {"retry-after": "1", PI_SLOT_AT_CAPACITY_HEADER: "1"},
+            )
+        case "revoked":
+            return _sub_error(401, "authentication_error", "OAuth token has been revoked")
+        case _:
+            return _sub_error(502, "api_error", "Provider request failed")
+
+
+def _sub_accounts_router(count: int) -> Router:
+    names: Final = tuple(f"{_SUB_ALIAS}/pi" if slot == 1 else f"{_SUB_ALIAS}/pi/{slot}" for slot in range(1, count + 1))
+    return Router(
+        model_list=[
+            {
+                "model_name": name,
+                "litellm_params": {
+                    "model": _SUB_ALIAS,
+                    "api_key": "synthetic",
+                    "api_base": f"https://slot{slot}.invalid",
+                    "cooldown_time": 0,
+                },
+                "model_info": {"id": f"claude-opus-5-5-pi-slot{slot}", SUBSCRIPTION_ACCOUNT_FLAG: True},
+            }
+            for slot, name in enumerate(names, start=1)
+        ],
+        fallbacks=[{name: [*names[index + 1 :], *names[:index]]} for index, name in enumerate(names)],
+        num_retries=2,
+        allowed_fails=0,
+        cooldown_time=300,
+    )
+
+
+async def _sub_call(router: Router, model: str, api_surface: str, stream: bool) -> str:
+    request: Final = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}
+    if api_surface == "messages":
+        response = await router.aanthropic_messages(**request, stream=stream)
+        if stream:
+            return b"".join([chunk async for chunk in response]).decode()
+        return response["content"][0]["text"]
+    response = await router.acompletion(**request, stream=stream)
+    if stream:
+        return "".join([chunk.choices[0].delta.content or "" async for chunk in response if chunk.choices])
+    return response.choices[0].message.content
+
+
+@pytest.mark.parametrize("api_surface", ["chat", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "first,second,answered,calls,retry_waits,exhausted_until",
+    [
+        pytest.param("exhausted", "ok", True, (1, 1), 0, None, id="out-of-quota-moves-on-at-once"),
+        pytest.param("busy", "ok", False, (3, 0), 3, None, id="busy-retried-on-its-account"),
+        pytest.param("overloaded", "ok", False, (3, 0), 3, None, id="overload-retried-on-its-account"),
+        pytest.param("exhausted", "exhausted", False, (1, 1), 0, _SUB_UNTIL, id="all-out-of-quota-says-so"),
+        pytest.param("exhausted", "busy", False, (1, 3), 3, None, id="busy-second-account-answers"),
+        pytest.param("broken", "ok", True, (3, 1), 3, None, id="broken-rotates-after-retries"),
+        pytest.param("full", "ok", True, (3, 1), 3, None, id="full-slot-rotates-after-retries"),
+        pytest.param("full", "full", False, (3, 3), 6, None, id="all-full-is-load"),
+        pytest.param("exhausted", "broken", False, (1, 3), 3, _SUB_UNTIL, id="broken-keeps-out-of-quota"),
+        pytest.param("exhausted", "revoked", False, (1, 1), 0, _SUB_UNTIL, id="signed-out-keeps-out-of-quota"),
+        pytest.param("broken", "exhausted", False, (3, 1), 3, _SUB_LATER, id="out-of-quota-after-broken"),
+        pytest.param("exhausted", "full", False, (1, 3), 3, None, id="full-second-account-answers"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_subscription_accounts_rotate_only_when_out_of_quota(
+    monkeypatch: pytest.MonkeyPatch,
+    api_surface: str,
+    stream: bool,
+    first: str,
+    second: str,
+    answered: bool,
+    calls: tuple[int, int],
+    retry_waits: int,
+    exhausted_until: int | None,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _sub_accounts_router(2)
+    try:
+        with (
+            patch.object(router, "_time_to_sleep_before_retry", return_value=0) as wait,
+            respx.mock(assert_all_called=False) as mock,
+        ):
+            slot1: Final = mock.post("https://slot1.invalid/v1/messages").mock(
+                return_value=_sub_slot_answer(first, stream)
+            )
+            slot2: Final = mock.post("https://slot2.invalid/v1/messages").mock(
+                return_value=_sub_slot_answer(second, stream, until=_SUB_LATER)
+            )
+            if answered:
+                assert "ok" in await _sub_call(router, f"{_SUB_ALIAS}/pi", api_surface, stream)
+            else:
+                with pytest.raises(openai.APIError) as raised:
+                    await _sub_call(router, f"{_SUB_ALIAS}/pi", api_surface, stream)
+                assert subscription_exhausted_until(raised.value) == exhausted_until
+                assert raised.value.status_code == (500 if first == "overloaded" else 429)
+            assert (slot1.call_count, slot2.call_count) == calls
+            assert wait.call_count == retry_waits
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("api_surface", ["chat", "messages"])
+@pytest.mark.parametrize(
+    "kinds,calls,exhausted_slot",
+    [
+        pytest.param(("exhausted", "busy", "exhausted"), (1, 3, 1), None, id="busy-between-out-of-quota"),
+        pytest.param(("exhausted", "broken", "busy"), (1, 3, 3), None, id="busy-behind-broken"),
+        pytest.param(("exhausted", "busy", "broken"), (1, 3, 3), None, id="broken-behind-busy"),
+        pytest.param(("revoked", "exhausted", "full"), (1, 1, 3), None, id="full-behind-out-of-quota"),
+        pytest.param(("exhausted", "broken", "exhausted"), (1, 3, 1), 1, id="no-load-first-out-of-quota"),
+        pytest.param(("broken", "exhausted", "revoked"), (3, 1, 1), 2, id="out-of-quota-between-broken"),
+        pytest.param(("broken", "broken", "exhausted"), (3, 3, 1), 3, id="out-of-quota-last"),
+        pytest.param(("exhausted", "broken", "full", "broken"), (1, 3, 3, 3), None, id="four-accounts-one-walk"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_subscription_accounts_answer_the_same_in_any_order(
+    monkeypatch: pytest.MonkeyPatch,
+    api_surface: str,
+    kinds: tuple[str, ...],
+    calls: tuple[int, ...],
+    exhausted_slot: int | None,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _sub_accounts_router(len(kinds))
+    try:
+        with (
+            patch.object(router, "_time_to_sleep_before_retry", return_value=0),
+            respx.mock(assert_all_called=False) as mock,
+        ):
+            routes: Final = tuple(
+                mock.post(f"https://slot{slot}.invalid/v1/messages").mock(
+                    return_value=_sub_slot_answer(kind, False, until=_SUB_UNTIL + slot)
+                )
+                for slot, kind in enumerate(kinds, start=1)
+            )
+            with pytest.raises(openai.APIError) as raised:
+                await _sub_call(router, f"{_SUB_ALIAS}/pi", api_surface, stream=False)
+            assert subscription_exhausted_until(raised.value) == (
+                None if exhausted_slot is None else _SUB_UNTIL + exhausted_slot
+            )
+            assert tuple(route.call_count for route in routes) == calls
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("api_surface", ["chat", "messages"])
+@pytest.mark.asyncio
+async def test_subscription_accounts_move_on_at_once_when_one_runs_out_of_quota_during_its_retries(
+    monkeypatch: pytest.MonkeyPatch, api_surface: str
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _sub_accounts_router(2)
+    try:
+        with (
+            patch.object(router, "_time_to_sleep_before_retry", return_value=0),
+            respx.mock(assert_all_called=False) as mock,
+        ):
+            slot1: Final = mock.post("https://slot1.invalid/v1/messages").mock(
+                side_effect=[_sub_slot_answer(kind, False) for kind in ("busy", "exhausted", "exhausted")]
+            )
+            slot2: Final = mock.post("https://slot2.invalid/v1/messages").mock(
+                return_value=_sub_slot_answer("ok", False)
+            )
+            assert "ok" in await _sub_call(router, f"{_SUB_ALIAS}/pi", api_surface, stream=False)
+            assert (slot1.call_count, slot2.call_count) == (2, 1)
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize(
+    "first,first_calls,second_calls",
+    [
+        pytest.param("exhausted", 1, 1, id="out-of-quota-moves-on"),
+        pytest.param("busy", 3, 0, id="busy-stays"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_prioritized_subscription_account_behind_its_alias_follows_the_same_rule(
+    monkeypatch: pytest.MonkeyPatch, first: str, first_calls: int, second_calls: int
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": f"{_SUB_ALIAS}/pi/{slot}",
+                "litellm_params": {
+                    "model": _SUB_ALIAS,
+                    "api_key": "synthetic",
+                    "api_base": f"https://slot{slot}.invalid",
+                    "cooldown_time": 0,
+                },
+                "model_info": {"id": f"claude-opus-5-5-pi-slot{slot}", SUBSCRIPTION_ACCOUNT_FLAG: True},
+            }
+            for slot in (1, 2)
+        ],
+        model_group_alias={f"{_SUB_ALIAS}/pi": {"model": f"{_SUB_ALIAS}/pi/2", "hidden": False}},
+        fallbacks=[
+            {f"{_SUB_ALIAS}/pi/2": [f"{_SUB_ALIAS}/pi/1"]},
+            {f"{_SUB_ALIAS}/pi/1": [f"{_SUB_ALIAS}/pi/2"]},
+            {f"{_SUB_ALIAS}/pi": [f"{_SUB_ALIAS}/pi/1"]},
+        ],
+        num_retries=2,
+    )
+    try:
+        with (
+            patch.object(router, "_time_to_sleep_before_retry", return_value=0),
+            respx.mock(assert_all_called=False) as mock,
+        ):
+            prioritized: Final = mock.post("https://slot2.invalid/v1/messages").mock(
+                return_value=_sub_slot_answer(first, False)
+            )
+            other: Final = mock.post("https://slot1.invalid/v1/messages").mock(
+                return_value=_sub_slot_answer("ok", False)
+            )
+            if first == "exhausted":
+                assert await _sub_call(router, f"{_SUB_ALIAS}/pi", "chat", stream=False) == "ok"
+            else:
+                with pytest.raises(openai.APIError) as raised:
+                    await _sub_call(router, f"{_SUB_ALIAS}/pi", "chat", stream=False)
+                assert subscription_exhausted_until(raised.value) is None
+            assert (prioritized.call_count, other.call_count) == (first_calls, second_calls)
+    finally:
+        router.reset()
+
+
+@pytest.mark.asyncio
+async def test_a_subscription_hop_whose_stream_fails_before_content_walks_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _sub_accounts_router(3)
+    failing_stream: Final = (
+        f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {**_SUB_MESSAGE, 'content': []}})}\n\n"
+        'event: error\ndata: {"type": "error", "error": {"type": "api_error", "message": "Internal server error"}}\n\n'
+    ).encode()
+    try:
+        with (
+            patch.object(router, "_time_to_sleep_before_retry", return_value=0),
+            respx.mock(assert_all_called=False) as mock,
+        ):
+            routes: Final = (
+                mock.post("https://slot1.invalid/v1/messages").mock(return_value=_sub_slot_answer("exhausted", True)),
+                mock.post("https://slot2.invalid/v1/messages").mock(
+                    return_value=httpx.Response(
+                        200, headers={"content-type": "text/event-stream"}, content=failing_stream
+                    )
+                ),
+                mock.post("https://slot3.invalid/v1/messages").mock(return_value=_sub_slot_answer("ok", True)),
+            )
+            assert "ok" in await _sub_call(router, f"{_SUB_ALIAS}/pi", "messages", stream=True)
+            assert tuple(route.call_count for route in routes) == (1, 1, 1)
+    finally:
+        router.reset()
+
+
+def _sub_workspace_router(paid_fallback: bool) -> Router:
+    routes: Final = ((1, "claude-opus-5-5-anthropic", "/pi"), (2, "claude-opus-5-5-anthropic-api-key-fallback", ""))
+    return Router(
+        model_list=[
+            {
+                "model_name": _SUB_ALIAS,
+                "litellm_params": {
+                    "model": f"litellm_proxy/{_SUB_ALIAS}{suffix}",
+                    "api_key": "synthetic",
+                    "api_base": "https://central.invalid",
+                    "cooldown_time": 0,
+                    **({"order": order, "num_retries": 0} if paid_fallback else {}),
+                },
+                "model_info": {
+                    "id": deployment_id,
+                    "supported_endpoints": ["/v1/messages"],
+                    **({"order_fallback_on_rate_limit_only": True} if paid_fallback else {}),
+                },
+            }
+            for order, deployment_id, suffix in (routes if paid_fallback else routes[:1])
+        ],
+        num_retries=2,
+    )
+
+
+def _sub_api_key_answer(api_surface: str) -> httpx.Response:
+    if api_surface == "messages":
+        return httpx.Response(200, json={**_SUB_MESSAGE, "content": [{"type": "text", "text": "ok from api"}]})
+    return httpx.Response(
+        200,
+        json={
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": _SUB_ALIAS,
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "ok from api"}, "finish_reason": "stop"}
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+    )
+
+
+def _sub_central_proxy(central: Router, api_surface: str) -> Callable[[httpx.Request], Awaitable[httpx.Response]]:
+    async def answer(request: httpx.Request) -> httpx.Response:
+        payload: Final = json.loads(request.content)
+        if payload["model"] == _SUB_ALIAS:
+            return _sub_api_key_answer(api_surface)
+        call: Final = central.aanthropic_messages if api_surface == "messages" else central.acompletion
+        try:
+            response: Final = await call(**{**payload, "stream": False})
+        except openai.APIError as error:
+            return httpx.Response(
+                error.status_code,
+                headers=dict(subscription_exhaustion_headers(error)),
+                json={"error": {"message": str(error), "type": "rate_limit_error", "code": str(error.status_code)}},
+            )
+        return httpx.Response(200, json=response if api_surface == "messages" else response.model_dump(mode="json"))
+
+    return answer
+
+
+@pytest.mark.parametrize("api_surface", ["chat", "messages"])
+@pytest.mark.parametrize(
+    "first,second,paid_fallback,answer,calls",
+    [
+        pytest.param("exhausted", "ok", True, "ok", (1, 1, 0), id="second-account-answers"),
+        pytest.param("exhausted", "ok", False, "ok", (1, 1, 0), id="second-account-answers-without-fallback"),
+        pytest.param("exhausted", "exhausted", True, "ok from api", (1, 1, 1), id="all-out-of-quota-pays"),
+        pytest.param("exhausted", "exhausted", False, "exhausted", (1, 1, 0), id="all-out-of-quota-told-at-once"),
+        pytest.param("busy", "ok", True, "busy", (3, 0, 0), id="busy-never-pays"),
+        pytest.param("overloaded", "ok", True, "overloaded", (3, 0, 0), id="overload-never-pays"),
+        pytest.param("exhausted", "busy", True, "busy", (1, 3, 0), id="busy-second-account-never-pays"),
+        pytest.param("exhausted", "broken", True, "ok from api", (1, 3, 1), id="broken-second-account-pays"),
+        pytest.param("exhausted", "revoked", True, "ok from api", (1, 1, 1), id="signed-out-second-account-pays"),
+        pytest.param("broken", "exhausted", True, "ok from api", (3, 1, 1), id="out-of-quota-after-broken-pays"),
+        pytest.param("exhausted", "full", True, "full", (1, 3, 0), id="full-second-account-never-pays"),
+        pytest.param("full", "ok", True, "ok", (3, 1, 0), id="full-first-account-moves-on"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_workspace_pays_only_when_central_says_the_accounts_are_out_of_quota(
+    monkeypatch: pytest.MonkeyPatch,
+    api_surface: str,
+    first: str,
+    second: str,
+    paid_fallback: bool,
+    answer: str,
+    calls: tuple[int, int, int],
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    central: Final = _sub_accounts_router(2)
+    workspace: Final = _sub_workspace_router(paid_fallback)
+    endpoint: Final = "v1/messages" if api_surface == "messages" else "chat/completions"
+    try:
+        with (
+            patch.object(central, "_time_to_sleep_before_retry", return_value=0),
+            patch.object(workspace, "_time_to_sleep_before_retry", return_value=0),
+            respx.mock(assert_all_called=False) as mock,
+        ):
+            api_key: Final = mock.post(f"https://central.invalid/{endpoint}", json__model=_SUB_ALIAS).mock(
+                return_value=_sub_api_key_answer(api_surface)
+            )
+            mock.post(f"https://central.invalid/{endpoint}").mock(side_effect=_sub_central_proxy(central, api_surface))
+            slots: Final = tuple(
+                mock.post(f"https://slot{slot}.invalid/v1/messages").mock(
+                    return_value=_sub_slot_answer(kind, False, until=_SUB_LATER if slot == 2 else _SUB_UNTIL)
+                )
+                for slot, kind in ((1, first), (2, second))
+            )
+            if answer.startswith("ok"):
+                assert await _sub_call(workspace, _SUB_ALIAS, api_surface, stream=False) == answer
+            else:
+                with pytest.raises(openai.APIError) as raised:
+                    await _sub_call(workspace, _SUB_ALIAS, api_surface, stream=False)
+                assert (subscription_exhausted_until(raised.value) is not None) == (answer == "exhausted")
+            assert (*(slot.call_count for slot in slots), api_key.call_count) == calls
+    finally:
+        workspace.reset()
+        central.reset()

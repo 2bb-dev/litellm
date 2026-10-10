@@ -33,6 +33,7 @@ from litellm.router_utils.cooldown_handlers import (
 from litellm.router_utils.router_callbacks.track_deployment_metrics import (
     increment_deployment_failures_for_current_minute,
 )
+from litellm.router_utils.subscription_exhaustion import is_subscription_account_group, subscription_walk_verdict
 from litellm.types.router import LiteLLMParamsTypedDict
 
 if TYPE_CHECKING:
@@ -637,6 +638,7 @@ async def run_async_fallback(
         raise original_exception
 
     error_from_fallbacks = original_exception
+    hop_errors: tuple[Exception, ...] = ()  # rebind-ok: grows by one failed hop per loop pass, like fallback_errors
     fallback_errors = (get_fallback_error_info(original_exception),)
     metadata_variable_name: Final = _get_router_metadata_variable_name(
         function_name=getattr(kwargs.get("original_function"), "__name__", None)
@@ -720,6 +722,7 @@ async def run_async_fallback(
             if isinstance(e, RequestRetryLimitError) or is_invalid_encrypted_content_error(e):
                 raise
             error_from_fallbacks = e
+            hop_errors = (*hop_errors, e)
             fallback_errors = fallback_errors + (get_fallback_error_info(e),)
             await log_failure_fallback_event(
                 original_model_group=original_model_group,
@@ -734,7 +737,21 @@ async def run_async_fallback(
                     exception=e,
                     model_call_details=logging_obj.model_call_details,
                 )
-    raise error_from_fallbacks
+    raise _walk_answer(litellm_router, original_model_group, (original_exception, *hop_errors), error_from_fallbacks)
+
+
+def _walk_answer(
+    litellm_router: LitellmRouter,
+    original_model_group: str,
+    errors: tuple[Exception, ...],
+    last_error: Exception,
+) -> Exception:
+    verdict: Final = subscription_walk_verdict(errors)
+    if verdict is None or not isinstance(verdict, Exception):
+        return last_error
+    if not is_subscription_account_group(litellm_router.get_model_list(model_name=original_model_group)):
+        return last_error
+    return verdict
 
 
 async def log_success_fallback_event(original_model_group: str, kwargs: dict, original_exception: Exception):

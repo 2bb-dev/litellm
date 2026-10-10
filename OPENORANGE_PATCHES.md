@@ -53,6 +53,21 @@ Upstream syncs must preserve these behaviors:
   `insufficient_quota` codes trigger quota cooldown and skip retries, including
   through a `litellm_proxy/chatgpt/` sidecar. Native-provider and non-429 error
   policies are unchanged.
+- **Claude subscription quota:** only a Claude subscription account that is out
+  of quota moves a call on. The Pi slot answers it with a 429 carrying
+  `x-openorange-subscription-exhausted-until` (unix seconds) when Anthropic's
+  429 says `anthropic-ratelimit-unified-status: rejected`, and refuses that
+  model without calling Anthropic until the reset. LiteLLM never retries that
+  answer on the same deployment. On groups with
+  `model_info.rate_limit_fallback_requires_exhaustion`, any other 429 and an
+  overload are retried with backoff and never fall back, except the slot's own
+  concurrency refusal (`x-openorange-pi-slot-at-capacity`); other errors fall
+  back as before. The proxy repeats the header to its caller unless an account
+  it reached was only busy or full, and `order_fallback_on_rate_limit_only`
+  (the workspace's paid hop) needs that header. The subscription tests in
+  `tests/unit/test_router/test_router.py` cover both proxies and both API
+  surfaces; `tests/unit/router_utils/test_subscription_exhaustion.py` covers
+  the signal itself.
 - **Video jobs through a second proxy:** a workspace LiteLLM forwards video
   jobs to the central LiteLLM through an OpenAI-compatible deployment. A video
   ID the upstream proxy encoded for a different provider is wrapped once more
@@ -152,6 +167,7 @@ Without the flag, existing exclusive thresholds are unchanged.
 ## Focused Regression Suites
 
 - `tests/test_litellm/router_utils/test_chatgpt_rate_limit.py`
+- `tests/unit/router_utils/test_subscription_exhaustion.py`
 - `tests/test_litellm/test_effective_token_pricing.py`
 - `tests/test_litellm/llms/chatgpt/chat/test_chatgpt_transformation.py`
 - `tests/test_litellm/llms/chatgpt/responses/test_chatgpt_responses_transformation.py`
