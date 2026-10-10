@@ -335,9 +335,9 @@ _MIN_BITS_PER_SECOND: Final = 100
 def audio_duration_seconds(content: bytes) -> float | None:
     """
     Seconds of audio in a file: soundfile's reading of what it opens, except MP3, which is measured by its frames when
-    they make up the file, and the container readers for the rest (MP4, Matroska, AAC, a streamed WAV). A length is never more than the bytes carry
-    at 100 bits a second, below even the silence of FLAC or of Opus with DTX, so a crafted file can't bill hours of
-    audio it couldn't hold
+    they make up the file, and the container readers for the rest (MP4, Matroska, AAC, a streamed WAV). A length is
+    never more than the bytes carry at 100 bits a second, below even the silence of FLAC or of Opus with DTX, so a
+    crafted file can't bill hours of audio it couldn't hold
     """
     seconds: Final = _measured_seconds(content, _soundfile_reading(content))
     return None if seconds is None else min(seconds, len(content) * 8 / _MIN_BITS_PER_SECOND)
