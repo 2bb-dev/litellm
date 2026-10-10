@@ -44,6 +44,10 @@ from litellm.router import (
     _anthropic_stream_should_drop_pre_content_ping,
     _is_retriable_anthropic_status,
 )
+from litellm.router_utils.subscription_exhaustion import (
+    SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER,
+    subscription_exhausted_until,
+)
 from litellm.router_strategy import simple_shuffle
 from litellm.types.router import Deployment, DeploymentTypedDict, LiteLLM_Params, ModelInfo, PreRoutingHookResponse, RetryPolicy
 
@@ -12870,6 +12874,7 @@ async def test_anthropic_messages_pre_content_sse_rate_limit_cools_selected_depl
 
 @pytest.mark.asyncio
 async def test_native_anthropic_messages_pre_content_429_cools_selected_deployment(monkeypatch: pytest.MonkeyPatch):
+    """A rate limit inside the stream says nothing about quota: no paid hop, the deployment still cools down."""
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
     router = Router(
         model_list=[
@@ -12909,10 +12914,10 @@ async def test_native_anthropic_messages_pre_content_429_cools_selected_deployme
             response = await router.aanthropic_messages(
                 model="primary", messages=[{"role": "user", "content": "hi"}], max_tokens=10, stream=True
             )
-            chunks = [chunk async for chunk in response]
+            with pytest.raises(litellm.APIError, match="Too many requests"):
+                _ = [chunk async for chunk in response]
             assert primary_route.call_count == 1
-            assert fallback_route.call_count == 1
-        assert b"fallback answer" in b"".join(chunks)
+            assert fallback_route.call_count == 0
         key = router.cooldown_cache.get_cooldown_cache_key("subscription")
         assert router.cooldown_cache.cooldown_store.get_cache(key=key)["cooldown_time"] == 300
     finally:
@@ -13010,7 +13015,8 @@ async def test_order_paid_fallback_gates_stream_errors(
         if api_surface == "messages" else content_payload.replace(b"primary answer", b"paid answer") + b'data: [DONE]\n\n'
     )
     endpoint: Final = "v1/messages" if api_surface == "messages" else "chat/completions"
-    expected_paid_attempts: Final = int(not after_content and error_status == 429)
+    # A stream error carries no "out of quota" signal, so none of them buys the paid hop.
+    expected_paid_attempts: Final = 0
     try:
         with respx.mock as mock:
             primary: Final = mock.post(f"https://central.invalid/{endpoint}", json__model=f"{alias}/pi").mock(
@@ -15411,19 +15417,23 @@ async def test_router_retry_policy_400_keeps_upstream_error_when_tags_narrow_the
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("request_retries", [None, 2])
 @pytest.mark.parametrize(
-    "status,error_type,paid_status,paid_attempts",
+    "status,error_type,exhausted,paid_status,paid_attempts",
     [
-        (200, "", 200, 0),
-        (400, "invalid_request_error", 200, 0),
-        (400, "rate_limit_error", 200, 0),
-        (401, "authentication_error", 200, 0),
-        (403, "permission_error", 200, 0),
-        (429, "rate_limit_error", 200, 1),
-        (429, "rate_limit_error", 429, 1),
-        (429, "rate_limit_error", 502, 1),
-        (502, "api_error", 200, 0),
-        (504, "api_error", 200, 0),
-        (None, "timeout", 200, 0),
+        (200, "", False, 200, 0),
+        (400, "invalid_request_error", False, 200, 0),
+        (400, "rate_limit_error", False, 200, 0),
+        (401, "authentication_error", False, 200, 0),
+        (403, "permission_error", False, 200, 0),
+        # Load: a plain 429 never pays.
+        (429, "rate_limit_error", False, 200, 0),
+        # Every subscription account out of quota: the paid route is tried once.
+        (429, "rate_limit_error", True, 200, 1),
+        (429, "rate_limit_error", True, 429, 1),
+        (429, "rate_limit_error", True, 502, 1),
+        (502, "api_error", False, 200, 0),
+        (504, "api_error", False, 200, 0),
+        (529, "overloaded_error", False, 200, 0),
+        (None, "timeout", False, 200, 0),
     ],
 )
 @pytest.mark.asyncio
@@ -15433,6 +15443,7 @@ async def test_order_paid_fallback_only_on_primary_rate_limit(
     stream: bool,
     status: int | None,
     error_type: str,
+    exhausted: bool,
     paid_status: int,
     paid_attempts: int,
     request_retries: int | None,
@@ -15496,7 +15507,11 @@ async def test_order_paid_fallback_only_on_primary_rate_limit(
         if status is None
         else ok
         if status == 200
-        else httpx.Response(status, json={"error": {"message": "primary failed", "type": error_type}})
+        else httpx.Response(
+            status,
+            headers={SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER: "1800003600"} if exhausted else None,
+            json={"error": {"message": "primary failed", "type": error_type}},
+        )
     )
     paid_result: Final = (
         ok
@@ -15557,15 +15572,17 @@ async def test_order_paid_fallback_only_on_primary_rate_limit(
 
 @pytest.mark.parametrize("api_surface", ["chat", "messages"])
 @pytest.mark.parametrize(
-    "primary_status,error_type,paid_status,paid_attempts",
+    "primary_status,error_type,exhausted,paid_status,paid_attempts",
     [
-        (200, "", 200, 0),
-        (400, "rate_limit_error", 200, 0),
-        (401, "authentication_error", 200, 0),
-        (429, "rate_limit_error", 200, 1),
-        (429, "rate_limit_error", 429, 1),
-        (429, "rate_limit_error", 502, 1),
-        (503, "overloaded_error", 200, 0),
+        (200, "", False, 200, 0),
+        (400, "rate_limit_error", False, 200, 0),
+        (401, "authentication_error", False, 200, 0),
+        (429, "rate_limit_error", False, 200, 0),
+        (429, "rate_limit_error", True, 200, 1),
+        (429, "rate_limit_error", True, 429, 1),
+        (429, "rate_limit_error", True, 502, 1),
+        (503, "overloaded_error", False, 200, 0),
+        (529, "overloaded_error", False, 200, 0),
     ],
 )
 @pytest.mark.asyncio
@@ -15574,6 +15591,7 @@ async def test_order_paid_fallback_across_instance_and_central_routers(
     api_surface: str,
     primary_status: int,
     error_type: str,
+    exhausted: bool,
     paid_status: int,
     paid_attempts: int,
 ):
@@ -15634,8 +15652,10 @@ async def test_order_paid_fallback_across_instance_and_central_routers(
         try:
             response: Final = await central_call(**(payload | {"num_retries": 2}))
         except openai.APIError as error:
+            until: Final = subscription_exhausted_until(error)
             return httpx.Response(
                 error.status_code,
+                headers={SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER: str(until)} if until is not None else None,
                 json={"error": {"message": str(error), "type": "rate_limit_error" if error.status_code == 429 else "api_error"}},
             )
         return httpx.Response(200, json=response if api_surface == "messages" else response.model_dump(mode="json"))
@@ -15646,7 +15666,9 @@ async def test_order_paid_fallback_across_instance_and_central_routers(
             mock.post(f"https://central.invalid/{endpoint}").mock(side_effect=forward_to_central)
             primary: Final = mock.post("https://pi-backend.invalid/v1/messages").mock(
                 return_value=httpx.Response(200, json=answer) if primary_status == 200 else httpx.Response(
-                    primary_status, json={"error": {"type": error_type, "message": "primary failed"}},
+                    primary_status,
+                    headers={SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER: "1800003600"} if exhausted else None,
+                    json={"error": {"type": error_type, "message": "primary failed"}},
                 )
             )
             paid: Final = mock.post("https://paid-backend.invalid/v1/messages").mock(
@@ -15706,7 +15728,11 @@ async def test_order_paid_fallback_retries_subscription_first_on_next_request(mo
         with respx.mock as mock:
             primary = mock.post("https://subscription.local/v1/chat/completions").mock(
                 side_effect=[
-                    httpx.Response(429, json={"error": {"message": "quota reached", "type": "rate_limit_error"}}),
+                    httpx.Response(
+                        429,
+                        headers={SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER: "1800003600"},
+                        json={"error": {"message": "quota reached", "type": "rate_limit_error"}},
+                    ),
                     httpx.Response(200, json=answer),
                 ]
             )
@@ -15721,6 +15747,48 @@ async def test_order_paid_fallback_retries_subscription_first_on_next_request(mo
     finally:
         router.reset()
 
+
+
+@pytest.mark.parametrize("api_surface", ["chat", "messages"])
+@pytest.mark.parametrize("exhausted,calls", [(True, 1), (False, 3)])
+@pytest.mark.asyncio
+async def test_an_out_of_quota_answer_is_never_retried(
+    monkeypatch: pytest.MonkeyPatch, api_surface: str, exhausted: bool, calls: int
+):
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    alias: Final = "anthropic/claude-opus-5-5"
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": alias,
+                "litellm_params": {
+                    "model": f"litellm_proxy/{alias}/pi",
+                    "api_base": "https://central.invalid",
+                    "api_key": "synthetic",
+                    "cooldown_time": 0,
+                },
+                "model_info": {"id": "subscription", "supported_endpoints": ["/v1/messages"]},
+            }
+        ],
+        num_retries=2,
+    )
+    endpoint: Final = "v1/messages" if api_surface == "messages" else "chat/completions"
+    call: Final = router.aanthropic_messages if api_surface == "messages" else router.acompletion
+    try:
+        with patch.object(router, "_time_to_sleep_before_retry", return_value=0), respx.mock as mock:
+            central: Final = mock.post(f"https://central.invalid/{endpoint}").mock(
+                return_value=httpx.Response(
+                    429,
+                    headers={SUBSCRIPTION_EXHAUSTED_UNTIL_HEADER: "1800003600"} if exhausted else None,
+                    json={"error": {"message": "limit", "type": "rate_limit_error"}},
+                )
+            )
+            with pytest.raises(openai.APIError) as raised:
+                await call(model=alias, messages=[{"role": "user", "content": "hi"}], max_tokens=10)
+            assert central.call_count == calls
+            assert subscription_exhausted_until(raised.value) == (1_800_003_600 if exhausted else None)
+    finally:
+        router.reset()
 
 @pytest.mark.asyncio
 async def test_router_retry_policy_400_never_returns_to_a_deployment_that_already_refused(

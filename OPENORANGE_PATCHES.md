@@ -53,6 +53,18 @@ Upstream syncs must preserve these behaviors:
   `insufficient_quota` codes trigger quota cooldown and skip retries, including
   through a `litellm_proxy/chatgpt/` sidecar. Native-provider and non-429 error
   policies are unchanged.
+- **Claude subscription quota (workspace):** `order_fallback_on_rate_limit_only`
+  (the workspace's paid API-key hop) moves a call to the next order only on a
+  429 carrying `x-openorange-subscription-exhausted-until` (unix seconds), which
+  the central proxy sends once every Claude subscription account it walked is
+  out of quota. A plain 429, an overload or a rate limit inside a stream never
+  pays, and LiteLLM never retries that answer on the same deployment. The
+  central-only parts of this rule (the Pi slot's answer, the walk over
+  subscription accounts and the proxy repeating the header) live on the
+  `openorange` branch. `tests/test_litellm/router_utils/test_subscription_exhaustion.py`
+  covers the signal; the `order_paid_fallback` and
+  `out_of_quota_answer_is_never_retried` cases in
+  `tests/test_litellm/test_router.py` cover the router.
 - **Retry privacy and limits:** history is request-local, contains at most four
   flat allowlisted records, and excludes prompts, credentials and exception
   text. A private request counter survives ordinary and streaming fallbacks
@@ -118,6 +130,7 @@ Without the flag, existing exclusive thresholds are unchanged.
 ## Focused Regression Suites
 
 - `tests/test_litellm/router_utils/test_chatgpt_rate_limit.py`
+- `tests/test_litellm/router_utils/test_subscription_exhaustion.py`
 - `tests/test_litellm/test_effective_token_pricing.py`
 - `tests/test_litellm/llms/chatgpt/chat/test_chatgpt_transformation.py`
 - `tests/test_litellm/llms/chatgpt/responses/test_chatgpt_responses_transformation.py`

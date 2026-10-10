@@ -102,13 +102,15 @@ jobs:
             tests/test_litellm/litellm_core_utils/test_core_helpers.py \
             -k 'retry_history or request_retry_cap or request_retry_state or retry_breadcrumbs or context_window_pre_call_check or registered_pre_routing_callback'
 
-      - name: Check rate-limit-only paid fallback and shared transport budgets
+      - name: Check subscription-exhaustion-only paid fallback and shared transport budgets
         env:
           LITELLM_LOCAL_MODEL_COST_MAP: "True"
         run: |
           uv run --no-sync pytest -q \
             tests/test_litellm/test_router.py \
-            -k 'order_paid_fallback or native_anthropic_messages_paid_fallback_rejects_unapproved_stream_errors or native_anthropic_messages_pre_content_429_cools_selected_deployment'
+            -k 'order_paid_fallback or native_anthropic_messages_paid_fallback_rejects_unapproved_stream_errors or native_anthropic_messages_pre_content_429_cools_selected_deployment or out_of_quota_answer_is_never_retried'
+          uv run --no-sync pytest -q \
+            tests/test_litellm/router_utils/test_subscription_exhaustion.py
           uv run --no-sync pytest -q \
             tests/proxy_unit_tests/test_unit_test_max_model_budget_limiter.py \
             tests/test_litellm/proxy/auth/test_auth_checks.py
