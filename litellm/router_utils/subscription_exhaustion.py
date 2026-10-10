@@ -3,9 +3,10 @@ Claude subscription accounts move a call on only when one is out of quota.
 
 The Pi slot answers an account Anthropic marked out of quota with a 429 carrying
 ``x-openorange-subscription-exhausted-until`` (unix seconds), and its own concurrency refusal
-with ``x-openorange-pi-slot-at-capacity``. Any other 429, and an overload, is load: it stays on
-its account and is never paid for. A walk over the accounts answers the same in any order: any
-load wins, otherwise the first out-of-quota answer, which a proxy repeats to its caller.
+with ``x-openorange-pi-slot-at-capacity``. Any other 429, and an overload, is load: it is retried
+on its account, never starts a walk to the next one and is never paid for. A walk over the accounts
+that met one out of quota answers the same in any order: any load wins, otherwise the first
+out-of-quota answer, which a proxy repeats to its caller.
 """
 
 import re

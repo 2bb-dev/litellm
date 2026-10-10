@@ -19877,18 +19877,19 @@ async def test_subscription_accounts_rotate_only_when_out_of_quota(
         pytest.param(("exhausted", "broken", "exhausted"), (1, 3, 1), 1, id="no-load-first-out-of-quota"),
         pytest.param(("broken", "exhausted", "revoked"), (3, 1, 1), 2, id="out-of-quota-between-broken"),
         pytest.param(("broken", "broken", "exhausted"), (3, 3, 1), 3, id="out-of-quota-last"),
+        pytest.param(("exhausted", "broken", "full", "broken"), (1, 3, 3, 3), None, id="four-accounts-one-walk"),
     ],
 )
 @pytest.mark.asyncio
 async def test_subscription_accounts_answer_the_same_in_any_order(
     monkeypatch: pytest.MonkeyPatch,
     api_surface: str,
-    kinds: tuple[str, str, str],
-    calls: tuple[int, int, int],
+    kinds: tuple[str, ...],
+    calls: tuple[int, ...],
     exhausted_slot: int | None,
 ) -> None:
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
-    router: Final = _sub_accounts_router(3)
+    router: Final = _sub_accounts_router(len(kinds))
     try:
         with (
             patch.object(router, "_time_to_sleep_before_retry", return_value=0),
@@ -19906,6 +19907,30 @@ async def test_subscription_accounts_answer_the_same_in_any_order(
                 None if exhausted_slot is None else _SUB_UNTIL + exhausted_slot
             )
             assert tuple(route.call_count for route in routes) == calls
+    finally:
+        router.reset()
+
+
+@pytest.mark.parametrize("api_surface", ["chat", "messages"])
+@pytest.mark.asyncio
+async def test_subscription_accounts_move_on_at_once_when_one_runs_out_of_quota_during_its_retries(
+    monkeypatch: pytest.MonkeyPatch, api_surface: str
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _sub_accounts_router(2)
+    try:
+        with (
+            patch.object(router, "_time_to_sleep_before_retry", return_value=0),
+            respx.mock(assert_all_called=False) as mock,
+        ):
+            slot1: Final = mock.post("https://slot1.invalid/v1/messages").mock(
+                side_effect=[_sub_slot_answer(kind, False) for kind in ("busy", "exhausted", "exhausted")]
+            )
+            slot2: Final = mock.post("https://slot2.invalid/v1/messages").mock(
+                return_value=_sub_slot_answer("ok", False)
+            )
+            assert "ok" in await _sub_call(router, f"{_SUB_ALIAS}/pi", api_surface, stream=False)
+            assert (slot1.call_count, slot2.call_count) == (2, 1)
     finally:
         router.reset()
 
