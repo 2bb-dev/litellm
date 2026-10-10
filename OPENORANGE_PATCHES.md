@@ -102,6 +102,43 @@ Upstream syncs must preserve these behaviors:
   retry is a second paid generation, and a timed-out first attempt can still
   finish and bill. The router's retry policy decides everything else. Covered by
   `test_openai_image_generation_retries.py`.
+- **Transcriptions are never free:** a transcription priced by the second is
+  billed for its audio's length: the longest of the upload's length and any
+  length the provider reports (`duration`, `usage.seconds`). Upstream read only
+  what soundfile opens, so m4a, mp4 and webm uploads were priced at $0. soundfile
+  still reads what it recognizes, except MP3, which is measured by its frames (a
+  Xing header can state far fewer). `audio_utils/container_duration.py` reads the
+  rest: MP4 (m4a, mov, fragmented recordings), Matroska and WebM (live
+  recordings without sizes or a duration), ADTS AAC and a WAV whose sizes were
+  never written. The length is what a decoder plays: the samples and timestamps
+  of the audio tracks, each track on its own and measured from its first sample
+  (a segment cut from a longer recording keeps its timestamps); an MP4's sample
+  table and the fragments after it add up; a duration a header declares counts
+  only when there are no samples or blocks. An MP3 soundfile opens is measured
+  by its MPEG frames when frames that follow one another make up at least half
+  its bytes; otherwise (a free-format MP3, whose frames this reader doesn't
+  parse) the longer of its frames and soundfile's reading counts, so neither a
+  Xing header that understates nor soundfile's estimate for a VBR file without
+  one decides alone. A file soundfile can't open reads as a stream of ADTS or
+  MPEG frames only when four matching frames come in a row, and then as the
+  longer of the two kinds, so a file holding both bills the longer. Like a
+  decoder, the readers skip stray bytes: a frame stream
+  resyncs only on a valid frame header, so any number of stray stretches costs
+  one search each, and an ID3 tag after the first is stray bytes whose frames
+  still count. EBML integers longer than 8 bytes read as 0, and a file with more
+  Matroska elements (skipped stretches and BlockGroup fields included) or MP4
+  fragments than any recording reads as unmeasured, as does a length soundfile
+  can't tell (2^63 - 1 frames, as for a FLAC written to a pipe). Header lies
+  soundfile trusts (FLAC STREAMINFO, an Ogg granule) and Matroska or MP4 timing
+  lies still bill what they state, unless the provider reports more. A length is
+  never more than the bytes carry at 100 bits a second, below even the silence
+  of FLAC or of Opus with DTX. The length is read
+  once, before the provider is called, and a route priced by the second (not by
+  tokens) refuses audio whose length can't be read with a 400, so it never
+  reaches a provider that would charge for it. Covered by
+  `test_container_duration.py`, `test_audio_utils.py` and the
+  `test_atranscription_*` / `test_transcription_*` cases in
+  `tests/unit/test_main.py`.
 - **Retry privacy and limits:** history is request-local, contains at most four
   flat allowlisted records, and excludes prompts, credentials and exception
   text. A private request counter survives ordinary and streaming fallbacks
@@ -182,6 +219,8 @@ Without the flag, existing exclusive thresholds are unchanged.
 - `tests/proxy_unit_tests/test_update_spend.py`
 - `tests/test_litellm/proxy/test_spend_log_cleanup.py`
 - `tests/unit/llms/xai/videos/test_xai_video_transformation.py`
+- `tests/unit/litellm_core_utils/audio_utils/test_container_duration.py`
+- `tests/unit/litellm_core_utils/test_audio_utils.py`
 
 ## Stable v1.101.0 integration
 

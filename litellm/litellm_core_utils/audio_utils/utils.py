@@ -3,10 +3,17 @@ Utils used for litellm.transcription() and litellm.atranscription()
 """
 
 import hashlib
+import io
+import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final
 
+from litellm.litellm_core_utils.audio_utils.container_duration import (
+    container_duration_seconds,
+    mp3_duration_seconds,
+)
 from litellm.types.files import (
     AUDIO_FILE_TYPES,
     FILE_EXTENSIONS,
@@ -263,17 +270,9 @@ def calculate_request_duration(file: FileTypes) -> float | None:
         file: The audio file (can be file path, bytes, or file-like object)
 
     Returns:
-        Duration in seconds, or None if extraction fails or soundfile is not available
+        Duration in seconds, or None when the length can't be read or isn't positive
     """
     try:
-        import soundfile as sf
-    except ImportError:
-        # soundfile not available, cannot extract duration
-        return None
-
-    try:
-        import io
-
         # Handle different file input types
         file_content: bytes | None = None
 
@@ -295,8 +294,11 @@ def calculate_request_duration(file: FileTypes) -> float | None:
             # Tuple format: (filename, content, optional content_type)
             if len(file) >= 2:
                 content: Final = file[1]
-                if isinstance(content, bytes):
-                    file_content = content
+                if isinstance(content, (bytes, bytearray)):
+                    file_content = bytes(content)
+                elif isinstance(content, os.PathLike):
+                    with open(str(content), "rb") as f:
+                        file_content = f.read()
                 elif hasattr(content, "read") and not isinstance(content, (str, os.PathLike)):
                     # File-like object in tuple
                     current_pos: Final = getattr(content, "tell", lambda: None)()
@@ -320,15 +322,93 @@ def calculate_request_duration(file: FileTypes) -> float | None:
         if file_content is None or not isinstance(file_content, bytes):
             return None
 
-        # Extract duration using soundfile
-        file_object: Final = io.BytesIO(file_content)
-        with sf.SoundFile(file_object) as audio:
-            duration: Final = len(audio) / audio.samplerate
-            return duration
+        return audio_duration_seconds(file_content)
 
     except Exception:
         # Silently fail if duration extraction fails
         return None
+
+
+_MIN_BITS_PER_SECOND: Final = 100
+
+
+def audio_duration_seconds(content: bytes) -> float | None:
+    """
+    Seconds of audio in a file: soundfile's reading of what it opens, except MP3, which is measured by its frames when
+    they make up the file, and the container readers for the rest (MP4, Matroska, AAC, a streamed WAV). A length is
+    never more than the bytes carry at 100 bits a second, below even the silence of FLAC or of Opus with DTX, so a
+    crafted file can't bill hours of audio it couldn't hold
+    """
+    seconds: Final = _measured_seconds(content, _soundfile_reading(content))
+    return None if seconds is None else min(seconds, len(content) * 8 / _MIN_BITS_PER_SECOND)
+
+
+def _measured_seconds(content: bytes, sound: tuple[float, str] | None) -> float | None:
+    if sound is None:
+        return container_duration_seconds(content)
+    seconds, audio_format = sound
+    return mp3_duration_seconds(content, seconds) if audio_format == "MP3" else seconds
+
+
+# libsndfile's frame count for a stream that never stated its length, such as FLAC written to a pipe
+_UNKNOWN_FRAMES: Final = (1 << 63) - 1
+
+
+def _soundfile_reading(content: bytes) -> tuple[float, str] | None:
+    """
+    The length soundfile reads and the format it recognizes, or None when it can't read a positive length or the file
+    never stated one
+    """
+    try:
+        import soundfile
+    except ImportError:
+        return None
+    try:
+        with soundfile.SoundFile(io.BytesIO(content)) as audio:
+            frames: Final = len(audio)
+            seconds: Final[float] = frames / audio.samplerate
+            audio_format: Final[str] = audio.format
+    except (RuntimeError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    measured: Final = frames < _UNKNOWN_FRAMES and math.isfinite(seconds) and seconds > 0
+    return (seconds, audio_format) if measured else None
+
+
+UNMEASURED_AUDIO_MESSAGE: Final = (
+    "The length of this audio could not be read, and this model is billed by the second, so the transcription was"
+    " not sent. Send wav, flac, mp3, ogg, opus, aiff, m4a, mp4, mov, webm, mkv or aac audio"
+)
+_PER_SECOND_PRICES: Final = ("input_cost_per_second", "output_cost_per_second")
+_PER_INPUT_TOKEN_PRICES: Final = ("input_cost_per_audio_token", "input_cost_per_token")
+_PRICES: Final = (*_PER_SECOND_PRICES, *_PER_INPUT_TOKEN_PRICES, "output_cost_per_token")
+
+
+def _positive_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value > 0 else None
+
+
+def _charges(prices: Mapping[str, object], keys: tuple[str, ...]) -> bool:
+    return any(_positive_number(prices.get(key)) is not None for key in keys)
+
+
+def priced_by_audio_length(deployment_prices: Mapping[str, object], cost_map_prices: Mapping[str, object]) -> bool:
+    """
+    Whether a transcription is charged by the second rather than by the tokens the provider reports. The deployment's
+    model_info decides when it states a price, even 0, the cost map otherwise
+    """
+    states_prices: Final = any(deployment_prices.get(key) is not None for key in _PRICES)
+    prices: Final = deployment_prices if states_prices else cost_map_prices
+    return _charges(prices, _PER_SECOND_PRICES) and not _charges(prices, _PER_INPUT_TOKEN_PRICES)
+
+
+def longest_audio_seconds(*readings: object) -> float | None:
+    """
+    The longest positive length among the upload's and every one the provider's answer reports, since the provider
+    bills at least the audio it says it heard
+    """
+    return max((seconds for reading in readings if (seconds := _positive_number(reading)) is not None), default=None)
 
 
 DEFAULT_SPEECH_MEDIA_TYPE: Final = "audio/mpeg"

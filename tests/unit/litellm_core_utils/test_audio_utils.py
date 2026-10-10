@@ -3,8 +3,12 @@ Test the audio utils functionality in litellm_core_utils/audio_utils/utils.py
 """
 
 import io
+import math
 import os
 import tempfile
+import wave
+from pathlib import Path
+from typing import Final
 from unittest.mock import mock_open, patch
 
 import pytest
@@ -15,8 +19,12 @@ from litellm.litellm_core_utils.audio_utils.utils import (
     get_audio_file_content_hash,
     get_audio_file_for_health_check,
     get_audio_file_name,
+    longest_audio_seconds,
+    priced_by_audio_length,
     process_audio_file,
 )
+
+RECORDINGS: Final = Path(__file__).resolve().parent / "audio_utils" / "recordings"
 
 
 class TestProcessAudioFile:
@@ -275,6 +283,188 @@ class TestCalculateRequestDuration:
         assert file_obj.tell() == len(
             wav_header
         ), "File position should be restored to original position"
+
+
+def _wav(seconds: float) -> bytes:
+    buffer: Final = io.BytesIO()
+    with wave.open(buffer, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16000)
+        audio.writeframes(b"\x00\x00" * int(16000 * seconds))
+    return buffer.getvalue()
+
+
+def _named(name: str, content: bytes) -> io.BytesIO:
+    upload: Final = io.BytesIO(content)
+    upload.name = name
+    return upload
+
+
+class TestCalculateRequestDurationOfEveryUploadFormat:
+    @pytest.mark.parametrize("name", sorted(path.name for path in RECORDINGS.glob("tone-1.5s*")))
+    @pytest.mark.parametrize("wrap", (lambda name, content: content, lambda name, content: (name, content), _named))
+    def test_a_recording_of_each_format_reads_its_length(self, name, wrap):
+        seconds: Final = calculate_request_duration(wrap(name, (RECORDINGS / name).read_bytes()))
+
+        assert seconds is not None
+        assert 1.5 <= seconds <= 1.5 + 2 * 1024 / 16000
+
+    def test_a_proxy_upload_is_read_from_its_start_and_left_where_it_was(self):
+        upload: Final = _named("note.webm", (RECORDINGS / "chromium-recorder.webm").read_bytes())
+        upload.seek(100)
+
+        assert calculate_request_duration(upload) == pytest.approx(1.367)
+        assert upload.tell() == 100
+
+    @pytest.mark.parametrize("content", (_wav(0), b"", b"not audio"))
+    def test_audio_without_a_positive_length_reads_none(self, content):
+        assert calculate_request_duration(("note.wav", content)) is None
+
+    def test_a_tuple_may_carry_a_bytearray_or_a_path(self, tmp_path):
+        m4a: Final = (RECORDINGS / "tone-1.5s.m4a").read_bytes()
+        upload: Final = tmp_path / "note.m4a"
+        upload.write_bytes(m4a)
+
+        assert calculate_request_duration(("note.m4a", bytearray(m4a))) == calculate_request_duration(m4a)
+        assert calculate_request_duration(("note.m4a", upload)) == calculate_request_duration(m4a)
+
+    def test_a_streamed_wav_whose_sizes_were_never_written_reads_its_data(self):
+        streamed: Final = _wav(0.5)[:4] + bytes(4) + _wav(0.5)[8:40] + bytes(4) + _wav(0.5)[44:]
+
+        assert calculate_request_duration(("note.wav", streamed)) == pytest.approx(0.5)
+
+    def test_a_length_is_never_more_than_the_bytes_carry_at_100_bits_a_second(self):
+        m4a: Final = (RECORDINGS / "tone-1.5s.m4a").read_bytes()
+        stts: Final = m4a.index(b"stts") + 4
+        hour_long_samples: Final = m4a[: stts + 12] + (16000 * 3600).to_bytes(4, "big") + m4a[stts + 16 :]
+
+        assert calculate_request_duration(hour_long_samples) == pytest.approx(len(m4a) * 8 / 100)
+
+    def test_an_mp3_is_measured_by_its_frames_even_when_its_payload_looks_like_aac(self):
+        mp3: Final = (RECORDINGS / "tone-1.5s.mp3").read_bytes()
+        # 24 kbps at 16 kHz: every frame is 108 bytes. Four 7-byte ADTS frames go inside the fourth one's payload.
+        tiny_adts_frames: Final = b"\xff\xf1\x60\x40\x00\xff\xfc" * 4
+        payload: Final = mp3.index(b"\xff\xf3") + 3 * 108 + 40
+        disguised: Final = mp3[:payload] + tiny_adts_frames + mp3[payload + len(tiny_adts_frames) :]
+
+        assert calculate_request_duration(disguised) == calculate_request_duration(mp3)
+
+    def test_a_format_soundfile_reads_is_measured_by_soundfile_even_when_its_samples_look_like_frames(self):
+        import numpy
+        import soundfile
+
+        mp3: Final = (RECORDINGS / "tone-1.5s.mp3").read_bytes()
+        four_mp3_frames: Final = mp3[mp3.index(b"\xff\xf3\x38") :][: 4 * 108]
+        buffer: Final = io.BytesIO()
+        soundfile.write(buffer, numpy.zeros(16000, dtype="int16"), 16000, format="HTK")
+        # HTK opens with a 12-byte header and no magic, so its samples are all the container readers see
+        htk: Final = buffer.getvalue()
+        disguised: Final = htk[:12] + four_mp3_frames + htk[12 + len(four_mp3_frames) :]
+
+        assert calculate_request_duration(("note.htk", disguised)) == pytest.approx(1.0)
+
+    def test_an_mp3_is_measured_by_its_frames_when_stray_bytes_split_them_and_its_info_header_understates(self):
+        mp3: Final = (RECORDINGS / "tone-1.5s.mp3").read_bytes()
+        info_frames: Final = mp3.index(b"Info") + 8
+        # 10 of its 45 frames, which soundfile reads as 0.276 s once it takes off the encoder delay and padding
+        understated: Final = mp3[:info_frames] + (10).to_bytes(4, "big") + mp3[info_frames + 4 :]
+        # A 180-byte Info frame, then 24 kbps frames at 16 kHz of 108 bytes: a stray byte after every third frame
+        # leaves no four in a row
+        first_frame: Final = mp3.index(b"\xff\xf3")
+        audio: Final = first_frame + 180
+        frames: Final = (understated[first_frame:audio], *(mp3[at : at + 108] for at in range(audio, len(mp3), 108)))
+        split: Final = mp3[:first_frame] + b"".join(
+            b"".join(frames[group : group + 3]) + b"\x00" for group in range(0, len(frames), 3)
+        )
+
+        assert calculate_request_duration(split) == calculate_request_duration(mp3)
+
+    def test_an_mp3_counts_only_its_mpeg_frames_when_its_payloads_read_as_adts_frames(self):
+        mp3: Final = (RECORDINGS / "tone-1.5s.mp3").read_bytes()
+        # Each 108-byte frame after the Info frame keeps its header and carries 14 tiny ADTS frames, 0.9 s of AAC by
+        # their headers, as the payload of an MPEG Layer II file can
+        first_audio_frame: Final = mp3.index(b"\xff\xf3\x38")
+        tiny_adts_frames: Final = b"\xff\xf1\x60\x40\x00\xff\xfc" * 14
+        frames: Final = tuple(
+            mp3[at : at + 4] + tiny_adts_frames + mp3[at + 4 + len(tiny_adts_frames) : at + 108]
+            for at in range(first_audio_frame, len(mp3), 108)
+        )
+
+        assert calculate_request_duration(mp3[:first_audio_frame] + b"".join(frames)) == calculate_request_duration(mp3)
+
+    def test_a_free_format_mp3_reads_soundfiles_length(self):
+        # Its frames state no bitrate, so the frame reader finds only stray bytes that look like frames
+        free_format: Final = (RECORDINGS / "tone-1.5s-freeformat.mp3").read_bytes()
+
+        assert calculate_request_duration(("note.mp3", free_format)) == pytest.approx(1.584, abs=0.001)
+
+    def test_flac_silence_is_not_capped_below_its_length(self):
+        import numpy
+        import soundfile
+
+        buffer: Final = io.BytesIO()
+        soundfile.write(buffer, numpy.zeros(16000 * 30, dtype="int16"), 16000, format="FLAC")
+
+        assert calculate_request_duration(("silence.flac", buffer.getvalue())) == pytest.approx(30)
+
+    def test_a_flac_that_never_stated_its_length_reads_none(self):
+        import numpy
+        import soundfile
+
+        buffer: Final = io.BytesIO()
+        soundfile.write(buffer, numpy.zeros(16000 * 20, dtype="int16"), 16000, format="FLAC")
+        flac: Final = buffer.getvalue()
+        # STREAMINFO keeps the total samples in the low 36 bits of its bytes 10-17, 0 when the encoder wrote to a pipe
+        fields: Final = int.from_bytes(flac[18:26], "big")
+        piped: Final = flac[:18] + (fields >> 36 << 36).to_bytes(8, "big") + flac[26:]
+
+        assert calculate_request_duration(("note.flac", flac)) == pytest.approx(20)
+        assert calculate_request_duration(("note.flac", piped)) is None
+
+
+class TestLongestAudioSeconds:
+    @pytest.mark.parametrize(
+        ("readings", "expected"),
+        [
+            ((1.5,), 1.5),
+            ((1.5, None, None, 2), 2),
+            ((1.5, None, 3.25, None), 3.25),
+            ((9.0, 4.5, 3.25, 2), 9.0),
+            ((None, None, None, 2), 2),
+            ((None, None, None, None), None),
+            ((), None),
+        ],
+    )
+    def test_the_longest_reading_is_billed(self, readings, expected):
+        assert longest_audio_seconds(*readings) == expected
+
+    @pytest.mark.parametrize("reading", (True, -3.0, 0, math.nan, math.inf, "12"))
+    def test_a_reading_that_is_not_a_positive_finite_number_is_ignored(self, reading):
+        assert longest_audio_seconds(1.5, reading) == 1.5
+
+
+class TestPricedByAudioLength:
+    PER_SECOND: Final = {"input_cost_per_second": 0.0001}
+    PER_TOKEN: Final = {"input_cost_per_audio_token": 0.0000025, "output_cost_per_token": 0.00001}
+
+    @pytest.mark.parametrize(
+        ("deployment", "cost_map", "expected"),
+        [
+            (PER_SECOND, {}, True),
+            ({"output_cost_per_second": 0.0001}, {}, True),
+            ({}, PER_SECOND, True),
+            ({"id": "route", "mode": "audio_transcription"}, PER_SECOND, True),
+            (PER_SECOND, PER_TOKEN, True),
+            (PER_TOKEN, PER_SECOND, False),
+            ({}, {**PER_SECOND, **PER_TOKEN}, False),
+            ({"input_cost_per_second": 0}, PER_SECOND, False),
+            ({"input_cost_per_second": 0, "input_cost_per_token": 0}, {}, False),
+            ({}, {}, False),
+        ],
+    )
+    def test_the_deployment_prices_decide_when_it_states_any(self, deployment, cost_map, expected):
+        assert priced_by_audio_length(deployment, cost_map) is expected
 
 
 class TestGetAudioFileContentHash:

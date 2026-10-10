@@ -72,6 +72,8 @@ jobs:
             tests/unit/litellm_core_utils/llm_cost_calc/test_off_peak_pricing.py \
             tests/unit/litellm_core_utils/llm_cost_calc/test_llm_cost_calc_utils.py \
             tests/unit/litellm_core_utils/test_get_model_cost_map.py \
+            tests/unit/litellm_core_utils/audio_utils/test_container_duration.py \
+            tests/unit/litellm_core_utils/test_audio_utils.py \
             tests/unit/litellm_core_utils/test_safe_json_dumps.py \
             tests/unit/litellm_core_utils/test_redact_messages.py \
             tests/unit/llms/chatgpt/chat/test_chatgpt_transformation.py \
@@ -102,6 +104,7 @@ jobs:
             tests/unit/test_utils.py \
             tests/unit/litellm_core_utils/test_core_helpers.py \
             -k 'retry_history or request_retry_cap or request_retry_state or retry_breadcrumbs or context_window_pre_call_check or registered_pre_routing_callback'
+          uv run --no-sync pytest -q tests/unit/test_main.py -k 'transcription'
 
       - name: Check subscription-exhaustion-only failover, paid fallback and shared transport budgets
         env:

@@ -3,6 +3,7 @@ import base64
 from datetime import datetime
 import contextlib
 import copy
+import io
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import respx
 
 
 import urllib.parse
+import wave
 from importlib import import_module
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -4007,6 +4009,16 @@ def test_stream_chunk_builder_leaves_xai_reported_cost_to_the_calculator(monkeyp
     assert logging_obj._response_cost_calculator(result=response) == pytest.approx(0.63)
 
 
+def _silent_wav(seconds: float) -> bytes:
+    buffer: Final = io.BytesIO()
+    with wave.open(buffer, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16000)
+        audio.writeframes(b"\x00\x00" * int(16000 * seconds))
+    return buffer.getvalue()
+
+
 def _recording_openai_client(response: httpx.Response) -> tuple[openai.AsyncOpenAI, MagicMock]:
     upstream: Final = MagicMock(return_value=response)
     client: Final = openai.AsyncOpenAI(
@@ -4023,7 +4035,7 @@ async def test_atranscription_sends_extra_headers_to_an_openai_compatible_upstre
 
     response: Final = await litellm.atranscription(
         model="litellm_proxy/whisper-1",
-        file=("audio.mp3", b"\x00\x01\x02", "audio/mpeg"),
+        file=("audio.wav", _silent_wav(0.1), "audio/wav"),
         api_base="https://central.example/v1",
         api_key="sk-test",
         client=client,
@@ -4036,6 +4048,92 @@ async def test_atranscription_sends_extra_headers_to_an_openai_compatible_upstre
     assert b"extra_headers" not in request.content
     assert b"call-from-instance" not in request.content
     assert response.text == "hello"
+
+
+RECORDINGS: Final = Path(__file__).resolve().parent / "litellm_core_utils" / "audio_utils" / "recordings"
+PER_SECOND_ROUTE: Final = {"id": "transcriber", "mode": "audio_transcription", "input_cost_per_second": 0.0001}
+
+
+async def _forwarded_atranscription(
+    file: tuple[str, bytes, str], upstream_body: Mapping[str, object], model_info: Mapping[str, object]
+) -> tuple[litellm.TranscriptionResponse, MagicMock]:
+    client, upstream = _recording_openai_client(httpx.Response(200, json=upstream_body))
+    response: Final = await litellm.atranscription(
+        model="litellm_proxy/groq/whisper-large-v3-turbo",
+        file=file,
+        api_base="https://central.example/v1",
+        api_key="sk-test",
+        client=client,
+        model_info=model_info,
+    )
+    return response, upstream
+
+
+@pytest.mark.asyncio
+async def test_atranscription_bills_the_length_of_an_m4a_upload():
+    m4a: Final = (RECORDINGS / "tone-1.5s.m4a").read_bytes()
+
+    response, upstream = await _forwarded_atranscription(("note.m4a", m4a, "audio/mp4"), {"text": "hi"}, PER_SECOND_ROUTE)
+
+    assert upstream.call_count == 1
+    assert 1.5 <= response._hidden_params["audio_transcription_duration"] <= 1.5 + 2 * 1024 / 16000
+
+
+@pytest.mark.parametrize(
+    "answer",
+    (
+        {"text": "hi", "usage": {"type": "duration", "seconds": 4}},
+        {"text": "hi", "language": "en", "duration": 4, "segments": []},
+    ),
+)
+@pytest.mark.asyncio
+async def test_atranscription_bills_the_longer_length_the_provider_reports(answer: Mapping[str, object]):
+    response, _ = await _forwarded_atranscription(("note.wav", _silent_wav(1.5), "audio/wav"), answer, PER_SECOND_ROUTE)
+
+    assert response._hidden_params["audio_transcription_duration"] == 4
+
+
+@pytest.mark.asyncio
+async def test_atranscription_refuses_audio_it_cannot_measure_before_a_route_billed_by_the_second_is_called():
+    with pytest.raises(litellm.BadRequestError, match="length of this audio could not be read"):
+        await _forwarded_atranscription(("note.m4a", b"not audio", "audio/mp4"), {"text": "hi"}, PER_SECOND_ROUTE)
+
+
+@pytest.mark.asyncio
+async def test_atranscription_sends_audio_it_cannot_measure_to_a_route_billed_by_tokens():
+    response, upstream = await _forwarded_atranscription(
+        ("note.m4a", b"not audio", "audio/mp4"),
+        {"text": "hi"},
+        {"id": "transcriber", "mode": "audio_transcription", "input_cost_per_audio_token": 0.0000025},
+    )
+
+    assert upstream.call_count == 1
+    assert "audio_transcription_duration" not in response._hidden_params
+
+
+def test_transcription_bills_the_length_of_a_webm_upload_and_refuses_one_it_cannot_measure():
+    upstream: Final = MagicMock(return_value=httpx.Response(200, json={"text": "hi"}))
+    client: Final = openai.OpenAI(
+        api_key="sk-test",
+        base_url="https://central.example/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(upstream)),
+    )
+    webm: Final = (RECORDINGS / "chromium-recorder.webm").read_bytes()
+
+    def transcribe(content: bytes) -> litellm.TranscriptionResponse:
+        return litellm.transcription(
+            model="litellm_proxy/groq/whisper-large-v3-turbo",
+            file=("note.webm", content, "audio/webm"),
+            api_base="https://central.example/v1",
+            api_key="sk-test",
+            client=client,
+            model_info=PER_SECOND_ROUTE,
+        )
+
+    assert transcribe(webm)._hidden_params["audio_transcription_duration"] == pytest.approx(1.367)
+    with pytest.raises(litellm.BadRequestError):
+        transcribe(webm[:100])
+    assert upstream.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -4117,7 +4215,7 @@ def test_azure_ai_transcription_on_a_foundry_host_uses_the_azure_openai_deployme
 
     response: Final = litellm.transcription(
         model="azure_ai/whisper-1",
-        file=("tone.wav", b"RIFF\x00\x00\x00\x00WAVE", "audio/wav"),
+        file=("tone.wav", _silent_wav(0.1), "audio/wav"),
         api_base=FOUNDRY_HOST,
         api_key="fake-key",
     )
