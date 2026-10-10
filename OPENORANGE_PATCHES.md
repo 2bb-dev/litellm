@@ -102,6 +102,18 @@ Upstream syncs must preserve these behaviors:
   retry is a second paid generation, and a timed-out first attempt can still
   finish and bill. The router's retry policy decides everything else. Covered by
   `test_openai_image_generation_retries.py`.
+- **Transcriptions are never free:** a transcription priced by the second is
+  billed for the longest length of its audio: the upload's (soundfile for wav,
+  flac, ogg, mp3 and aiff; `audio_utils/container_duration.py` for MP4, m4a,
+  mov, WebM, mkv and ADTS AAC, including browser recordings without a declared
+  duration) or any length the provider reports (`duration`, `usage.seconds`).
+  Upstream read only what soundfile opens, so m4a, mp4 and webm uploads were
+  priced at $0. The length is read once, before the provider is called, and a
+  route priced by the second refuses audio whose length can't be read with a
+  400, so it never reaches a provider that would charge for it. A route priced
+  by tokens (the provider reports them) is not refused. Covered by
+  `test_container_duration.py`, `test_audio_utils.py` and the
+  `test_atranscription_*` / `test_transcription_*` cases in `tests/unit/test_main.py`.
 - **Retry privacy and limits:** history is request-local, contains at most four
   flat allowlisted records, and excludes prompts, credentials and exception
   text. A private request counter survives ordinary and streaming fallbacks
@@ -182,6 +194,8 @@ Without the flag, existing exclusive thresholds are unchanged.
 - `tests/proxy_unit_tests/test_update_spend.py`
 - `tests/test_litellm/proxy/test_spend_log_cleanup.py`
 - `tests/unit/llms/xai/videos/test_xai_video_transformation.py`
+- `tests/unit/litellm_core_utils/audio_utils/test_container_duration.py`
+- `tests/unit/litellm_core_utils/test_audio_utils.py`
 
 ## Stable v1.101.0 integration
 

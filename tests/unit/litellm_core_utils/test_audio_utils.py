@@ -3,8 +3,12 @@ Test the audio utils functionality in litellm_core_utils/audio_utils/utils.py
 """
 
 import io
+import math
 import os
 import tempfile
+import wave
+from pathlib import Path
+from typing import Final
 from unittest.mock import mock_open, patch
 
 import pytest
@@ -15,8 +19,12 @@ from litellm.litellm_core_utils.audio_utils.utils import (
     get_audio_file_content_hash,
     get_audio_file_for_health_check,
     get_audio_file_name,
+    longest_audio_seconds,
+    priced_by_audio_length,
     process_audio_file,
 )
+
+RECORDINGS: Final = Path(__file__).resolve().parent / "audio_utils" / "recordings"
 
 
 class TestProcessAudioFile:
@@ -275,6 +283,87 @@ class TestCalculateRequestDuration:
         assert file_obj.tell() == len(
             wav_header
         ), "File position should be restored to original position"
+
+
+def _wav(seconds: float) -> bytes:
+    buffer: Final = io.BytesIO()
+    with wave.open(buffer, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16000)
+        audio.writeframes(b"\x00\x00" * int(16000 * seconds))
+    return buffer.getvalue()
+
+
+def _named(name: str, content: bytes) -> io.BytesIO:
+    upload: Final = io.BytesIO(content)
+    upload.name = name
+    return upload
+
+
+class TestCalculateRequestDurationOfEveryUploadFormat:
+    @pytest.mark.parametrize("name", sorted(path.name for path in RECORDINGS.glob("tone-1.5s*")))
+    @pytest.mark.parametrize("wrap", (lambda name, content: content, lambda name, content: (name, content), _named))
+    def test_a_recording_of_each_format_reads_its_length(self, name, wrap):
+        seconds: Final = calculate_request_duration(wrap(name, (RECORDINGS / name).read_bytes()))
+
+        assert seconds is not None
+        assert 1.5 <= seconds <= 1.5 + 2 * 1024 / 16000
+
+    def test_a_proxy_upload_is_read_from_its_start_and_left_where_it_was(self):
+        upload: Final = _named("note.webm", (RECORDINGS / "chromium-recorder.webm").read_bytes())
+        upload.seek(100)
+
+        assert calculate_request_duration(upload) == pytest.approx(1.367)
+        assert upload.tell() == 100
+
+    @pytest.mark.parametrize("content", (_wav(0), b"", b"not audio"))
+    def test_audio_without_a_positive_length_reads_none(self, content):
+        assert calculate_request_duration(("note.wav", content)) is None
+
+
+class TestLongestAudioSeconds:
+    @pytest.mark.parametrize(
+        ("readings", "expected"),
+        [
+            ((1.5,), 1.5),
+            ((1.5, None, None, 2), 2),
+            ((1.5, None, 3.25, None), 3.25),
+            ((9.0, 4.5, 3.25, 2), 9.0),
+            ((None, None, None, 2), 2),
+            ((None, None, None, None), None),
+            ((), None),
+        ],
+    )
+    def test_the_longest_reading_is_billed(self, readings, expected):
+        assert longest_audio_seconds(*readings) == expected
+
+    @pytest.mark.parametrize("reading", (True, -3.0, 0, math.nan, math.inf, "12"))
+    def test_a_reading_that_is_not_a_positive_finite_number_is_ignored(self, reading):
+        assert longest_audio_seconds(1.5, reading) == 1.5
+
+
+class TestPricedByAudioLength:
+    PER_SECOND: Final = {"input_cost_per_second": 0.0001}
+    PER_TOKEN: Final = {"input_cost_per_audio_token": 0.0000025, "output_cost_per_token": 0.00001}
+
+    @pytest.mark.parametrize(
+        ("deployment", "cost_map", "expected"),
+        [
+            (PER_SECOND, {}, True),
+            ({"output_cost_per_second": 0.0001}, {}, True),
+            ({}, PER_SECOND, True),
+            ({"id": "route", "mode": "audio_transcription"}, PER_SECOND, True),
+            (PER_SECOND, PER_TOKEN, True),
+            (PER_TOKEN, PER_SECOND, False),
+            ({}, {**PER_SECOND, **PER_TOKEN}, False),
+            ({"input_cost_per_second": 0}, PER_SECOND, False),
+            ({"input_cost_per_second": 0, "input_cost_per_token": 0}, {}, False),
+            ({}, {}, False),
+        ],
+    )
+    def test_the_deployment_prices_decide_when_it_states_any(self, deployment, cost_map, expected):
+        assert priced_by_audio_length(deployment, cost_map) is expected
 
 
 class TestGetAudioFileContentHash:

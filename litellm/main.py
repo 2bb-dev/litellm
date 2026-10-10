@@ -71,8 +71,11 @@ from litellm.exceptions import LiteLLMUnknownProvider
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.asyncify import asyncify, run_async_function
 from litellm.litellm_core_utils.audio_utils.utils import (
+    UNMEASURED_AUDIO_MESSAGE,
     calculate_request_duration,
     get_audio_file_for_health_check,
+    longest_audio_seconds,
+    priced_by_audio_length,
 )
 from litellm.litellm_core_utils.chat_completion_agentic_loop import (
     maybe_run_chat_completion_agentic_loop,
@@ -134,6 +137,7 @@ from litellm.types.utils import (
     ModelResponseStream,
     RawRequestTypedDict,
     StreamingChoices,
+    TranscriptionUsageDurationObject,
 )
 from litellm.utils import (
     Choices,
@@ -7849,7 +7853,6 @@ async def atranscription(*args, **kwargs) -> TranscriptionResponse:
     model: Final = args[0] if len(args) > 0 else kwargs["model"]
     ### PASS ARGS TO Image Generation ###
     kwargs["atranscription"] = True
-    file: Final = kwargs.get("file", None)
     custom_llm_provider = None
     try:
         # Use a partial function to pass your keyword arguments
@@ -7876,17 +7879,6 @@ async def atranscription(*args, **kwargs) -> TranscriptionResponse:
             raise ValueError(
                 f"Invalid response from transcription provider, expected TranscriptionResponse, but got {type(response)}"
             )
-
-        # Store duration in _hidden_params for cost calculation without
-        # exposing it in the response body. Adding duration to the response
-        # tricks the OpenAI SDK's "best match deserialization" into thinking
-        # a plain Transcription is a TranscriptionVerbose/Diarized type.
-        if response is not None and not isinstance(response, Coroutine) and file is not None:
-            existing_duration: Final = getattr(response, "duration", None)
-            if existing_duration is None:
-                calculated_duration: Final = calculate_request_duration(file)
-                if calculated_duration is not None:
-                    response._hidden_params["audio_transcription_duration"] = calculated_duration
 
         return response
     except Exception as e:
@@ -7985,6 +7977,13 @@ def transcription(
         },
         custom_llm_provider=custom_llm_provider,
     )
+
+    request_seconds: Final = calculate_request_duration(file)
+    if request_seconds is None and priced_by_audio_length(
+        model_info if isinstance(model_info, Mapping) else MappingProxyType({}),
+        _cost_map_prices(model=model, custom_llm_provider=custom_llm_provider),
+    ):
+        raise litellm.BadRequestError(message=UNMEASURED_AUDIO_MESSAGE, model=model, llm_provider=custom_llm_provider)
 
     response: TranscriptionResponse | Coroutine[object, object, TranscriptionResponse] | None = None
 
@@ -8152,18 +8151,44 @@ def transcription(
             shared_session=shared_session,
         )
 
-    # Store duration in _hidden_params for cost calculation without
-    # exposing it in the response body (see sync path comment above).
-    if response is not None and not isinstance(response, Coroutine):
-        existing_duration: Final = getattr(response, "duration", None)
-        if existing_duration is None:
-            calculated_duration: Final = calculate_request_duration(file)
-            if calculated_duration is not None:
-                response._hidden_params["audio_transcription_duration"] = calculated_duration
-
     if response is None:
         raise ValueError("Unmapped provider passed in. Unable to get the response.")
+    if isinstance(response, Coroutine):
+        return _with_billable_audio_seconds_after(response, request_seconds)
+    return _with_billable_audio_seconds(response, request_seconds)
+
+
+def _cost_map_prices(model: str, custom_llm_provider: str) -> Mapping[str, object]:
+    try:
+        return litellm.get_model_info(model=model, custom_llm_provider=custom_llm_provider)
+    except Exception:  # noqa: BLE001  # a model the cost map doesn't list has no prices there
+        return MappingProxyType({})
+
+
+def _with_billable_audio_seconds(
+    response: TranscriptionResponse, request_seconds: float | None
+) -> TranscriptionResponse:
+    # The billed length lives in _hidden_params: a `duration` in the response body makes the OpenAI SDK
+    # deserialize a plain Transcription as TranscriptionVerbose.
+    usage: Final = response.usage
+    seconds: Final = longest_audio_seconds(
+        request_seconds,
+        response._hidden_params.get("audio_transcription_duration"),
+        getattr(response, "duration", None),
+        usage.seconds if isinstance(usage, TranscriptionUsageDurationObject) else None,
+    )
+    if seconds is not None:
+        response._hidden_params["audio_transcription_duration"] = seconds  # rebind-ok: the cost calculator reads it
     return response
+
+
+async def _with_billable_audio_seconds_after(
+    pending: Coroutine[object, object, TranscriptionResponse], request_seconds: float | None
+) -> TranscriptionResponse:
+    response: Final = await pending
+    if not isinstance(response, TranscriptionResponse):
+        return response
+    return _with_billable_audio_seconds(response, request_seconds)
 
 
 @client

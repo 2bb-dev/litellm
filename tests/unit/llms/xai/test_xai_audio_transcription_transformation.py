@@ -1,3 +1,6 @@
+import io
+import wave
+
 import httpx
 import pytest
 
@@ -15,7 +18,19 @@ from litellm.utils import ProviderConfigManager
 
 CONFIG = XAIAudioTranscriptionConfig()
 
-WAV_BYTES = b"RIFF" + b"\x00" * 64
+
+
+def _silent_wav(seconds: float) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16000)
+        audio.writeframes(b"\x00\x00" * int(16000 * seconds))
+    return buffer.getvalue()
+
+
+WAV_BYTES = _silent_wav(0.1)
 
 
 def test_transform_request_serializes_provider_params():
