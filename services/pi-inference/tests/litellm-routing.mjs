@@ -19,12 +19,40 @@ const listen = async (server) => {
 };
 const received = [];
 const receivedBetas = [];
+const limited = { busy: 0, quota: 0 };
+const quotaReset = Math.floor(Date.now() / 1000) + 3600;
 const stub = createServer(async (req, res) => {
   const parts = [];
   for await (const p of req) parts.push(p);
   const body = JSON.parse(Buffer.concat(parts));
   received.push(body);
   receivedBetas.push(req.headers["anthropic-beta"] ?? "");
+  const asked = JSON.stringify(body.messages ?? []);
+  const limit = asked.includes("busy now")
+    ? "busy"
+    : asked.includes("over quota")
+      ? "quota"
+      : undefined;
+  if (limit) {
+    limited[limit] += 1;
+    res.writeHead(429, {
+      "content-type": "application/json",
+      ...(limit === "busy"
+        ? { "retry-after": "1" }
+        : {
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-reset": String(quotaReset),
+            "anthropic-ratelimit-unified-representative-claim": "five_hour",
+          }),
+    });
+    res.end(
+      JSON.stringify({
+        type: "error",
+        error: { type: "rate_limit_error", message: "Rate limited" },
+      }),
+    );
+    return;
+  }
   const toolName = body.tools?.find(
     (tool) => !tool.type || tool.type === "custom",
   )?.name;
@@ -203,6 +231,21 @@ async def main():
     else:
       raise AssertionError('forced tool choice reached the backend')
   print('LiteLLM Chat forced tool choice on Sonnet 5.5 fails closed with drop_params PASS')
+  from litellm.router_utils.subscription_exhaustion import subscription_exhausted_until
+  reset=int(os.environ['CHECK_QUOTA_RESET'])
+  for text,expected in (('busy now',None),('over quota',reset)):
+    for stream in (False,True):
+      for surface in ('chat','messages'):
+        request=dict(model='anthropic/claude-haiku-4-5',api_base=base,api_key=key,max_tokens=16,messages=[{'role':'user','content':text}],stream=stream)
+        try:
+          r=await (litellm.acompletion(**request) if surface=='chat' else acreate(**request))
+          if stream:
+            _=[x async for x in r]
+        except litellm.RateLimitError as error:
+          assert subscription_exhausted_until(error)==expected,(surface,stream,error)
+        else:
+          raise AssertionError(f'{text} answered on {surface}')
+    print(f'LiteLLM reads {text!r} as '+('load' if expected is None else 'an account out of quota')+' on Chat and Messages PASS')
   await asyncio.sleep(0.1)
 asyncio.run(main())`;
 try {
@@ -215,6 +258,7 @@ try {
         PYTHONPATH: forkRoot,
         CHECK_BASE: base,
         CHECK_KEY: key,
+        CHECK_QUOTA_RESET: String(quotaReset),
         LITELLM_LOCAL_MODEL_COST_MAP: "True",
       },
       timeout: 60000,
@@ -223,6 +267,7 @@ try {
   );
   console.log(stdout);
   if (stderr) console.error(stderr);
+  assert.deepEqual(limited, { busy: 4, quota: 1 });
   const opus = received
     .map((payload, index) => ({ payload, betas: receivedBetas[index] }))
     .filter(({ payload }) => payload.model === "claude-opus-5-5");

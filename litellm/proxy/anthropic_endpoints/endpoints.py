@@ -41,6 +41,7 @@ from litellm.proxy.common_utils.openai_error_payload import (
     openai_error_type,
     with_litellm_call_id,
 )
+from litellm.router_utils.subscription_exhaustion import subscription_exhaustion_headers
 from litellm.types.utils import TokenCountResponse
 
 router: Final = APIRouter()
@@ -291,13 +292,14 @@ async def anthropic_response(
             return _anthropic_error_json_response(proxy_exception_from_http_exception(e, headers), request)
 
         error_msg: Final = f"{e}"
+        error_headers: Final = {**headers, **subscription_exhaustion_headers(e)}  # mutable-ok: ProxyException fills it
         return _anthropic_error_json_response(
             ProxyException(
                 message=getattr(e, "message", error_msg),
                 type=openai_error_type(e, error_status_code(e, 500)),
                 param=openai_error_param(e),
                 code=error_status_code(e, 500),
-                headers=headers,
+                headers=error_headers,
             ),
             request,
         )

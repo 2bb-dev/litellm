@@ -281,6 +281,12 @@ from litellm.router_utils.routing_groups import (
     parse_routing_groups,
     validate_routing_strategy,
 )
+from litellm.router_utils.subscription_exhaustion import (
+    is_subscription_account_group,
+    is_subscription_load,
+    pi_slot_at_capacity,
+    subscription_exhausted_until,
+)
 from litellm.scheduler import FlowItem, Scheduler
 from litellm.types.litellm_params import RoutingStrategyName
 from litellm.types.llms.openai import (
@@ -545,7 +551,6 @@ def _with_router_resolved_session_model(session: object, model_name: str) -> Map
 MAX_BUFFERED_PRE_CONTENT_ANTHROPIC_CHUNKS: Final = 200
 _ORDER_POLICY_DEPLOYMENTS_ADAPTER: Final = TypeAdapter(tuple[Mapping[str, object], ...])
 _ORDER_POLICY_METADATA_ADAPTER: Final = TypeAdapter(Mapping[str, object])
-_EMPTY_ORDER_POLICY_METADATA: Final[Mapping[str, object]] = MappingProxyType({})
 
 
 def _rate_limit_only_order_policy(deployments: Sequence[DeploymentTypedDict]) -> bool:
@@ -7356,35 +7361,19 @@ class Router:
             if order is not None
         )
         order_values: Final = tuple(sorted(_order_set))
-        if len(order_values) > 1 and _rate_limit_only_order_policy(all_deployments):
-            from litellm.exceptions import MidStreamFallbackError
+        from litellm.exceptions import MidStreamFallbackError
 
-            rate_limit_error: Final = e.original_exception if isinstance(e, MidStreamFallbackError) else e
+        subscription_accounts: Final = is_subscription_account_group(all_deployments)
+        # The first account's fallbacks name every other account, so the first walk sees every answer.
+        hop_ends_walk: Final = nested_fallback_hop and not isinstance(e, MidStreamFallbackError)
+        if subscription_accounts and (hop_ends_walk or (is_subscription_load(e) and not pi_slot_at_capacity(e))):
+            raise original_exception
+        if len(order_values) > 1 and _rate_limit_only_order_policy(all_deployments):
+            source_error: Final = e.original_exception if isinstance(e, MidStreamFallbackError) else e
             before_content: Final = not isinstance(e, MidStreamFallbackError) or (
                 e.is_pre_first_chunk and not e.generated_content
             )
-            source_status: Final = getattr(getattr(rate_limit_error, "__context__", None), "status_code", None)
-            stream_source: Final = e.__context__ if isinstance(e, MidStreamFallbackError) else None
-            stream_source_body: Final = (
-                stream_source.body
-                if isinstance(stream_source, openai.APIError) and not isinstance(stream_source, openai.APIStatusError)
-                else None
-            )
-            stream_error_body: Final = (
-                _ORDER_POLICY_METADATA_ADAPTER.validate_python(stream_source_body)
-                if isinstance(stream_source_body, Mapping)
-                else _EMPTY_ORDER_POLICY_METADATA
-            )
-            stream_rate_limit: Final = (
-                stream_error_body.get("type") == "rate_limit_error" and stream_error_body.get("code") == 429
-            )
-            is_rate_limit: Final = (
-                stream_rate_limit
-                or isinstance(rate_limit_error, litellm.RateLimitError)
-                or (isinstance(e, MidStreamFallbackError) and isinstance(rate_limit_error, litellm.APIError))
-            )
-            rate_limit_status: Final = 429 if stream_rate_limit else getattr(rate_limit_error, "status_code", None)
-            if not before_content or not (is_rate_limit and rate_limit_status == 429 and source_status in (None, 429)):
+            if not before_content or source_error is None or subscription_exhausted_until(source_error) is None:
                 raise original_exception
         if len(order_values) > 1 and not _skip_order_fallback:
             # Determine which order levels have already been tried
@@ -7582,6 +7571,8 @@ class Router:
                 fallback_failure_exception_str,
                 cooldown_info,
             )
+            if subscription_accounts and new_exception is not original_exception:
+                raise new_exception from original_exception
 
         attempted_fallback_group: Final = input_kwargs.get("fallback_model_group")
         if (
@@ -7781,6 +7772,7 @@ class Router:
                 isinstance(e, RequestRetryLimitError)
                 or is_invalid_encrypted_content_error(e)
                 or is_chatgpt_quota_error(e)
+                or subscription_exhausted_until(e) is not None
             ):
                 raise
             current_attempt = None
@@ -7888,6 +7880,7 @@ class Router:
                         isinstance(e, RequestRetryLimitError)
                         or is_invalid_encrypted_content_error(e)
                         or is_chatgpt_quota_error(e)
+                        or subscription_exhausted_until(e) is not None
                     ):
                         raise
                     if is_chatgpt_rate_limit(original_exception) and not is_chatgpt_rate_limit(e):

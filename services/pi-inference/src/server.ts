@@ -26,6 +26,16 @@ import {
   type Result,
   type WireEvent,
 } from "./protocol.js";
+import {
+  atCapacityHeader,
+  ExhaustedModels,
+  exhaustedUntil,
+  exhaustedUntilHeader,
+  exhaustionClaim,
+  exhaustionFailure,
+  unifiedLimit,
+  type UnifiedLimit,
+} from "./quota.js";
 
 export interface InferenceRuntime {
   models: Models;
@@ -40,6 +50,7 @@ export interface ServerOptions {
   maxBodyBytes?: number;
   maxInflight?: number;
   keepAliveMs?: number;
+  now?: () => number;
 }
 
 const genericFailure: ApiError = {
@@ -87,6 +98,7 @@ interface Upstream {
   rawJson?: string;
   rawStream?: Response;
   oauth?: boolean;
+  unified?: UnifiedLimit;
 }
 function redactCredentials(value: string, credentials: string[]): string {
   return credentials.reduce(
@@ -159,6 +171,7 @@ function upstreamFetch(
       response.headers.get("retry-after") ?? undefined,
     );
     if (!response.ok) {
+      upstream.unified = unifiedLimit(response.headers);
       const body = upstreamError.safeParse(
         await response
           .clone()
@@ -234,6 +247,8 @@ function upstreamFetch(
 
 export function createInferenceServer(options: ServerOptions) {
   const active = new Set<AbortController>();
+  const nowSeconds = () => Math.floor((options.now ?? Date.now)() / 1000);
+  const exhausted = new ExhaustedModels(nowSeconds);
   const server = createServer((req, res) => {
     void handle(req, res).catch(() => {
       if (!res.headersSent) sendError(res, genericFailure);
@@ -303,11 +318,13 @@ export function createInferenceServer(options: ServerOptions) {
       return;
     }
     if (active.size >= (options.maxInflight ?? 16)) {
-      res.setHeader("retry-after", "1");
+      res.setHeader(atCapacityHeader, "1");
       sendError(res, {
         status: 429,
         type: "rate_limit_error",
+        code: "slot_at_capacity",
         message: "Backend concurrency limit reached",
+        retryAfter: "1",
       });
       return;
     }
@@ -395,6 +412,12 @@ export function createInferenceServer(options: ServerOptions) {
         return;
       }
       const call = prepared.value;
+      const exhaustion = exhausted.get(alias);
+      if (exhaustion) {
+        result.error = exhaustionFailure(exhaustion);
+        sendError(res, result.error);
+        return;
+      }
       const responseContext =
         model.provider === "anthropic"
           ? normalizeContext(call.context)
@@ -472,9 +495,20 @@ export function createInferenceServer(options: ServerOptions) {
           result.firstTokenMs = performance.now() - started;
         if (event.type === "error") {
           result.message = event.error;
-          result.error = deadline.aborted
-            ? timeoutFailure
-            : providerFailure(upstream, model.provider === "anthropic");
+          const until = deadline.aborted
+            ? undefined
+            : exhaustedUntil(upstream.status, upstream.unified, nowSeconds());
+          result.error =
+            until !== undefined
+              ? exhaustionFailure(
+                  exhausted.mark(alias, {
+                    until,
+                    claim: exhaustionClaim(upstream.unified?.claim),
+                  }),
+                )
+              : deadline.aborted
+                ? timeoutFailure
+                : providerFailure(upstream, model.provider === "anthropic");
           if (rawForward || upstream.rawJson !== undefined) continue;
           if (call.stream && res.headersSent)
             await writeEvent(
@@ -579,6 +613,8 @@ export function createInferenceServer(options: ServerOptions) {
             : Math.round(result.firstTokenMs),
         provider_requests: result.requests,
         upstream_status: upstream.status,
+        upstream_unified_status: safeId(upstream.unified?.status),
+        subscription_exhausted_until: result.error?.exhaustedUntil,
         upstream_request_id: upstream.requestId,
         upstream_response_id: safeId(result.message?.responseId),
         usage: usage
@@ -807,12 +843,18 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 function errorBody(error: ApiError): unknown {
   return {
     type: "error",
-    error: { type: error.type, message: error.message },
+    error: {
+      type: error.type,
+      ...(error.code ? { code: error.code } : {}),
+      message: error.message,
+    },
   };
 }
 
 function sendError(res: ServerResponse, error: ApiError): void {
   if (error.retryAfter) res.setHeader("retry-after", error.retryAfter);
+  if (error.exhaustedUntil !== undefined)
+    res.setHeader(exhaustedUntilHeader, String(error.exhaustedUntil));
   sendJson(res, error.status, errorBody(error));
 }
 

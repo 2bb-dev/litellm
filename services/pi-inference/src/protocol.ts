@@ -11,6 +11,8 @@ export interface ApiError {
   type: string;
   message: string;
   retryAfter?: string;
+  code?: string;
+  exhaustedUntil?: number;
 }
 
 export type Result<T> = { ok: true; value: T } | { ok: false; error: ApiError };

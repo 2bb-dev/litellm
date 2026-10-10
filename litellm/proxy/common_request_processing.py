@@ -114,6 +114,7 @@ from litellm.proxy.utils import ProxyLogging, _check_and_merge_model_level_guard
 from litellm.router import Router
 from litellm.router_utils.add_retry_fallback_headers import get_hidden_params_dict
 from litellm.router_utils.common_utils import resolve_model_group_alias
+from litellm.router_utils.subscription_exhaustion import subscription_exhaustion_headers
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.router import RouterRateLimitError
 from litellm.types.router_weights import validate_router_weights
@@ -3673,6 +3674,7 @@ class ProxyBaseLLMRequestProcessing:
             if _provider_headers:
                 headers = get_response_headers(dict(_provider_headers))
         headers.update(custom_headers)
+        headers.update(subscription_exhaustion_headers(e))
 
         # Call response headers hook for failure
         try:

@@ -644,9 +644,232 @@ test(
     await started;
     const excess = await fetch(`${url}/v1/messages`, request);
     assert.equal(excess.status, 429);
+    assert.equal(excess.headers.get("retry-after"), "1");
+    assert.equal(excess.headers.get("x-openorange-pi-slot-at-capacity"), "1");
+    assert.equal(
+      excess.headers.get("x-openorange-subscription-exhausted-until"),
+      null,
+    );
+    assert.equal(
+      ((await excess.json()) as { error: { code: string } }).error.code,
+      "slot_at_capacity",
+    );
     const aborted = once(events, "aborted");
     client.abort();
     await aborted;
     await rejected;
   },
 );
+
+async function quotaFixture(
+  t: { after: (fn: () => unknown) => void },
+  answer: (model: string) => {
+    status: number;
+    headers?: Record<string, string>;
+  },
+) {
+  const calls: string[] = [];
+  const upstream = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString()) as {
+      model: string;
+    };
+    calls.push(body.model);
+    const { status, headers = {} } = answer(body.model);
+    res.writeHead(status, { "content-type": "application/json", ...headers });
+    res.end(
+      JSON.stringify(
+        status === 200
+          ? {
+              id: "provider-response",
+              type: "message",
+              role: "assistant",
+              model: body.model,
+              content: [{ type: "text", text: "ok" }],
+              stop_reason: "end_turn",
+              stop_sequence: null,
+              usage: { input_tokens: 1, output_tokens: 1 },
+            }
+          : {
+              type: "error",
+              error: {
+                type: status === 529 ? "overloaded_error" : "rate_limit_error",
+                message: "provider said no",
+              },
+            },
+      ),
+    );
+  });
+  const upstreamUrl = await listen(upstream);
+  t.after(() => close(upstream));
+  const stub = (id: string): Model<"anthropic-messages"> => ({
+    id,
+    name: id,
+    provider: "stub",
+    api: "anthropic-messages",
+    baseUrl: upstreamUrl,
+    reasoning: false,
+    input: ["text"],
+    contextWindow: 4096,
+    maxTokens: 1024,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  });
+  const models = createModels({
+    authContext: {
+      env: async (name) => (name === "STUB_KEY" ? providerKey : undefined),
+      fileExists: async () => false,
+    },
+  });
+  models.setProvider(
+    createProvider({
+      id: "stub",
+      auth: { apiKey: envApiKeyAuth("Stub", ["STUB_KEY"]) },
+      models: [stub("stub-opus"), stub("stub-sonnet")],
+      api: anthropicMessagesApi(),
+    }),
+  );
+  const clock = { now: 1_800_000_000_000 };
+  const logs: Record<string, unknown>[] = [];
+  const backend = createInferenceServer({
+    apiKey: internalKey,
+    now: () => clock.now,
+    runtime: {
+      models,
+      routes: new Map([
+        ["opus", stub("stub-opus")],
+        ["sonnet", stub("stub-sonnet")],
+      ]),
+    },
+    log: (record) => logs.push(record),
+  });
+  const url = await listen(backend.server);
+  t.after(() => close(backend.server));
+  const send = (model: string, stream = false) =>
+    fetch(`${url}/v1/messages`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${internalKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hi" }],
+        stream,
+      }),
+    });
+  return { calls, clock, logs, send };
+}
+
+test("an out-of-quota account answers that model at once until its reset, without calling Anthropic", async (t) => {
+  const reset = 1_800_003_600;
+  const nextReset = reset + 18_000;
+  let answerReset = reset;
+  const { calls, clock, logs, send } = await quotaFixture(t, (model) =>
+    model === "stub-opus"
+      ? {
+          status: 429,
+          headers: {
+            "retry-after": "3600",
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-reset": String(answerReset),
+            "anthropic-ratelimit-unified-representative-claim": "five_hour",
+          },
+        }
+      : { status: 200 },
+  );
+  for (const stream of [false, true, false]) {
+    const response = await send("opus", stream);
+    assert.equal(response.status, 429);
+    assert.equal(
+      response.headers.get("x-openorange-subscription-exhausted-until"),
+      String(reset),
+    );
+    assert.equal(response.headers.get("retry-after"), null);
+    assert.deepEqual(await response.json(), {
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        code: "subscription_exhausted",
+        message:
+          "Claude subscription usage limit reached (five_hour); it resets at 2027-01-15T09:00:00.000Z",
+      },
+    });
+  }
+  assert.deepEqual(calls, ["stub-opus"]);
+  const sonnet = await send("sonnet");
+  assert.equal(sonnet.status, 200);
+  await sonnet.text();
+  assert.deepEqual(calls, ["stub-opus", "stub-sonnet"]);
+  clock.now = reset * 1000;
+  answerReset = nextReset;
+  const again = await send("opus");
+  assert.equal(again.status, 429);
+  assert.equal(
+    again.headers.get("x-openorange-subscription-exhausted-until"),
+    String(nextReset),
+  );
+  assert.deepEqual(calls, ["stub-opus", "stub-sonnet", "stub-opus"]);
+  assert.deepEqual(
+    logs.map((record) => [
+      record.alias,
+      record.status,
+      record.provider_requests,
+      record.upstream_status,
+      record.upstream_unified_status,
+      record.subscription_exhausted_until,
+    ]),
+    [
+      ["opus", 429, 1, 429, "rejected", reset],
+      ["opus", 429, 0, undefined, undefined, reset],
+      ["opus", 429, 0, undefined, undefined, reset],
+      ["sonnet", 200, 1, 200, undefined, undefined],
+      ["opus", 429, 1, 429, "rejected", nextReset],
+    ],
+  );
+});
+
+test("a plain 429, a 529 and a rejection already reset stay retryable and mark nothing", async (t) => {
+  const answers: { status: number; headers: Record<string, string> }[] = [
+    { status: 429, headers: { "retry-after": "2" } },
+    {
+      status: 429,
+      headers: {
+        "anthropic-ratelimit-unified-status": "allowed",
+        "anthropic-ratelimit-unified-reset": "1800003600",
+      },
+    },
+    {
+      status: 429,
+      headers: {
+        "anthropic-ratelimit-unified-status": "rejected",
+        "anthropic-ratelimit-unified-reset": "1799999000",
+      },
+    },
+    { status: 529, headers: { "retry-after": "1" } },
+  ];
+  let next = 0;
+  const { calls, logs, send } = await quotaFixture(t, () => answers[next]!);
+  for (const [index, answer] of answers.entries()) {
+    next = index;
+    for (const stream of [false, true]) {
+      const response = await send("opus", stream);
+      assert.equal(response.status, answer.status);
+      assert.equal(
+        response.headers.get("x-openorange-subscription-exhausted-until"),
+        null,
+      );
+      assert.equal(
+        response.headers.get("retry-after"),
+        answer.headers["retry-after"] ?? null,
+      );
+      const body = (await response.json()) as { error: { code?: string } };
+      assert.equal(body.error.code, undefined);
+    }
+  }
+  assert.equal(calls.length, answers.length * 2);
+  assert(
+    logs.every((record) => record.subscription_exhausted_until === undefined),
+  );
+});
