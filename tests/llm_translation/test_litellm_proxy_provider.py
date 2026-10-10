@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Final
 from unittest.mock import AsyncMock
+import wave
 
 
 import httpx
@@ -327,6 +328,16 @@ async def test_litellm_gateway_from_sdk_image_edit(is_async):
     assert called_kwargs["headers"]["Authorization"] == "Bearer sk-1234"
 
 
+def _silent_wav(seconds: float) -> bytes:
+    buffer = BytesIO()
+    with wave.open(buffer, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16000)
+        audio.writeframes(b"\x00\x00" * int(16000 * seconds))
+    return buffer.getvalue()
+
+
 @pytest.mark.parametrize("is_async", [False, True])
 @pytest.mark.asyncio
 async def test_litellm_gateway_from_sdk_transcription(is_async):
@@ -351,14 +362,14 @@ async def test_litellm_gateway_from_sdk_transcription(is_async):
             if is_async:
                 await litellm.atranscription(
                     model="litellm_proxy/whisper-1",
-                    file=b"sample_audio",
+                    file=_silent_wav(0.1),
                     client=openai_client,
                     api_base="my-custom-api-base",
                 )
             else:
                 litellm.transcription(
                     model="litellm_proxy/whisper-1",
-                    file=b"sample_audio",
+                    file=_silent_wav(0.1),
                     client=openai_client,
                     api_base="my-custom-api-base",
                 )

@@ -321,6 +321,35 @@ class TestCalculateRequestDurationOfEveryUploadFormat:
     def test_audio_without_a_positive_length_reads_none(self, content):
         assert calculate_request_duration(("note.wav", content)) is None
 
+    def test_a_tuple_may_carry_a_bytearray_or_a_path(self, tmp_path):
+        m4a: Final = (RECORDINGS / "tone-1.5s.m4a").read_bytes()
+        upload: Final = tmp_path / "note.m4a"
+        upload.write_bytes(m4a)
+
+        assert calculate_request_duration(("note.m4a", bytearray(m4a))) == calculate_request_duration(m4a)
+        assert calculate_request_duration(("note.m4a", upload)) == calculate_request_duration(m4a)
+
+    def test_a_streamed_wav_whose_sizes_were_never_written_reads_its_data(self):
+        streamed: Final = _wav(0.5)[:4] + bytes(4) + _wav(0.5)[8:40] + bytes(4) + _wav(0.5)[44:]
+
+        assert calculate_request_duration(("note.wav", streamed)) == pytest.approx(0.5)
+
+    def test_a_length_is_never_more_than_the_bytes_carry_at_100_bits_a_second(self):
+        m4a: Final = (RECORDINGS / "tone-1.5s.m4a").read_bytes()
+        stts: Final = m4a.index(b"stts") + 4
+        hour_long_samples: Final = m4a[: stts + 12] + (16000 * 3600).to_bytes(4, "big") + m4a[stts + 16 :]
+
+        assert calculate_request_duration(hour_long_samples) == pytest.approx(len(m4a) * 8 / 100)
+
+    def test_flac_silence_is_not_capped_below_its_length(self):
+        import numpy
+        import soundfile
+
+        buffer: Final = io.BytesIO()
+        soundfile.write(buffer, numpy.zeros(16000 * 30, dtype="int16"), 16000, format="FLAC")
+
+        assert calculate_request_duration(("silence.flac", buffer.getvalue())) == pytest.approx(30)
+
 
 class TestLongestAudioSeconds:
     @pytest.mark.parametrize(

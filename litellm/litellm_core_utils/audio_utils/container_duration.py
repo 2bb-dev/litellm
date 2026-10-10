@@ -1,34 +1,55 @@
 """
-Audio length read from the containers soundfile can't open: MP4 (m4a, mov, 3gp), Matroska (webm, mkv) and ADTS AAC.
+Audio length read from an upload's own bytes, for what soundfile can't measure: MP4 (m4a, mov, 3gp), Matroska (webm,
+mkv) and ADTS AAC, MP3 (soundfile takes its length from a header that can understate it) and a WAV whose header was
+never finalized.
 
-Every length a container states or implies counts, and the longest one wins: a provider bills the audio it decodes,
-and a declared duration can be shorter than the samples a file carries. Each pass walks the upload once, so a
-crafted file costs time in proportion to its size.
+The length is the audio a decoder plays: the samples a file carries and their timestamps, on its audio tracks. A
+duration a header declares counts only when the samples give no length, since a buggy or crafted header can state any
+length. Like a decoder, the readers skip bytes they can't parse, a bounded number of times. Each pass walks the upload
+once, so a crafted file costs time in proportion to its size.
 """
 
 import math
+import re
 import struct
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import IntEnum
-from functools import reduce
-from itertools import groupby, takewhile
+from itertools import takewhile
 from types import MappingProxyType
-from typing import Final
+from typing import Final, TypeAlias
 
 _NANOSECONDS_PER_SECOND: Final = 1_000_000_000
 _MP4_FIRST_BOXES: Final = frozenset((b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide"))
 _MATROSKA_MAGIC: Final = b"\x1a\x45\xdf\xa3"
-_ADTS_SAMPLE_RATES: Final = (96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350)
-_AAC_SAMPLES_PER_BLOCK: Final = 1024
+_SOUNDFILE_MAGICS: Final = (b"OggS", b"fLaC", b"FORM", b".snd", b"caff")
+_MAX_RESYNCS: Final = 4096
+
+
+@dataclass(frozen=True, slots=True)
+class _Lengths:
+    played: tuple[float, ...]
+    declared: tuple[float, ...] = ()
 
 
 def container_duration_seconds(content: bytes) -> float | None:
     if content[4:8] in _MP4_FIRST_BOXES:
-        return _mp4_seconds(content)
+        return _length(_mp4_lengths(content))
     if content.startswith(_MATROSKA_MAGIC):
-        return _matroska_seconds(content)
-    return _adts_seconds(content)
+        return _length(_matroska_lengths(content))
+    if content.startswith(b"RIFF") and content[8:12] == b"WAVE":
+        return _streamed_wav_seconds(content)
+    if content.startswith(_SOUNDFILE_MAGICS):
+        return None
+    start: Final = _id3_end(content, 0)
+    if _first_frame(content, start, _adts_frame, _ADTS_SYNC) is not None:
+        return _longest((sum(_frames(content, start, _adts_frame, _ADTS_SYNC)),))
+    return _mp3_seconds(content, start)
+
+
+def _length(lengths: _Lengths) -> float | None:
+    played: Final = _longest(lengths.played)
+    return played if played is not None else _longest(lengths.declared)
 
 
 def _longest(readings: Iterable[float]) -> float | None:
@@ -96,6 +117,7 @@ def _seconds(ticks: int, timescale: int) -> float:
 class _Mp4Track:
     track_id: int
     timescale: int
+    audio: bool
     declared_ticks: int
     sample_ticks: int
 
@@ -105,10 +127,12 @@ def _mp4_track(content: bytes, trak: _Box) -> _Mp4Track | None:
     if header is None or header.end - header.start < 24:
         return None
     timescale, declared = _clock(content, _descendant(content, trak, b"mdia", b"mdhd"))
+    handler: Final = _descendant(content, trak, b"mdia", b"hdlr")
     stts: Final = _descendant(content, trak, b"mdia", b"minf", b"stbl", b"stts")
     return _Mp4Track(
         track_id=_uint(content, header.start + (20 if _wide(content, header) else 12), 4),
         timescale=timescale,
+        audio=handler is not None and content[handler.start + 8 : handler.start + 12] == b"soun",
         declared_ticks=declared,
         sample_ticks=0 if stts is None else _stts_ticks(content, stts),
     )
@@ -181,46 +205,48 @@ def _trun_ticks(content: bytes, trun: _Box, default: int) -> int:
     return sum(_uint(content, first + stride * index, 4) for index in range(samples))
 
 
-def _fragments_ticks(fragments: tuple[_Fragment, ...]) -> int:
+_Totals: TypeAlias = tuple[int, int, int]
+
+
+def _fragment_ticks(content: bytes, track_ids: frozenset[int], trex_ticks: Mapping[int, int]) -> Mapping[int, int]:
     """
-    The longer of the summed sample durations and the span from the first fragment's start to the last one's end.
-    Chromium's recorder states a short duration for each fragment's last sample, and the start times keep the timeline.
+    Per track: the longer of its fragments' summed sample durations and the span from its first fragment's start to
+    its last one's end. Chromium's recorder states a short duration for each fragment's last sample, and the start
+    times keep the timeline.
     """
-    span: Final = max(f.start_ticks + f.ticks for f in fragments) - min(f.start_ticks for f in fragments)
-    return max(sum(f.ticks for f in fragments), span)
+    totals: Final[dict[int, _Totals]] = {}  # mutable-ok: running per-track totals keep the fragments out of memory
+    for traf in _trafs(content):
+        fragment = _fragment(content, traf, trex_ticks)
+        if fragment is None or fragment.track_id not in track_ids:
+            continue
+        ticks, first, last = totals.get(fragment.track_id, (0, fragment.start_ticks, 0))
+        end = fragment.start_ticks + fragment.ticks
+        totals[fragment.track_id] = (ticks + fragment.ticks, min(first, fragment.start_ticks), max(last, end))
+    return MappingProxyType({track_id: max(ticks, last - first) for track_id, (ticks, first, last) in totals.items()})
 
 
-def _track_of(fragment: _Fragment) -> int:
-    return fragment.track_id
-
-
-def _fragment_ticks_by_track(content: bytes, trex_ticks: Mapping[int, int]) -> Mapping[int, int]:
-    fragments: Final = sorted(
-        (fragment for traf in _trafs(content) if (fragment := _fragment(content, traf, trex_ticks)) is not None),
-        key=_track_of,
-    )
-    return MappingProxyType(
-        {track_id: _fragments_ticks(tuple(group)) for track_id, group in groupby(fragments, key=_track_of)}
-    )
-
-
-def _mp4_seconds(content: bytes) -> float | None:
+def _mp4_lengths(content: bytes) -> _Lengths:
     moov: Final = next((box for box in _boxes(content, 0, len(content)) if box.kind == b"moov"), None)
     if moov is None:
-        return None
-    movie_timescale, movie_ticks = _clock(content, _descendant(content, moov, b"mvhd"))
+        return _Lengths(played=())
     tracks: Final = tuple(
         track for trak in _children(content, moov, b"trak") if (track := _mp4_track(content, trak)) is not None
     )
-    fragments: Final = _fragment_ticks_by_track(content, _trex_default_ticks(content, moov))
-    return _longest(
-        (
+    audio: Final = tuple(track for track in tracks if track.audio) or tracks
+    fragments: Final = _fragment_ticks(
+        content, frozenset(track.track_id for track in audio), _trex_default_ticks(content, moov)
+    )
+    movie_timescale, movie_ticks = _clock(content, _descendant(content, moov, b"mvhd"))
+    return _Lengths(
+        played=(
+            *(_seconds(track.sample_ticks, track.timescale) for track in audio),
+            *(_seconds(fragments.get(track.track_id, 0), track.timescale) for track in audio),
+        ),
+        declared=(
+            *(_seconds(track.declared_ticks, track.timescale) for track in audio),
             _seconds(movie_ticks, movie_timescale),
             _seconds(_mehd_ticks(content, moov), movie_timescale),
-            *(_seconds(track.declared_ticks, track.timescale) for track in tracks),
-            *(_seconds(track.sample_ticks, track.timescale) for track in tracks),
-            *(_seconds(fragments.get(track.track_id, 0), track.timescale) for track in tracks),
-        )
+        ),
     )
 
 
@@ -233,6 +259,7 @@ class _Ebml(IntEnum):
     DURATION = 0x4489
     TRACK_ENTRY = 0xAE
     TRACK_NUMBER = 0xD7
+    TRACK_TYPE = 0x83
     CODEC_ID = 0x86
     DEFAULT_DURATION = 0x23E383
     CLUSTER_TIMESTAMP = 0xE7
@@ -243,7 +270,10 @@ class _Ebml(IntEnum):
 
 
 _ENTERED_MASTERS: Final = frozenset((_Ebml.SEGMENT, _Ebml.INFO, _Ebml.TRACKS, _Ebml.CLUSTER))
+_CLUSTER_ID: Final = b"\x1f\x43\xb6\x75"
+_AUDIO_TRACK_TYPE: Final = 2
 _DEFAULT_TIMESTAMP_SCALE_NS: Final = 1_000_000
+_EBML_MAX_UINT_BYTES: Final = 8
 
 
 def _varint_length(content: bytes, offset: int) -> int:
@@ -265,32 +295,47 @@ class _Element:
     end: int
 
 
-def _elements(content: bytes, start: int, end: int) -> Iterator[_Element]:
+def _element_at(content: bytes, offset: int, end: int) -> tuple[_Element, int] | None:
+    """The element at `offset` and where the next one starts, or None when the bytes there are not one."""
+    id_length: Final = _varint_length(content, offset)
+    size_length: Final = _varint_length(content, offset + id_length) if id_length else 0
+    if not size_length:
+        return None
+    element_id: Final = _uint(content, offset, id_length)
+    payload: Final = offset + id_length + size_length
+    if element_id in _ENTERED_MASTERS:
+        return _Element(element_id, payload, end), payload
+    size: Final = _varint_value(content, offset + id_length, size_length)
+    if size == (1 << 7 * size_length) - 1 or payload + size > end:
+        return None
+    return _Element(element_id, payload, payload + size), payload + size
+
+
+def _elements(content: bytes, start: int, end: int, resync: bool) -> Iterator[_Element]:
     """
     Elements in file order. A master a length depends on is entered rather than skipped, so its children follow it
-    even when its size is unknown, as in a live recording; its `end` is then its parent's.
+    even when its size is unknown, as in a live recording; its `end` is then its parent's. With `resync`, bytes that
+    are not an element are skipped to the next Cluster, as a decoder does.
     """
     offset = start  # rebind-ok: a cursor over consecutive elements
+    resyncs = 0  # rebind-ok: the Clusters sought after bytes that were not an element
     while offset < end:
-        id_length = _varint_length(content, offset)
-        size_length = _varint_length(content, offset + id_length) if id_length else 0
-        if not size_length:
-            return
-        element_id = _uint(content, offset, id_length)
-        payload = offset + id_length + size_length
-        if element_id in _ENTERED_MASTERS:
-            yield _Element(element_id, payload, end)
-            offset = payload
+        found = _element_at(content, offset, end)
+        if found is not None:
+            yield found[0]
+            offset = found[1]
             continue
-        size = _varint_value(content, offset + id_length, size_length)
-        if size == (1 << 7 * size_length) - 1 or payload + size > end:
+        cluster = content.find(_CLUSTER_ID, offset + 1, end) if resync and resyncs < _MAX_RESYNCS else -1
+        if cluster < 0:
             return
-        yield _Element(element_id, payload, payload + size)
-        offset = payload + size
+        offset = cluster
+        resyncs += 1
 
 
 def _element_uint(content: bytes, element: _Element) -> int:
-    return _uint(content, element.start, element.end - element.start)
+    """An EBML unsigned integer, which is at most 8 bytes; a longer one reads as 0."""
+    size: Final = element.end - element.start
+    return 0 if size > _EBML_MAX_UINT_BYTES else _uint(content, element.start, size)
 
 
 def _element_float(content: bytes, element: _Element) -> float:
@@ -302,6 +347,7 @@ def _element_float(content: bytes, element: _Element) -> float:
 
 @dataclass(frozen=True, slots=True)
 class _MatroskaTrack:
+    audio: bool
     default_duration_ns: int
     opus: bool
 
@@ -314,18 +360,24 @@ class _MatroskaHeader:
 
 
 def _track_entry(content: bytes, entry: _Element) -> tuple[int, _MatroskaTrack]:
-    fields: Final = MappingProxyType({child.element_id: child for child in _elements(content, entry.start, entry.end)})
+    fields: Final = MappingProxyType(
+        {child.element_id: child for child in _elements(content, entry.start, entry.end, resync=False)}
+    )
     number: Final = fields.get(_Ebml.TRACK_NUMBER)
+    kind: Final = fields.get(_Ebml.TRACK_TYPE)
     default_duration: Final = fields.get(_Ebml.DEFAULT_DURATION)
     codec: Final = fields.get(_Ebml.CODEC_ID)
     return 0 if number is None else _element_uint(content, number), _MatroskaTrack(
+        audio=kind is not None and _element_uint(content, kind) == _AUDIO_TRACK_TYPE,
         default_duration_ns=0 if default_duration is None else _element_uint(content, default_duration),
         opus=codec is not None and content[codec.start : codec.end].rstrip(b"\x00") == b"A_OPUS",
     )
 
 
 def _before_clusters(content: bytes, element_id: int) -> Iterator[_Element]:
-    header: Final = takewhile(lambda element: element.element_id != _Ebml.CLUSTER, _elements(content, 0, len(content)))
+    header: Final = takewhile(
+        lambda element: element.element_id != _Ebml.CLUSTER, _elements(content, 0, len(content), resync=False)
+    )
     return (element for element in header if element.element_id == element_id)
 
 
@@ -359,21 +411,21 @@ def _group_blocks(content: bytes, cluster_timestamp: int, group: _Element) -> It
     duration: Final = next(
         (
             _element_uint(content, child)
-            for child in _elements(content, group.start, group.end)
+            for child in _elements(content, group.start, group.end, resync=False)
             if child.element_id == _Ebml.BLOCK_DURATION
         ),
         None,
     )
     return (
         _Block(cluster_timestamp, child, duration)
-        for child in _elements(content, group.start, group.end)
+        for child in _elements(content, group.start, group.end, resync=False)
         if child.element_id == _Ebml.BLOCK
     )
 
 
 def _blocks(content: bytes) -> Iterator[_Block]:
     cluster_timestamp = 0  # rebind-ok: the Timestamp of the Cluster the next blocks belong to
-    for element in _elements(content, 0, len(content)):
+    for element in _elements(content, 0, len(content), resync=True):
         if element.element_id == _Ebml.SIMPLE_BLOCK:
             yield _Block(cluster_timestamp, element, None)
         elif element.element_id == _Ebml.CLUSTER_TIMESTAMP:
@@ -420,56 +472,189 @@ def _carried_ns(
     return 0
 
 
-def _block_span(content: bytes, header: _MatroskaHeader, block: _Block) -> tuple[int, int]:
-    """When the block's audio ends and how much audio it carries, in nanoseconds."""
+@dataclass(frozen=True, slots=True)
+class _Span:
+    track: int
+    end_ns: int
+    carried_ns: int
+
+
+def _block_span(content: bytes, header: _MatroskaHeader, block: _Block) -> _Span | None:
+    """Which track a block belongs to, when its audio ends and how much audio it carries, in nanoseconds."""
     element: Final = block.element
     track_length: Final = _varint_length(content, element.start)
     timing: Final = element.start + track_length
     if not track_length or timing + 3 > element.end:
-        return 0, 0
-    track: Final = header.tracks.get(_varint_value(content, element.start, track_length))
+        return None
+    number: Final = _varint_value(content, element.start, track_length)
     laced: Final = content[timing + 2] & 0x06
     frames: Final = content[timing + 3] + 1 if laced and timing + 3 < element.end else 1
-    carried_ns: Final = _carried_ns(content, header, block, track, frames, None if laced else timing + 3)
+    carried: Final = _carried_ns(
+        content, header, block, header.tracks.get(number), frames, None if laced else timing + 3
+    )
     relative: Final = int.from_bytes(content[timing : timing + 2], "big", signed=True)
-    return (block.cluster_timestamp + relative) * header.timestamp_scale_ns + carried_ns, carried_ns
+    return _Span(number, (block.cluster_timestamp + relative) * header.timestamp_scale_ns + carried, carried)
 
 
-def _tally(tally: tuple[int, int], span: tuple[int, int]) -> tuple[int, int]:
-    return max(tally[0], span[0]), tally[1] + span[1]
+def _played_ns(content: bytes, header: _MatroskaHeader, audio: frozenset[int]) -> tuple[int, int]:
+    """
+    The latest end of an audio block, and the most audio one audio track carries. Blocks of other tracks don't count,
+    unless the file names no audio track.
+    """
+    latest = 0  # rebind-ok: the latest end of an audio block so far
+    carried: Final[dict[int, int]] = {}  # mutable-ok: running per-track totals keep the blocks out of memory
+    for block in _blocks(content):
+        span = _block_span(content, header, block)
+        if span is None or (audio and span.track not in audio):
+            continue
+        latest = max(latest, span.end_ns)
+        carried[span.track] = carried.get(span.track, 0) + span.carried_ns
+    return latest, max(carried.values(), default=0)
 
 
-def _matroska_seconds(content: bytes) -> float | None:
+def _matroska_lengths(content: bytes) -> _Lengths:
     header: Final = _matroska_header(content)
-    latest_ns, carried_ns = reduce(_tally, (_block_span(content, header, block) for block in _blocks(content)), (0, 0))
-    return _longest(
-        (
-            header.declared_ticks * header.timestamp_scale_ns / _NANOSECONDS_PER_SECOND,
-            latest_ns / _NANOSECONDS_PER_SECOND,
-            carried_ns / _NANOSECONDS_PER_SECOND,
-        )
+    audio: Final = frozenset(number for number, track in header.tracks.items() if track.audio)
+    latest_ns, carried_ns = _played_ns(content, header, audio)
+    return _Lengths(
+        played=(latest_ns / _NANOSECONDS_PER_SECOND, carried_ns / _NANOSECONDS_PER_SECOND),
+        declared=(header.declared_ticks * header.timestamp_scale_ns / _NANOSECONDS_PER_SECOND,),
     )
 
 
-def _id3_size(content: bytes) -> int:
-    if not content.startswith(b"ID3") or len(content) < 10:
-        return 0
-    synchsafe: Final = (content[6] & 0x7F) << 21 | (content[7] & 0x7F) << 14 | (content[8] & 0x7F) << 7
-    footer: Final = 10 if content[5] & 0x10 else 0
-    return 10 + (synchsafe | content[9] & 0x7F) + footer
+def _id3_end(content: bytes, offset: int) -> int:
+    """Where an ID3v2 tag at `offset` ends, or `offset` when there is none."""
+    if content[offset : offset + 3] != b"ID3" or offset + 10 > len(content):
+        return offset
+    high: Final = (content[offset + 6] & 0x7F) << 21 | (content[offset + 7] & 0x7F) << 14
+    size: Final = high | (content[offset + 8] & 0x7F) << 7 | content[offset + 9] & 0x7F
+    footer: Final = 10 if content[offset + 5] & 0x10 else 0
+    return offset + 10 + size + footer
 
 
-def _adts_frames(content: bytes) -> Iterator[float]:
-    """Seconds of each complete ADTS frame from the start of the stream, up to the first bytes that aren't one."""
-    offset = _id3_size(content)  # rebind-ok: a cursor over consecutive frames
-    while offset + 7 <= len(content) and content[offset] == 0xFF and content[offset + 1] & 0xF6 == 0xF0:
-        rate_index = content[offset + 2] >> 2 & 0x0F
-        length = (content[offset + 3] & 0x03) << 11 | content[offset + 4] << 3 | content[offset + 5] >> 5
-        if rate_index >= len(_ADTS_SAMPLE_RATES) or length < 7 or offset + length > len(content):
+_ADTS_SYNC: Final = re.compile(rb"\xff[\xf0\xf1\xf8\xf9]")
+_ADTS_SAMPLE_RATES: Final = (96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350)
+_AAC_SAMPLES_PER_BLOCK: Final = 1024
+
+
+def _adts_frame(content: bytes, offset: int) -> tuple[float, int] | None:
+    """Seconds and bytes of the complete ADTS frame at `offset`, or None when there is none."""
+    if offset + 7 > len(content) or content[offset] != 0xFF or content[offset + 1] & 0xF6 != 0xF0:
+        return None
+    rate_index: Final = content[offset + 2] >> 2 & 0x0F
+    length: Final = (content[offset + 3] & 0x03) << 11 | content[offset + 4] << 3 | content[offset + 5] >> 5
+    if rate_index >= len(_ADTS_SAMPLE_RATES) or length < 7 or offset + length > len(content):
+        return None
+    blocks: Final = (content[offset + 6] & 0x03) + 1
+    return blocks * _AAC_SAMPLES_PER_BLOCK / _ADTS_SAMPLE_RATES[rate_index], length
+
+
+_MPEG_SYNC: Final = re.compile(rb"\xff[\xe0-\xff]")
+_MPEG_SAMPLE_RATES: Final = MappingProxyType(
+    {3: (44100, 48000, 32000), 2: (22050, 24000, 16000), 0: (11025, 12000, 8000)}
+)
+_MPEG1_KBPS: Final = MappingProxyType(
+    {
+        3: (0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448),
+        2: (0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384),
+        1: (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320),
+    }
+)
+_MPEG2_KBPS: Final = MappingProxyType(
+    {
+        3: (0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256),
+        2: (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
+        1: (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
+    }
+)
+
+
+def _mpeg_frame(content: bytes, offset: int) -> tuple[float, int] | None:
+    """Seconds and bytes of the complete MPEG audio frame (layer I, II or III) at `offset`, or None."""
+    if offset + 4 > len(content) or content[offset] != 0xFF or content[offset + 1] & 0xE0 != 0xE0:
+        return None
+    version: Final = content[offset + 1] >> 3 & 0x03
+    layer: Final = content[offset + 1] >> 1 & 0x03
+    bitrate_index: Final = content[offset + 2] >> 4
+    rate_index: Final = content[offset + 2] >> 2 & 0x03
+    if version == 1 or layer == 0 or bitrate_index in (0, 15) or rate_index == 3:
+        return None
+    bits_per_second: Final = (_MPEG1_KBPS if version == 3 else _MPEG2_KBPS)[layer][bitrate_index] * 1000
+    rate: Final = _MPEG_SAMPLE_RATES[version][rate_index]
+    padding: Final = content[offset + 2] >> 1 & 0x01
+    samples: Final = 384 if layer == 3 else 1152 if layer == 2 or version == 3 else 576
+    slot_bytes: Final = 4 if layer == 3 else 1
+    length: Final = (samples // 8 * bits_per_second // rate // slot_bytes + padding) * slot_bytes
+    if offset + length > len(content):
+        return None
+    return samples / rate, length
+
+
+_FrameReader: TypeAlias = Callable[[bytes, int], tuple[float, int] | None]  # mutable-ok: Callable params
+_SEARCH_BYTES: Final = 65536
+
+
+def _first_frame(content: bytes, start: int, frame_at: _FrameReader, sync: re.Pattern[bytes]) -> int | None:
+    """
+    Where the first frame followed by another one, or by the end, starts within the first 64 KB: what tells a stream
+    of these frames from other bytes. Its frames are then counted from the stream's start.
+    """
+    for found in sync.finditer(content, start, min(len(content), start + _SEARCH_BYTES)):
+        frame = frame_at(content, found.start())
+        if frame is None:
+            continue
+        following = found.start() + frame[1]
+        if following == len(content) or frame_at(content, following) is not None:
+            return found.start()
+    return None
+
+
+def _frames(content: bytes, start: int, frame_at: _FrameReader, sync: re.Pattern[bytes]) -> Iterator[float]:
+    """Seconds of each complete frame of a stream, past ID3 tags and stray bytes, as a decoder reads it."""
+    offset = start  # rebind-ok: a cursor over the stream
+    resyncs = 0  # rebind-ok: the frames sought after bytes that were not one
+    while offset < len(content):
+        frame = frame_at(content, offset)
+        if frame is not None:
+            yield frame[0]
+            offset += frame[1]
+            continue
+        tag_end = _id3_end(content, offset)
+        if tag_end > offset:
+            offset = tag_end
+            continue
+        found = sync.search(content, offset + 1) if resyncs < _MAX_RESYNCS else None
+        if found is None:
             return
-        yield ((content[offset + 6] & 0x03) + 1) * _AAC_SAMPLES_PER_BLOCK / _ADTS_SAMPLE_RATES[rate_index]
-        offset += length
+        offset = found.start()
+        resyncs += 1
 
 
-def _adts_seconds(content: bytes) -> float | None:
-    return _longest((sum(_adts_frames(content)),))
+def _mp3_seconds(content: bytes, start: int) -> float | None:
+    """
+    The frames' own length. soundfile takes an MP3's length from its Xing or Info header, which can state far fewer
+    frames than the file carries, and it can't read one that starts with padding.
+    """
+    if _first_frame(content, start, _mpeg_frame, _MPEG_SYNC) is None:
+        return None
+    return _longest((sum(_frames(content, start, _mpeg_frame, _MPEG_SYNC)),))
+
+
+def _streamed_wav_seconds(content: bytes) -> float | None:
+    """
+    The length of a WAV whose data size was never written (0 or all ones) or runs past the end of the file, as a
+    recorder that streams its output leaves it: the data runs to the end. Any other WAV is soundfile's to read.
+    """
+    offset = 12  # rebind-ok: a cursor over the RIFF chunks
+    byte_rate = 0  # rebind-ok: the format chunk's average bytes per second, once read
+    while offset + 8 <= len(content):
+        kind = content[offset : offset + 4]
+        size = int.from_bytes(content[offset + 4 : offset + 8], "little")
+        if kind == b"fmt " and size >= 16:
+            byte_rate = int.from_bytes(content[offset + 16 : offset + 20], "little")
+        if kind == b"data":
+            available = len(content) - offset - 8
+            finalized = size not in (0, 0xFFFFFFFF) and size <= available
+            return None if finalized or byte_rate <= 0 else _longest((available / byte_rate,))
+        offset += 8 + size + size % 2
+    return None

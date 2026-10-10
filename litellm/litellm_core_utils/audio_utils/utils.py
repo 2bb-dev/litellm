@@ -291,8 +291,11 @@ def calculate_request_duration(file: FileTypes) -> float | None:
             # Tuple format: (filename, content, optional content_type)
             if len(file) >= 2:
                 content: Final = file[1]
-                if isinstance(content, bytes):
-                    file_content = content
+                if isinstance(content, (bytes, bytearray)):
+                    file_content = bytes(content)
+                elif isinstance(content, os.PathLike):
+                    with open(str(content), "rb") as f:
+                        file_content = f.read()
                 elif hasattr(content, "read") and not isinstance(content, (str, os.PathLike)):
                     # File-like object in tuple
                     current_pos: Final = getattr(content, "tell", lambda: None)()
@@ -323,10 +326,18 @@ def calculate_request_duration(file: FileTypes) -> float | None:
         return None
 
 
+_MIN_BITS_PER_SECOND: Final = 100
+
+
 def audio_duration_seconds(content: bytes) -> float | None:
-    """Seconds of audio in a file: soundfile reads wav, flac, ogg, mp3 and aiff, the container parser the rest."""
-    seconds: Final = _soundfile_seconds(content)
-    return seconds if seconds is not None else container_duration_seconds(content)
+    """
+    Seconds of audio in a file: the container readers for MP4, Matroska, AAC, MP3 and a streamed WAV, soundfile for
+    the rest. A length is never more than the bytes carry at 100 bits a second, below even the silence of FLAC or of
+    Opus with DTX, so a crafted file can't bill hours of audio it couldn't hold
+    """
+    measured: Final = container_duration_seconds(content)
+    seconds: Final = measured if measured is not None else _soundfile_seconds(content)
+    return None if seconds is None else min(seconds, len(content) * 8 / _MIN_BITS_PER_SECOND)
 
 
 def _soundfile_seconds(content: bytes) -> float | None:

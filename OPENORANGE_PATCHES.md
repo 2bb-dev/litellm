@@ -103,17 +103,24 @@ Upstream syncs must preserve these behaviors:
   finish and bill. The router's retry policy decides everything else. Covered by
   `test_openai_image_generation_retries.py`.
 - **Transcriptions are never free:** a transcription priced by the second is
-  billed for the longest length of its audio: the upload's (soundfile for wav,
-  flac, ogg, mp3 and aiff; `audio_utils/container_duration.py` for MP4, m4a,
-  mov, WebM, mkv and ADTS AAC, including browser recordings without a declared
-  duration) or any length the provider reports (`duration`, `usage.seconds`).
-  Upstream read only what soundfile opens, so m4a, mp4 and webm uploads were
-  priced at $0. The length is read once, before the provider is called, and a
-  route priced by the second refuses audio whose length can't be read with a
-  400, so it never reaches a provider that would charge for it. A route priced
-  by tokens (the provider reports them) is not refused. Covered by
-  `test_container_duration.py`, `test_audio_utils.py` and the
-  `test_atranscription_*` / `test_transcription_*` cases in `tests/unit/test_main.py`.
+  billed for its audio's length: the longest of the upload's length and any
+  length the provider reports (`duration`, `usage.seconds`). Upstream read only
+  what soundfile opens, so m4a, mp4 and webm uploads were priced at $0.
+  `audio_utils/container_duration.py` reads MP4 (m4a, mov, fragmented
+  recordings), Matroska and WebM (live recordings without sizes or a
+  duration), ADTS AAC, MP3 (by its frames, not its Xing header) and a WAV whose
+  sizes were never written. The length is what a decoder plays: the samples
+  and timestamps of the audio tracks, each track on its own; a duration a
+  header declares counts only when there are no samples. Like a decoder, the
+  readers skip stray bytes and ID3 tags, a bounded number of times; EBML
+  integers longer than 8 bytes read as 0. A length is never more than the
+  bytes carry at 100 bits a second, below even the silence of FLAC or of Opus
+  with DTX. The length is read once, before the provider is called, and a
+  route priced by the second (not by tokens) refuses audio whose length can't
+  be read with a 400, so it never reaches a provider that would charge for it.
+  Covered by `test_container_duration.py`, `test_audio_utils.py` and the
+  `test_atranscription_*` / `test_transcription_*` cases in
+  `tests/unit/test_main.py`.
 - **Retry privacy and limits:** history is request-local, contains at most four
   flat allowlisted records, and excludes prompts, credentials and exception
   text. A private request counter survives ordinary and streaming fallbacks
