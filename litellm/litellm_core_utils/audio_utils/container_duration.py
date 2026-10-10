@@ -1,8 +1,8 @@
 """
 Audio length read from an upload's own bytes, for what soundfile can't measure: MP4 (m4a, mov, 3gp), Matroska (webm,
 mkv) and ADTS AAC, a WAV whose header was never finalized, and MP3, whose length soundfile takes from a header that
-can understate it. A stream of ADTS or MPEG audio frames reads as the longer of the two kinds it holds, so a file
-that holds both bills the longer, whichever a decoder takes it for.
+can understate it. A file soundfile can't open that holds a stream of ADTS or MPEG audio frames reads as the longer
+of the two kinds, so a file holding both bills the longer, whichever a decoder takes it for.
 
 The length is the audio a decoder plays: the samples a file carries and their timestamps, on its audio tracks, each
 measured from its first sample. A duration a header declares counts only when the file carries no samples, since a
@@ -69,13 +69,21 @@ def container_duration_seconds(content: bytes) -> float | None:
     return None
 
 
-def mp3_duration_seconds(content: bytes) -> float | None:
+def mp3_duration_seconds(content: bytes, soundfile_seconds: float) -> float:
     """
-    The length of an MP3 by its frames, counted from the end of its ID3 tag, or None when it has none. soundfile takes
-    the length from the Xing or Info header, which can state far fewer frames than the file carries. soundfile has
-    already told the upload is MPEG audio, so its frames count without a run of them to tell them from other bytes.
+    The length of an MP3 soundfile opened, by its MPEG frames from the end of its ID3 tag. soundfile takes the length
+    from a Xing or Info header, which can state far fewer frames than the file carries, or without one estimates it
+    from the first frames' bitrate, which can be far off for VBR. So the frames decide when frames that follow one
+    another make up at least half the bytes. Fewer means they aren't the file's stream (as in a free-format MP3, whose
+    frames this reader doesn't parse, so it finds only stray bytes that look like frames), and the longer of the frames
+    and soundfile's reading counts.
     """
-    return _frame_stream_seconds(content, _id3_end(content, 0))
+    start: Final = _id3_end(content, 0)
+    tally: Final = _tally(_frames(content, start, _mpeg_frame, _MPEG_SYNC))
+    after_tag: Final = len(content) - start
+    if after_tag > 0 and 2 * tally.chained_bytes >= after_tag:
+        return tally.seconds
+    return max(tally.seconds, soundfile_seconds)
 
 
 def _length(lengths: _Lengths) -> float | None:
@@ -748,30 +756,56 @@ def _first_frame(content: bytes, start: int, frame_at: _FrameReader, sync: re.Pa
     return None
 
 
-def _frames(content: bytes, start: int, frame_at: _FrameReader, sync: re.Pattern[bytes]) -> Iterator[float]:
+@dataclass(frozen=True, slots=True)
+class _Step:
+    frame: _Frame
+    follows: bool
+
+
+def _frames(content: bytes, start: int, frame_at: _FrameReader, sync: re.Pattern[bytes]) -> Iterator[_Step]:
     """
-    Seconds of each complete frame of a stream, past stray bytes, as a decoder reads it. `sync` finds only a valid
+    Each complete frame of a stream, past stray bytes, as a decoder reads it, and whether it starts where the frame
+    before it ended. `sync` finds only a valid
     frame header, so the search past stray bytes lands on a frame, or within a frame's length of the end. An ID3 tag
     within the stream is stray bytes too, as to a decoder that reads no such tags, so frames inside one still count.
     """
     offset = start  # rebind-ok: a cursor over the stream
+    follows = False  # rebind-ok: whether the frame at the cursor would start where the one before it ended
     while offset < len(content):
         frame = frame_at(content, offset)
         if frame is not None:
-            yield frame.seconds
+            yield _Step(frame, follows)
             offset += frame.length
+            follows = True
             continue
         found = sync.search(content, offset + 1)
         if found is None:
             return
         offset = found.start()
+        follows = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Tally:
+    seconds: float
+    chained_bytes: int
+
+
+def _tally(steps: Iterable[_Step]) -> _Tally:
+    """The audio the frames carry, and the bytes of those that start where the frame before them ended, in one pass."""
+    seconds = 0.0  # rebind-ok: running total of the frames' audio
+    chained_bytes = 0  # rebind-ok: running total of the bytes of frames that follow another
+    for step in steps:
+        seconds += step.frame.seconds
+        chained_bytes += step.frame.length if step.follows else 0
+    return _Tally(seconds, chained_bytes)
 
 
 def _frame_stream_seconds(content: bytes, start: int) -> float | None:
     """The longer of the ADTS frames and the MPEG audio frames from `start` on, or None when there are none."""
-    return _longest(
-        (sum(_frames(content, start, _adts_frame, _ADTS_SYNC)), sum(_frames(content, start, _mpeg_frame, _MPEG_SYNC)))
-    )
+    adts: Final = _tally(_frames(content, start, _adts_frame, _ADTS_SYNC))
+    mpeg: Final = _tally(_frames(content, start, _mpeg_frame, _MPEG_SYNC))
+    return _longest((adts.seconds, mpeg.seconds))
 
 
 def _streamed_wav_seconds(content: bytes) -> float | None:

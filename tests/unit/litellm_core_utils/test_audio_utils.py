@@ -380,6 +380,25 @@ class TestCalculateRequestDurationOfEveryUploadFormat:
 
         assert calculate_request_duration(split) == calculate_request_duration(mp3)
 
+    def test_an_mp3_counts_only_its_mpeg_frames_when_its_payloads_read_as_adts_frames(self):
+        mp3: Final = (RECORDINGS / "tone-1.5s.mp3").read_bytes()
+        # Each 108-byte frame after the Info frame keeps its header and carries 14 tiny ADTS frames, 0.9 s of AAC by
+        # their headers, as the payload of an MPEG Layer II file can
+        first_audio_frame: Final = mp3.index(b"\xff\xf3\x38")
+        tiny_adts_frames: Final = b"\xff\xf1\x60\x40\x00\xff\xfc" * 14
+        frames: Final = tuple(
+            mp3[at : at + 4] + tiny_adts_frames + mp3[at + 4 + len(tiny_adts_frames) : at + 108]
+            for at in range(first_audio_frame, len(mp3), 108)
+        )
+
+        assert calculate_request_duration(mp3[:first_audio_frame] + b"".join(frames)) == calculate_request_duration(mp3)
+
+    def test_a_free_format_mp3_reads_soundfiles_length(self):
+        # Its frames state no bitrate, so the frame reader finds only stray bytes that look like frames
+        free_format: Final = (RECORDINGS / "tone-1.5s-freeformat.mp3").read_bytes()
+
+        assert calculate_request_duration(("note.mp3", free_format)) == pytest.approx(1.584, abs=0.001)
+
     def test_flac_silence_is_not_capped_below_its_length(self):
         import numpy
         import soundfile

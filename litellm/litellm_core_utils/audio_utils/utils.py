@@ -334,8 +334,8 @@ _MIN_BITS_PER_SECOND: Final = 100
 
 def audio_duration_seconds(content: bytes) -> float | None:
     """
-    Seconds of audio in a file: soundfile's reading of what it opens, except MP3, which is measured by its frames, and
-    the container readers for the rest (MP4, Matroska, AAC, a streamed WAV). A length is never more than the bytes carry
+    Seconds of audio in a file: soundfile's reading of what it opens, except MP3, which is measured by its frames when
+    they make up the file, and the container readers for the rest (MP4, Matroska, AAC, a streamed WAV). A length is never more than the bytes carry
     at 100 bits a second, below even the silence of FLAC or of Opus with DTX, so a crafted file can't bill hours of
     audio it couldn't hold
     """
@@ -347,10 +347,7 @@ def _measured_seconds(content: bytes, sound: tuple[float, str] | None) -> float 
     if sound is None:
         return container_duration_seconds(content)
     seconds, audio_format = sound
-    if audio_format != "MP3":
-        return seconds
-    frames: Final = mp3_duration_seconds(content)
-    return frames if frames is not None else seconds
+    return mp3_duration_seconds(content, seconds) if audio_format == "MP3" else seconds
 
 
 # libsndfile's frame count for a stream that never stated its length, such as FLAC written to a pipe

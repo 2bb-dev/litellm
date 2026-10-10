@@ -114,11 +114,15 @@ Upstream syncs must preserve these behaviors:
   of the audio tracks, each track on its own and measured from its first sample
   (a segment cut from a longer recording keeps its timestamps); an MP4's sample
   table and the fragments after it add up; a duration a header declares counts
-  only when there are no samples or blocks. A file soundfile can't open reads as
-  a stream of ADTS or MPEG frames only when four matching frames come in a row;
-  an MP3 soundfile opens counts its frames without that, and either way the
-  length is the longer of its ADTS and its MPEG frames, so a file holding both
-  bills the longer. Like a decoder, the readers skip stray bytes: a frame stream
+  only when there are no samples or blocks. An MP3 soundfile opens is measured
+  by its MPEG frames when frames that follow one another make up at least half
+  its bytes; otherwise (a free-format MP3, whose frames this reader doesn't
+  parse) the longer of its frames and soundfile's reading counts, so neither a
+  Xing header that understates nor soundfile's estimate for a VBR file without
+  one decides alone. A file soundfile can't open reads as a stream of ADTS or
+  MPEG frames only when four matching frames come in a row, and then as the
+  longer of the two kinds, so a file holding both bills the longer. Like a
+  decoder, the readers skip stray bytes: a frame stream
   resyncs only on a valid frame header, so any number of stray stretches costs
   one search each, and an ID3 tag after the first is stray bytes whose frames
   still count. EBML integers longer than 8 bytes read as 0, and a file with more

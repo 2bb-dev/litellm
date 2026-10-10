@@ -160,19 +160,30 @@ def test_mp3_frames_count_past_any_number_of_stray_bytes_without_four_in_a_row()
     many: Final = (frames[0], *frames[1:] * 120)
     split: Final = tag + b"".join(frame + b"\x00" for frame in many)
 
-    assert mp3_duration_seconds(tag + b"".join(frames)) == pytest.approx(len(frames) * MP3_FRAME_SECONDS)
-    assert mp3_duration_seconds(split) == pytest.approx(len(many) * MP3_FRAME_SECONDS)
-    assert mp3_duration_seconds(b"ID3" + bytes(7) + bytes(200)) is None
+    assert mp3_duration_seconds(tag + b"".join(frames), 0.01) == pytest.approx(len(frames) * MP3_FRAME_SECONDS)
+    assert mp3_duration_seconds(split, 0.01) == pytest.approx(len(many) * MP3_FRAME_SECONDS)
 
 
-def test_a_file_holding_both_kinds_of_frames_reads_the_longer_whichever_starts_a_stream():
+def test_mp3_frames_decide_when_they_make_up_the_file_and_a_longer_reading_counts_when_they_dont():
+    tag, frames = _mp3_frames()
+    # A VBR file without a Xing header: soundfile estimates its length from the first frames' bitrate
+    assert mp3_duration_seconds(tag + b"".join(frames), 134.0) == pytest.approx(len(frames) * MP3_FRAME_SECONDS)
+    # Three frames among 5,000 other bytes are not the file's stream, as in a free-format MP3
+    sparse: Final = tag + b"".join(frames[:3]) + bytes(5000)
+    assert mp3_duration_seconds(sparse, 1.5) == pytest.approx(1.5)
+    assert mp3_duration_seconds(sparse, 0.05) == pytest.approx(3 * MP3_FRAME_SECONDS)
+    # A lone frame follows no other, however few bytes surround it
+    assert mp3_duration_seconds(frames[1] + bytes(50), 1.5) == pytest.approx(1.5)
+    assert mp3_duration_seconds(b"ID3" + bytes(7) + bytes(200), 2.0) == pytest.approx(2.0)
+
+
+def test_a_file_soundfile_cant_open_reads_the_longer_kind_of_frames_whichever_starts_a_stream():
     adts: Final = _adts_frames(_recording("tone-1.5s.aac"))
     _, mpeg = _mp3_frames()
     # A stray byte after every third AAC frame leaves no four in a row, so only the MPEG frames start a stream
     split_adts: Final = b"".join(b"".join(adts[group : group + 3]) + b"\x00" for group in range(0, len(adts), 3))
 
     assert container_duration_seconds(b"".join(mpeg[1:5]) + split_adts) == pytest.approx(len(adts) * AAC_FRAME_SECONDS)
-    assert mp3_duration_seconds(b"".join(adts * 3) + b"".join(mpeg)) == pytest.approx(3 * len(adts) * AAC_FRAME_SECONDS)
 
 
 @pytest.mark.parametrize(
