@@ -353,19 +353,28 @@ def _measured_seconds(content: bytes, sound: tuple[float, str] | None) -> float 
     return frames if frames is not None else seconds
 
 
+# libsndfile's frame count for a stream that never stated its length, such as FLAC written to a pipe
+_UNKNOWN_FRAMES: Final = (1 << 63) - 1
+
+
 def _soundfile_reading(content: bytes) -> tuple[float, str] | None:
-    """The length soundfile reads and the format it recognizes, or None when it can't read a positive length."""
+    """
+    The length soundfile reads and the format it recognizes, or None when it can't read a positive length or the file
+    never stated one
+    """
     try:
         import soundfile
     except ImportError:
         return None
     try:
         with soundfile.SoundFile(io.BytesIO(content)) as audio:
-            seconds: Final[float] = len(audio) / audio.samplerate
+            frames: Final = len(audio)
+            seconds: Final[float] = frames / audio.samplerate
             audio_format: Final[str] = audio.format
     except (RuntimeError, TypeError, ValueError, ZeroDivisionError):
         return None
-    return (seconds, audio_format) if math.isfinite(seconds) and seconds > 0 else None
+    measured: Final = frames < _UNKNOWN_FRAMES and math.isfinite(seconds) and seconds > 0
+    return (seconds, audio_format) if measured else None
 
 
 UNMEASURED_AUDIO_MESSAGE: Final = (

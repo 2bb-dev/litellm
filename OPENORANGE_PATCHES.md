@@ -114,12 +114,21 @@ Upstream syncs must preserve these behaviors:
   of the audio tracks, each track on its own and measured from its first sample
   (a segment cut from a longer recording keeps its timestamps); an MP4's sample
   table and the fragments after it add up; a duration a header declares counts
-  only when there are no samples. A stream of AAC or MPEG frames needs four
-  matching frames in a row. Like a decoder, the readers skip stray bytes and ID3
-  tags, a bounded number of times; EBML integers longer than 8 bytes read as 0,
-  and a file with more Matroska elements or MP4 fragments than any recording
-  reads as unmeasured. A length is never more than the bytes carry at 100 bits a
-  second, below even the silence of FLAC or of Opus with DTX. The length is read
+  only when there are no samples or blocks. A file soundfile can't open reads as
+  a stream of ADTS or MPEG frames only when four matching frames come in a row;
+  an MP3 soundfile opens counts its frames without that, and either way the
+  length is the longer of its ADTS and its MPEG frames, so a file holding both
+  bills the longer. Like a decoder, the readers skip stray bytes: a frame stream
+  resyncs only on a valid frame header, so any number of stray stretches costs
+  one search each, and an ID3 tag after the first is stray bytes whose frames
+  still count. EBML integers longer than 8 bytes read as 0, and a file with more
+  Matroska elements (skipped stretches and BlockGroup fields included) or MP4
+  fragments than any recording reads as unmeasured, as does a length soundfile
+  can't tell (2^63 - 1 frames, as for a FLAC written to a pipe). Header lies
+  soundfile trusts (FLAC STREAMINFO, an Ogg granule) and Matroska or MP4 timing
+  lies still bill what they state, unless the provider reports more. A length is
+  never more than the bytes carry at 100 bits a second, below even the silence
+  of FLAC or of Opus with DTX. The length is read
   once, before the provider is called, and a route priced by the second (not by
   tokens) refuses audio whose length can't be read with a 400, so it never
   reaches a provider that would charge for it. Covered by

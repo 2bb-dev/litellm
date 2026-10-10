@@ -350,6 +350,36 @@ class TestCalculateRequestDurationOfEveryUploadFormat:
 
         assert calculate_request_duration(disguised) == calculate_request_duration(mp3)
 
+    def test_a_format_soundfile_reads_is_measured_by_soundfile_even_when_its_samples_look_like_frames(self):
+        import numpy
+        import soundfile
+
+        mp3: Final = (RECORDINGS / "tone-1.5s.mp3").read_bytes()
+        four_mp3_frames: Final = mp3[mp3.index(b"\xff\xf3\x38") :][: 4 * 108]
+        buffer: Final = io.BytesIO()
+        soundfile.write(buffer, numpy.zeros(16000, dtype="int16"), 16000, format="HTK")
+        # HTK opens with a 12-byte header and no magic, so its samples are all the container readers see
+        htk: Final = buffer.getvalue()
+        disguised: Final = htk[:12] + four_mp3_frames + htk[12 + len(four_mp3_frames) :]
+
+        assert calculate_request_duration(("note.htk", disguised)) == pytest.approx(1.0)
+
+    def test_an_mp3_is_measured_by_its_frames_when_stray_bytes_split_them_and_its_info_header_understates(self):
+        mp3: Final = (RECORDINGS / "tone-1.5s.mp3").read_bytes()
+        info_frames: Final = mp3.index(b"Info") + 8
+        # 10 of its 45 frames, which soundfile reads as 0.276 s once it takes off the encoder delay and padding
+        understated: Final = mp3[:info_frames] + (10).to_bytes(4, "big") + mp3[info_frames + 4 :]
+        # A 180-byte Info frame, then 24 kbps frames at 16 kHz of 108 bytes: a stray byte after every third frame
+        # leaves no four in a row
+        first_frame: Final = mp3.index(b"\xff\xf3")
+        audio: Final = first_frame + 180
+        frames: Final = (understated[first_frame:audio], *(mp3[at : at + 108] for at in range(audio, len(mp3), 108)))
+        split: Final = mp3[:first_frame] + b"".join(
+            b"".join(frames[group : group + 3]) + b"\x00" for group in range(0, len(frames), 3)
+        )
+
+        assert calculate_request_duration(split) == calculate_request_duration(mp3)
+
     def test_flac_silence_is_not_capped_below_its_length(self):
         import numpy
         import soundfile
@@ -358,6 +388,20 @@ class TestCalculateRequestDurationOfEveryUploadFormat:
         soundfile.write(buffer, numpy.zeros(16000 * 30, dtype="int16"), 16000, format="FLAC")
 
         assert calculate_request_duration(("silence.flac", buffer.getvalue())) == pytest.approx(30)
+
+    def test_a_flac_that_never_stated_its_length_reads_none(self):
+        import numpy
+        import soundfile
+
+        buffer: Final = io.BytesIO()
+        soundfile.write(buffer, numpy.zeros(16000 * 20, dtype="int16"), 16000, format="FLAC")
+        flac: Final = buffer.getvalue()
+        # STREAMINFO keeps the total samples in the low 36 bits of its bytes 10-17, 0 when the encoder wrote to a pipe
+        fields: Final = int.from_bytes(flac[18:26], "big")
+        piped: Final = flac[:18] + (fields >> 36 << 36).to_bytes(8, "big") + flac[26:]
+
+        assert calculate_request_duration(("note.flac", flac)) == pytest.approx(20)
+        assert calculate_request_duration(("note.flac", piped)) is None
 
 
 class TestLongestAudioSeconds:
