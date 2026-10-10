@@ -105,20 +105,25 @@ Upstream syncs must preserve these behaviors:
 - **Transcriptions are never free:** a transcription priced by the second is
   billed for its audio's length: the longest of the upload's length and any
   length the provider reports (`duration`, `usage.seconds`). Upstream read only
-  what soundfile opens, so m4a, mp4 and webm uploads were priced at $0.
-  `audio_utils/container_duration.py` reads MP4 (m4a, mov, fragmented
-  recordings), Matroska and WebM (live recordings without sizes or a
-  duration), ADTS AAC, MP3 (by its frames, not its Xing header) and a WAV whose
-  sizes were never written. The length is what a decoder plays: the samples
-  and timestamps of the audio tracks, each track on its own; a duration a
-  header declares counts only when there are no samples. Like a decoder, the
-  readers skip stray bytes and ID3 tags, a bounded number of times; EBML
-  integers longer than 8 bytes read as 0. A length is never more than the
-  bytes carry at 100 bits a second, below even the silence of FLAC or of Opus
-  with DTX. The length is read once, before the provider is called, and a
-  route priced by the second (not by tokens) refuses audio whose length can't
-  be read with a 400, so it never reaches a provider that would charge for it.
-  Covered by `test_container_duration.py`, `test_audio_utils.py` and the
+  what soundfile opens, so m4a, mp4 and webm uploads were priced at $0. soundfile
+  still reads what it recognizes, except MP3, which is measured by its frames (a
+  Xing header can state far fewer). `audio_utils/container_duration.py` reads the
+  rest: MP4 (m4a, mov, fragmented recordings), Matroska and WebM (live
+  recordings without sizes or a duration), ADTS AAC and a WAV whose sizes were
+  never written. The length is what a decoder plays: the samples and timestamps
+  of the audio tracks, each track on its own and measured from its first sample
+  (a segment cut from a longer recording keeps its timestamps); an MP4's sample
+  table and the fragments after it add up; a duration a header declares counts
+  only when there are no samples. A stream of AAC or MPEG frames needs four
+  matching frames in a row. Like a decoder, the readers skip stray bytes and ID3
+  tags, a bounded number of times; EBML integers longer than 8 bytes read as 0,
+  and a file with more Matroska elements or MP4 fragments than any recording
+  reads as unmeasured. A length is never more than the bytes carry at 100 bits a
+  second, below even the silence of FLAC or of Opus with DTX. The length is read
+  once, before the provider is called, and a route priced by the second (not by
+  tokens) refuses audio whose length can't be read with a 400, so it never
+  reaches a provider that would charge for it. Covered by
+  `test_container_duration.py`, `test_audio_utils.py` and the
   `test_atranscription_*` / `test_transcription_*` cases in
   `tests/unit/test_main.py`.
 - **Retry privacy and limits:** history is request-local, contains at most four

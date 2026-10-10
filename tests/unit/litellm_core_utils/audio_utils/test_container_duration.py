@@ -24,9 +24,11 @@ def _recording(name: str) -> bytes:
         "tone-1.5s.mp4",
         "tone-1.5s.mov",
         "tone-1.5s-fragmented.mp4",
+        "tone-1.5s-fragmented-moov.mp4",
         "tone-1.5s.aac",
         "tone-1.5s.webm",
         "tone-1.5s-live.webm",
+        "tone-1.5s-segment.webm",
         "tone-1.5s.mkv",
         "tone-1.5s.mp3",
         "tone-1.5s-video-3s.mp4",
@@ -95,6 +97,15 @@ def test_adts_reads_on_past_id3_tags_and_stray_bytes_and_drops_an_incomplete_las
     assert container_duration_seconds(aac + _id3_holding(aac[:first_frame]) + aac) == pytest.approx(2 * whole)
     assert container_duration_seconds(aac[:first_frame] + b"\x00" + aac[first_frame:]) == whole
     assert container_duration_seconds(aac[:-1]) == pytest.approx(whole - AAC_FRAME_SECONDS)
+
+
+def test_a_stream_of_frames_needs_four_of_them_in_a_row():
+    tiny_adts_frame: Final = b"\xff\xf1\x60\x40\x00\xff\xfc"
+
+    assert container_duration_seconds(bytes(1000) + tiny_adts_frame * 2 + bytes(1000)) is None
+    assert container_duration_seconds(bytes(1000) + tiny_adts_frame * 4 + bytes(1000)) == pytest.approx(
+        4 * 1024 / 16000
+    )
 
 
 def test_mp3_reads_its_frames_whatever_its_info_header_says_and_after_padding():
@@ -193,22 +204,20 @@ def test_the_latest_block_ends_after_the_packet_it_carries():
     )
 
 
-def test_a_cluster_timestamp_and_timestamp_scale_place_the_blocks():
+def test_a_track_is_measured_from_its_first_block_in_timestamp_scale_units():
     info: Final = _element(0x1549A966, _element(0x2AD7B1, (10_000_000).to_bytes(4, "big")))
+    segment: Final = _live_webm(_block(0, OPUS_20_MS), _block(50, OPUS_20_MS), info=info, cluster_timestamp=18_000)
 
-    assert container_duration_seconds(
-        _live_webm(_block(50, OPUS_20_MS), info=info, cluster_timestamp=100)
-    ) == pytest.approx(1.52)
+    assert container_duration_seconds(segment) == pytest.approx(0.52)
 
 
 def test_an_integer_longer_than_eight_bytes_reads_as_zero():
     oversized: Final = b"\x01" + bytes(4096)
     info: Final = _element(0x1549A966, _element(0x2AD7B1, oversized))
-    webm: Final = (
-        EBML_HEADER + SEGMENT + info + _element(0x1654AE6B, _track(1)) + _cluster(oversized, _block(1000, OPUS_20_MS))
-    )
+    tracks: Final = _element(0x1654AE6B, _track(1))
+    clusters: Final = _cluster(bytes(2), _block(0, OPUS_20_MS)) + _cluster(oversized, _block(1000, OPUS_20_MS))
 
-    assert container_duration_seconds(webm) == pytest.approx(1.02)
+    assert container_duration_seconds(EBML_HEADER + SEGMENT + info + tracks + clusters) == pytest.approx(1.02)
 
 
 def test_a_block_group_lasts_its_block_duration():

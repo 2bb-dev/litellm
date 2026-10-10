@@ -341,6 +341,15 @@ class TestCalculateRequestDurationOfEveryUploadFormat:
 
         assert calculate_request_duration(hour_long_samples) == pytest.approx(len(m4a) * 8 / 100)
 
+    def test_an_mp3_is_measured_by_its_frames_even_when_its_payload_looks_like_aac(self):
+        mp3: Final = (RECORDINGS / "tone-1.5s.mp3").read_bytes()
+        # 24 kbps at 16 kHz: every frame is 108 bytes. Four 7-byte ADTS frames go inside the fourth one's payload.
+        tiny_adts_frames: Final = b"\xff\xf1\x60\x40\x00\xff\xfc" * 4
+        payload: Final = mp3.index(b"\xff\xf3") + 3 * 108 + 40
+        disguised: Final = mp3[:payload] + tiny_adts_frames + mp3[payload + len(tiny_adts_frames) :]
+
+        assert calculate_request_duration(disguised) == calculate_request_duration(mp3)
+
     def test_flac_silence_is_not_capped_below_its_length(self):
         import numpy
         import soundfile

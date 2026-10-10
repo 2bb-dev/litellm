@@ -10,7 +10,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final
 
-from litellm.litellm_core_utils.audio_utils.container_duration import container_duration_seconds
+from litellm.litellm_core_utils.audio_utils.container_duration import (
+    container_duration_seconds,
+    mp3_duration_seconds,
+)
 from litellm.types.files import (
     AUDIO_FILE_TYPES,
     FILE_EXTENSIONS,
@@ -331,16 +334,27 @@ _MIN_BITS_PER_SECOND: Final = 100
 
 def audio_duration_seconds(content: bytes) -> float | None:
     """
-    Seconds of audio in a file: the container readers for MP4, Matroska, AAC, MP3 and a streamed WAV, soundfile for
-    the rest. A length is never more than the bytes carry at 100 bits a second, below even the silence of FLAC or of
-    Opus with DTX, so a crafted file can't bill hours of audio it couldn't hold
+    Seconds of audio in a file: soundfile's reading of what it opens, except MP3, which is measured by its frames, and
+    the container readers for the rest (MP4, Matroska, AAC, a streamed WAV). A length is never more than the bytes carry
+    at 100 bits a second, below even the silence of FLAC or of Opus with DTX, so a crafted file can't bill hours of
+    audio it couldn't hold
     """
-    measured: Final = container_duration_seconds(content)
-    seconds: Final = measured if measured is not None else _soundfile_seconds(content)
+    seconds: Final = _measured_seconds(content, _soundfile_reading(content))
     return None if seconds is None else min(seconds, len(content) * 8 / _MIN_BITS_PER_SECOND)
 
 
-def _soundfile_seconds(content: bytes) -> float | None:
+def _measured_seconds(content: bytes, sound: tuple[float, str] | None) -> float | None:
+    if sound is None:
+        return container_duration_seconds(content)
+    seconds, audio_format = sound
+    if audio_format != "MP3":
+        return seconds
+    frames: Final = mp3_duration_seconds(content)
+    return frames if frames is not None else seconds
+
+
+def _soundfile_reading(content: bytes) -> tuple[float, str] | None:
+    """The length soundfile reads and the format it recognizes, or None when it can't read a positive length."""
     try:
         import soundfile
     except ImportError:
@@ -348,9 +362,10 @@ def _soundfile_seconds(content: bytes) -> float | None:
     try:
         with soundfile.SoundFile(io.BytesIO(content)) as audio:
             seconds: Final[float] = len(audio) / audio.samplerate
+            audio_format: Final[str] = audio.format
     except (RuntimeError, TypeError, ValueError, ZeroDivisionError):
         return None
-    return seconds if math.isfinite(seconds) and seconds > 0 else None
+    return (seconds, audio_format) if math.isfinite(seconds) and seconds > 0 else None
 
 
 UNMEASURED_AUDIO_MESSAGE: Final = (
