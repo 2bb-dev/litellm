@@ -161,6 +161,9 @@ def _model_id_from_metadata(litellm_metadata: Mapping[str, object] | None) -> st
     return model_id if isinstance(model_id, str) else None
 
 
+_PENDING_STREAM_LOGGING_TASKS: Final[set[asyncio.Task[None]]] = set()
+
+
 def _log_background_task_failure(task: asyncio.Task[object], *, task_name: str) -> None:
     if task.cancelled():
         return
@@ -1081,13 +1084,28 @@ class BaseResponsesAPIStreamingIterator:
                 typed_call_type = None
 
         try:
-            # Call synchronously; async hook will be executed via asyncio.run in a new loop
-            run_async_function(
-                async_function=async_post_call_success_deployment_hook,
-                request_data=request_payload,
-                response=self.completed_response,
-                call_type=typed_call_type,
-            )
+            try:
+                loop: Final = asyncio.get_running_loop()
+            except RuntimeError:
+                run_async_function(
+                    async_function=async_post_call_success_deployment_hook,
+                    request_data=request_payload,
+                    response=self.completed_response,
+                    call_type=typed_call_type,
+                )
+            else:
+                hook_task: Final = loop.create_task(
+                    async_post_call_success_deployment_hook(
+                        request_data=request_payload,
+                        response=self.completed_response,
+                        call_type=typed_call_type,
+                    )
+                )
+                _PENDING_STREAM_LOGGING_TASKS.add(hook_task)
+                hook_task.add_done_callback(_PENDING_STREAM_LOGGING_TASKS.discard)
+                hook_task.add_done_callback(
+                    lambda task: _log_background_task_failure(task, task_name="Responses stream post-success hook")
+                )
         except Exception:
             pass
 
@@ -1106,24 +1124,37 @@ class BaseResponsesAPIStreamingIterator:
 
         traceback_exception: Final = traceback.format_exc()
         try:
-            run_async_function(
-                async_function=self.logging_obj.async_failure_handler,
-                exception=exception,
-                traceback_exception=traceback_exception,
-                start_time=self.start_time,
-                end_time=datetime.now(),
-            )
-        except Exception:
-            pass
-
-        try:
-            executor.submit(
-                self.logging_obj.failure_handler,
-                exception,
-                traceback_exception,
-                self.start_time,
-                datetime.now(),
-            )
+            try:
+                loop: Final = asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    run_async_function(
+                        async_function=self.logging_obj.async_failure_handler,
+                        exception=exception,
+                        traceback_exception=traceback_exception,
+                        start_time=self.start_time,
+                        end_time=datetime.now(),
+                    )
+                except Exception:
+                    pass
+                executor.submit(
+                    self.logging_obj.failure_handler,
+                    exception,
+                    traceback_exception,
+                    self.start_time,
+                    datetime.now(),
+                )
+            else:
+                failure_task: Final = loop.create_task(
+                    self.logging_obj.dispatch_failure_handlers(
+                        exception, traceback_exception, prefer_async_handlers=True
+                    )
+                )
+                _PENDING_STREAM_LOGGING_TASKS.add(failure_task)
+                failure_task.add_done_callback(_PENDING_STREAM_LOGGING_TASKS.discard)
+                failure_task.add_done_callback(
+                    lambda task: _log_background_task_failure(task, task_name="Responses stream failure logging")
+                )
         except Exception:
             pass
 
