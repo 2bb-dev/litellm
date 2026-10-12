@@ -8,6 +8,8 @@ crashed with exit 139 whenever any CustomLogger was registered).
 
 import asyncio
 import time
+from datetime import datetime
+from typing import Final
 
 import httpx
 import pytest
@@ -15,8 +17,8 @@ import pytest
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils import thread_pool_executor as thread_pool_executor_module
-from litellm.responses import streaming_iterator as responses_streaming_iterator_module
 from litellm.litellm_core_utils.litellm_logging import Logging as LitellmLogging
+from litellm.responses import streaming_iterator as responses_streaming_iterator_module
 from litellm.responses.streaming_iterator import ResponsesAPIStreamingIterator
 from litellm.types.llms.openai import ResponsesAPIResponse
 
@@ -156,3 +158,34 @@ async def test_sync_callbacks_run_only_after_async_handler_completes(recording_e
     submit_times = recording_executor.submit_times_for(logging_obj)
     assert len(submit_times) == 1
     assert submit_times[0] >= recorder.async_hook_finished
+
+
+class LoopRecordingLogger(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.callback_loop: asyncio.AbstractEventLoop | None = None
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        self.callback_loop = asyncio.get_running_loop()
+
+    async def async_post_call_success_deployment_hook(self, request_data, response, call_type):
+        self.callback_loop = asyncio.get_running_loop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook", ["failure", "post_success"])
+async def test_stream_logging_hooks_stay_on_request_loop(hook: str) -> None:
+    recorder: Final = LoopRecordingLogger()
+    litellm.callbacks = [recorder]
+    litellm.failure_callback = [recorder]
+    litellm._async_failure_callback = [recorder]
+    iterator: Final = _make_iterator(_make_logging_obj())
+    request_loop: Final = asyncio.get_running_loop()
+
+    if hook == "failure":
+        iterator._handle_failure(ValueError("stream failed"))
+    else:
+        iterator._run_post_success_hooks(end_time=datetime.now())
+
+    await asyncio.sleep(0)
+    assert recorder.callback_loop is request_loop

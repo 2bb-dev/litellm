@@ -1081,13 +1081,23 @@ class BaseResponsesAPIStreamingIterator:
                 typed_call_type = None
 
         try:
-            # Call synchronously; async hook will be executed via asyncio.run in a new loop
-            run_async_function(
-                async_function=async_post_call_success_deployment_hook,
-                request_data=request_payload,
-                response=self.completed_response,
-                call_type=typed_call_type,
-            )
+            try:
+                loop: Final = asyncio.get_running_loop()
+            except RuntimeError:
+                run_async_function(
+                    async_function=async_post_call_success_deployment_hook,
+                    request_data=request_payload,
+                    response=self.completed_response,
+                    call_type=typed_call_type,
+                )
+            else:
+                loop.create_task(
+                    async_post_call_success_deployment_hook(
+                        request_data=request_payload,
+                        response=self.completed_response,
+                        call_type=typed_call_type,
+                    )
+                )
         except Exception:
             pass
 
@@ -1106,13 +1116,25 @@ class BaseResponsesAPIStreamingIterator:
 
         traceback_exception: Final = traceback.format_exc()
         try:
-            run_async_function(
-                async_function=self.logging_obj.async_failure_handler,
-                exception=exception,
-                traceback_exception=traceback_exception,
-                start_time=self.start_time,
-                end_time=datetime.now(),
-            )
+            try:
+                loop: Final = asyncio.get_running_loop()
+            except RuntimeError:
+                run_async_function(
+                    async_function=self.logging_obj.async_failure_handler,
+                    exception=exception,
+                    traceback_exception=traceback_exception,
+                    start_time=self.start_time,
+                    end_time=datetime.now(),
+                )
+            else:
+                loop.create_task(
+                    self.logging_obj.async_failure_handler(
+                        exception=exception,
+                        traceback_exception=traceback_exception,
+                        start_time=self.start_time,
+                        end_time=datetime.now(),
+                    )
+                )
         except Exception:
             pass
 
