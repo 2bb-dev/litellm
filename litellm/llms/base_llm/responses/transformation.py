@@ -245,7 +245,8 @@ class BaseResponsesAPIConfig(ABC):
     def get_error_class(self, error_message: str, status_code: int, headers: dict | httpx.Headers) -> BaseLLMException:
         from ..chat.transformation import BaseLLMException
 
-        raise BaseLLMException(
+        # Returned, not raised: the caller marks a status it made up for a provider that never answered.
+        return BaseLLMException(
             status_code=status_code,
             message=error_message,
             headers=headers,

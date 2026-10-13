@@ -23,6 +23,7 @@ import weakref
 from collections import defaultdict
 from collections.abc import (
     AsyncGenerator,
+    AsyncIterable,
     AsyncIterator,
     Callable,
     Generator,
@@ -190,7 +191,12 @@ from litellm.router_utils.batch_utils import (
     replace_model_in_jsonl,
     should_replace_model_in_jsonl,
 )
-from litellm.router_utils.chatgpt_rate_limit import is_chatgpt_quota_error, is_chatgpt_rate_limit
+from litellm.router_utils.chatgpt_rate_limit import (
+    chatgpt_quota_reset_seconds,
+    is_chatgpt_quota_error,
+    is_chatgpt_rate_limit,
+    is_chatgpt_transient_error,
+)
 from litellm.router_utils.client_initalization_utils import InitalizeCachedClient, MaxParallelRequestsLimit
 from litellm.router_utils.clientside_credential_handler import (
     get_dynamic_litellm_params,
@@ -3263,6 +3269,58 @@ class Router:
         ]
         return cast("ResponseInputParam", base + continuation)
 
+    def _same_account_stream_retries_allowed(
+        self, error: "MidStreamFallbackError", kwargs: Mapping[str, object]
+    ) -> int:
+        """A stream an OpenAI hiccup cut off gets the retries the request would get before streaming."""
+        request_retries: Final = kwargs.get("num_retries")
+        if request_retries == 0:
+            return 0
+        model_group: Final = kwargs.get("model")
+        group_policies: Final = kwargs.get("model_group_retry_policy")
+        from_policy: Final = _get_num_retries_from_retry_policy(
+            exception=error.original_exception or error,
+            retry_policy=self.retry_policy,
+            model_group=model_group if isinstance(model_group, str) else None,
+            model_group_retry_policy=(
+                group_policies if isinstance(group_policies, Mapping) else self.model_group_retry_policy
+            ),
+        )
+        if from_policy is not None:
+            return from_policy
+        if isinstance(request_retries, int):
+            return request_retries
+        return self.num_retries or 0
+
+    async def _await_same_account_stream_retry(
+        self,
+        error: "MidStreamFallbackError",
+        source_iterator: object,
+        kwargs: dict[str, Any],  # mutable-ok: the hop kwargs the retry starts with
+    ) -> None:
+        """
+        Count a retry of a ChatGPT stream an OpenAI hiccup cut off, then wait the router's usual
+        backoff. A partly streamed answer can't be repeated, and spent retries end the request: the
+        caller gets OpenAI's error to retry later, and the account stays in service.
+        """
+        initialize_request_retry_state(kwargs, "litellm_metadata")
+        # The count lives in the request's in-process retry state, which callers can't set.
+        state: Final = kwargs["litellm_metadata"]._retry_state
+        answered: Final = bool(error.generated_content or getattr(source_iterator, "_generated_tool_arguments", ""))
+        allowed: Final = self._same_account_stream_retries_allowed(error, kwargs)
+        done: Final = state.same_account_stream_retries
+        if answered or done >= allowed:
+            if error.original_exception is not None:
+                raise error.original_exception from error
+            raise error
+        state.same_account_stream_retries = done + 1
+        # The restart must keep this request's opt-out of fallbacks, which the call re-records.
+        kwargs["disable_fallbacks"] = fallbacks_disabled_for_request(kwargs)
+        self.log_retry(kwargs=kwargs, e=error)
+        await asyncio.sleep(
+            self._time_to_sleep_before_retry(e=error, remaining_retries=allowed - done, num_retries=allowed)
+        )
+
     async def _aresponses_streaming_iterator(
         self,
         response: "BaseResponsesAPIStreamingIterator",
@@ -3420,6 +3478,11 @@ class Router:
                 async for item in source_iterator:
                     yield item
             except MidStreamFallbackError as e:
+                same_account: Final = is_chatgpt_transient_error(e)
+                if same_account:
+                    # The same account a moment later, never another one: the conversation's
+                    # encrypted reasoning only decrypts on the account that wrote it.
+                    await self._await_same_account_stream_retry(e, source_iterator, initial_kwargs)
                 partial_usage: Final = Router._extract_partial_responses_usage(source_iterator)
                 try:
                     model_group: Final = cast(str, initial_kwargs.get("model"))
@@ -3458,20 +3521,24 @@ class Router:
                         if isinstance(e.original_exception, litellm.ContentPolicyViolationError)
                         else e
                     )
-                    fallback_response = await self.async_function_with_fallbacks_common_utils(
-                        e=fallback_trigger,
-                        disable_fallbacks=fallbacks_disabled_for_request(initial_kwargs),
-                        fallbacks=fallbacks,
-                        context_window_fallbacks=context_window_fallbacks,
-                        content_policy_fallbacks=content_policy_fallbacks,
-                        model_group=model_group,
-                        args=(),
-                        kwargs=initial_kwargs,
-                        include_fallback_errors=initial_kwargs.get("include_fallback_errors", False) is True,
+                    fallback_response = (
+                        await self.async_function_with_fallbacks(**initial_kwargs)
+                        if same_account
+                        else await self.async_function_with_fallbacks_common_utils(
+                            e=fallback_trigger,
+                            disable_fallbacks=fallbacks_disabled_for_request(initial_kwargs),
+                            fallbacks=fallbacks,
+                            context_window_fallbacks=context_window_fallbacks,
+                            content_policy_fallbacks=content_policy_fallbacks,
+                            model_group=model_group,
+                            args=(),
+                            kwargs=initial_kwargs,
+                            include_fallback_errors=initial_kwargs.get("include_fallback_errors", False) is True,
+                        )
                     )
 
                     prepared_fallback_hidden_params = wrapper.adopt_fallback_headers(fallback_response)
-                    if hasattr(fallback_response, "__aiter__"):
+                    if isinstance(fallback_response, AsyncIterable):
                         async for fallback_item in fallback_response:
                             Router._apply_fallback_hidden_params_to_item(fallback_item, prepared_fallback_hidden_params)
                             if partial_usage is not None:
@@ -7327,6 +7394,9 @@ class Router:
             or is_invalid_encrypted_content_error(e)
             or disable_fallbacks is True
             or original_model_group is None
+            # An OpenAI hiccup is retried on its own ChatGPT account, never moved to another one:
+            # the conversation's encrypted reasoning only decrypts on the account that wrote it.
+            or is_chatgpt_transient_error(e)
         ):
             raise e
 
@@ -8379,6 +8449,10 @@ class Router:
                 header_cooldown = litellm.utils._get_retry_after_from_exception_header(
                     response_headers=exception_headers
                 )
+            # A ChatGPT account out of quota sits out as long as OpenAI says, also through its sidecar.
+            quota_reset: Final = chatgpt_quota_reset_seconds(exception)
+            if quota_reset is not None:
+                header_cooldown = quota_reset  # rebind-ok: OpenAI's own wait outranks a generic header
             ##############################################
             # Logic to determine cooldown time
             # 1. Check if a cooldown time is set in the deployment config

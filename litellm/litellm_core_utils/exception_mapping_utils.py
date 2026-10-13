@@ -2709,6 +2709,9 @@ def exception_type(
         )
 
         # don't let an error with mapping interrupt the user from receiving an error from the llm api calls
+        # A status made up for a provider that never answered stays marked as made up.
+        if getattr(original_exception, "status_code_is_synthesized", False):
+            e.status_code_is_synthesized = True  # pyright: ignore[reportAttributeAccessIssue]  # dynamic stamp, read by the router
         if exception_mapping_worked:
             setattr(e, "litellm_response_headers", litellm_response_headers)
             raise e

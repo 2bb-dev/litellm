@@ -343,11 +343,13 @@ def get_or_create_metadata_bucket(
 
 
 class _RouterRetryState:
-    """Only bounded diagnostics and a call counter, never request payloads."""
+    """Only bounded diagnostics and call counters, never request payloads."""
 
     def __init__(self) -> None:
         self.count = -1
         self.history: tuple[dict[str, str | int | None], ...] = ()
+        # Streams an OpenAI hiccup cut off that the router started again on the same ChatGPT account.
+        self.same_account_stream_retries = 0
 
 
 class _RouterRequestMetadata(dict):

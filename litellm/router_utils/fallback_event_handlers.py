@@ -23,6 +23,7 @@ from litellm.router_utils.add_retry_fallback_headers import (
     get_fallback_error_info,
 )
 from litellm.router_utils.batch_utils import _get_router_metadata_variable_name
+from litellm.router_utils.chatgpt_rate_limit import chatgpt_quota_reset_seconds
 from litellm.router_utils.cooldown_handlers import (
     _first_present,  # pyright: ignore[reportPrivateUsage] - shared internal helper, used across router_utils
     _set_cooldown_deployments,  # pyright: ignore[reportPrivateUsage] - shared helper, used across router_utils
@@ -130,9 +131,12 @@ def _trigger_cooldown_for_failed_deployment(
         _get_retry_after: Final = (
             litellm.utils._get_retry_after_from_exception_header  # pyright: ignore[reportPrivateUsage] - as router.py
         )
-        header_cooldown: Final = (
+        header_retry_after: Final = (
             _get_retry_after(response_headers=exception_headers) if exception_headers is not None else None
         )
+        # A ChatGPT account out of quota sits out as long as OpenAI says, also through its sidecar.
+        quota_reset: Final = chatgpt_quota_reset_seconds(exception)
+        header_cooldown: Final = quota_reset if quota_reset is not None else header_retry_after
         time_to_cooldown: Final = (
             deployment_cooldown
             if deployment_cooldown is not None and deployment_cooldown >= 0
