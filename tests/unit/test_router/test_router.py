@@ -19294,7 +19294,7 @@ def test_request_retry_state_copies_share_cap_without_serializing_context(copier
     assert get_request_retry_count(original) == 1
     assert original["metadata"] is not deferred["metadata"]
     assert json.loads(json.dumps(deferred["metadata"])) == {"owner": "synthetic", "request_retry_count": 1}
-    assert set(vars(original["metadata"]._retry_state)) == {"count", "history"}
+    assert set(vars(original["metadata"]._retry_state)) == {"count", "history", "same_account_stream_retries"}
 
 
 @pytest.mark.asyncio
