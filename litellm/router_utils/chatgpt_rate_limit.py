@@ -71,7 +71,10 @@ def is_chatgpt_transient_error(error: object) -> bool:
         return False
     if isinstance(source, Timeout):
         return True
-    if isinstance(source, (RateLimitError, openai.APIConnectionError)):
+    # A sidecar that never answered gets a made-up 500; it is down, not OpenAI.
+    if isinstance(source, (RateLimitError, openai.APIConnectionError)) or getattr(
+        source, "status_code_is_synthesized", False
+    ):
         return False
     status_code: Final = getattr(source, "status_code", None)
     return isinstance(status_code, int) and status_code >= 500

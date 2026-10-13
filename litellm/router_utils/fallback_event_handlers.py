@@ -131,15 +131,12 @@ def _trigger_cooldown_for_failed_deployment(
         _get_retry_after: Final = (
             litellm.utils._get_retry_after_from_exception_header  # pyright: ignore[reportPrivateUsage] - as router.py
         )
+        header_retry_after: Final = (
+            _get_retry_after(response_headers=exception_headers) if exception_headers is not None else None
+        )
         # A ChatGPT account out of quota sits out as long as OpenAI says, also through its sidecar.
         quota_reset: Final = chatgpt_quota_reset_seconds(exception)
-        header_cooldown: Final = (
-            quota_reset
-            if quota_reset is not None
-            else _get_retry_after(response_headers=exception_headers)
-            if exception_headers is not None
-            else None
-        )
+        header_cooldown: Final = quota_reset if quota_reset is not None else header_retry_after
         time_to_cooldown: Final = (
             deployment_cooldown
             if deployment_cooldown is not None and deployment_cooldown >= 0

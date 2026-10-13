@@ -61,9 +61,14 @@ Upstream syncs must preserve these behaviors:
   another, so the conversation keeps its encrypted reasoning. A stream that
   fails before any of the answer reached the caller starts again on that
   account after the router's retry backoff, up to the request's retry count; a
-  partly streamed answer returns OpenAI's error to the caller. An unreachable
-  sidecar keeps the default retries and fallbacks. Whether a hiccup benches the
-  account is the router's `allowed_fails_policy`; central's allows them all.
+  partly streamed answer returns OpenAI's error to the caller. The restart
+  count lives in the request's in-process retry state, never in metadata a
+  caller can send. An unreachable sidecar keeps the default retries and
+  fallbacks: the 500 LiteLLM makes up for a provider that never answered stays
+  marked `status_code_is_synthesized` through exception mapping, and the
+  Responses base `get_error_class` returns its error so the handler can mark
+  it. Whether a hiccup benches the account is the router's
+  `allowed_fails_policy`; central's allows them all.
 - **Claude subscription quota:** only a Claude subscription account that is out
   of quota moves a call on. The Pi slot answers it with a 429 carrying
   `x-openorange-subscription-exhausted-until` (unix seconds) when Anthropic's

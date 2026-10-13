@@ -110,12 +110,17 @@ class ChatGPTTransientErrorTest(unittest.TestCase):
 
     def test_rate_limits_unreachable_sidecars_client_errors_and_native_routes_are_not(self):
         throttled = RateLimitError(message="Rate limit exceeded", llm_provider="litellm_proxy", model=SIDECAR_MODEL)
+        never_answered = litellm.InternalServerError(
+            message="refused", llm_provider="litellm_proxy", model=SIDECAR_MODEL
+        )
+        never_answered.status_code_is_synthesized = True
         for error in (
             throttled,
             MidStreamFallbackError(
                 message="throttled", model=SIDECAR_MODEL, llm_provider="litellm_proxy", original_exception=throttled
             ),
             litellm.APIConnectionError(message="refused", llm_provider="litellm_proxy", model=SIDECAR_MODEL),
+            never_answered,
             litellm.BadRequestError(message="bad", llm_provider="litellm_proxy", model=SIDECAR_MODEL),
             litellm.InternalServerError(message=OVERLOADED, llm_provider="openai", model="gpt-6.1-sol"),
             litellm.InternalServerError(message=OVERLOADED, llm_provider="litellm_proxy", model="openai/gpt-6.1-sol"),
@@ -207,11 +212,17 @@ class _Sidecar(BaseHTTPRequestHandler):
         server = self.server
         step = server.script.pop(0) if server.script else "ok"
         server.calls.append(step)
-        if step == "503":
-            self.send_response(503)
+        if step in ("503", "quota"):
+            status, upstream = (
+                (503, {"error": {"message": OVERLOADED}})
+                if step == "503"
+                else (429, {"error": {"type": "usage_limit_reached", "message": "The usage limit has been reached"}})
+            )
+            body = {"error": {"message": "ChatgptException - " + json.dumps(upstream), "code": str(status)}}
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"error": {"message": OVERLOADED, "code": "503"}}).encode())
+            self.wfile.write(json.dumps(body).encode())
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -279,8 +290,8 @@ class ChatGPTSameAccountRetryTest(unittest.IsolatedAsyncioTestCase):
             server.shutdown()
             server.server_close()
 
-    async def stream(self) -> str | None:
-        response = await self.router.aresponses(model="sol/1", input="Hi", stream=True)
+    async def stream(self, **options: object) -> str | None:
+        response = await self.router.aresponses(model="sol/1", input="Hi", stream=True, **options)
         statuses = [event.response.status async for event in response if event.type == "response.completed"]
         return statuses[-1] if statuses else None
 
@@ -309,6 +320,46 @@ class ChatGPTSameAccountRetryTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(self.stream(), 20)
         self.assertEqual(self.calls(1), ["partial"])
         self.assertEqual(self.calls(2), [])
+
+    async def test_a_sidecar_that_never_answers_still_falls_back(self):
+        dead = {"model": "litellm_proxy/" + SIDECAR_MODEL, "api_key": "synthetic", "api_base": "http://127.0.0.1:1"}
+        alive = {**dead, "api_base": f"http://127.0.0.1:{self.sidecars[2].server_port}"}
+        router = Router(
+            model_list=[
+                {"model_name": "sol/1", "model_info": {"id": "sol-slot1"}, "litellm_params": dead},
+                {"model_name": "sol/2", "model_info": {"id": "sol-slot2"}, "litellm_params": alive},
+            ],
+            fallbacks=[{"sol/1": ["sol/2"]}],
+            allowed_fails=0,
+            num_retries=0,
+            allowed_fails_policy={"InternalServerErrorAllowedFails": 1000},
+        )
+        try:
+            response = await asyncio.wait_for(router.aresponses(model="sol/1", input="Hi", stream=True), 20)
+            statuses = [event.response.status async for event in response if event.type == "response.completed"]
+            self.assertEqual(statuses, ["completed"])
+            self.assertEqual(self.calls(2), ["ok"])
+        finally:
+            router.reset()
+
+    async def test_a_caller_cannot_raise_the_retry_count(self):
+        self.sidecars[1].script = ["overloaded"] * 10
+        with self.assertRaises(litellm.InternalServerError):
+            await asyncio.wait_for(self.stream(litellm_metadata={"same_account_stream_retries": -5}), 30)
+        self.assertEqual(self.calls(1), ["overloaded"] * 3)
+
+    async def test_a_restart_keeps_the_request_opt_out_of_fallbacks(self):
+        self.sidecars[1].script = ["overloaded", "quota"]
+        with self.assertRaises(litellm.RateLimitError):
+            await asyncio.wait_for(self.stream(disable_fallbacks=True), 20)
+        self.assertEqual(self.calls(1), ["overloaded", "quota"])
+        self.assertEqual(self.calls(2), [])
+
+    async def test_the_request_retry_count_applies_to_a_restart(self):
+        self.sidecars[1].script = ["overloaded"]
+        with self.assertRaises(litellm.InternalServerError):
+            await asyncio.wait_for(self.stream(num_retries=0), 20)
+        self.assertEqual(self.calls(1), ["overloaded"])
 
 
 if __name__ == "__main__":

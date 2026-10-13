@@ -555,8 +555,6 @@ def _with_router_resolved_session_model(session: object, model_name: str) -> Map
 # upstream that never emits content or an error could otherwise grow that
 # buffer without bound, so hitting this cap forces an early commit instead.
 MAX_BUFFERED_PRE_CONTENT_ANTHROPIC_CHUNKS: Final = 200
-# How often this request's ChatGPT stream was started again on its own account after an OpenAI hiccup.
-SAME_ACCOUNT_STREAM_RETRIES_KEY: Final = "same_account_stream_retries"
 _ORDER_POLICY_DEPLOYMENTS_ADAPTER: Final = TypeAdapter(tuple[Mapping[str, object], ...])
 _ORDER_POLICY_METADATA_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 
@@ -3271,39 +3269,53 @@ class Router:
         ]
         return cast("ResponseInputParam", base + continuation)
 
-    def _same_account_stream_retries(
+    def _same_account_stream_retries_allowed(
         self, error: "MidStreamFallbackError", kwargs: Mapping[str, object]
-    ) -> tuple[int, int]:
-        """(retries done, retries allowed) for a stream an OpenAI hiccup cut off, allowed like pre-stream retries."""
-        bucket: Final = kwargs.get("litellm_metadata")
-        done: Final = bucket.get(SAME_ACCOUNT_STREAM_RETRIES_KEY, 0) if isinstance(bucket, Mapping) else 0
+    ) -> int:
+        """A stream an OpenAI hiccup cut off gets the retries the request would get before streaming."""
+        request_retries: Final = kwargs.get("num_retries")
+        if request_retries == 0:
+            return 0
         model_group: Final = kwargs.get("model")
-        from_policy: Final = self.get_num_retries_from_retry_policy(
+        group_policies: Final = kwargs.get("model_group_retry_policy")
+        from_policy: Final = _get_num_retries_from_retry_policy(
             exception=error.original_exception or error,
+            retry_policy=self.retry_policy,
             model_group=model_group if isinstance(model_group, str) else None,
+            model_group_retry_policy=(
+                group_policies if isinstance(group_policies, Mapping) else self.model_group_retry_policy
+            ),
         )
-        allowed: Final = from_policy if from_policy is not None else (self.num_retries or 0)
-        return (done if isinstance(done, int) else 0), allowed
+        if from_policy is not None:
+            return from_policy
+        if isinstance(request_retries, int):
+            return request_retries
+        return self.num_retries or 0
 
     async def _await_same_account_stream_retry(
         self,
         error: "MidStreamFallbackError",
         source_iterator: object,
-        kwargs: dict[str, Any],  # mutable-ok: the hop kwargs the retry starts with carry its count
+        kwargs: dict[str, Any],  # mutable-ok: the hop kwargs the retry starts with
     ) -> None:
         """
         Count a retry of a ChatGPT stream an OpenAI hiccup cut off, then wait the router's usual
         backoff. A partly streamed answer can't be repeated, and spent retries end the request: the
         caller gets OpenAI's error to retry later, and the account stays in service.
         """
+        initialize_request_retry_state(kwargs, "litellm_metadata")
+        # The count lives in the request's in-process retry state, which callers can't set.
+        state: Final = kwargs["litellm_metadata"]._retry_state
         answered: Final = bool(error.generated_content or getattr(source_iterator, "_generated_tool_arguments", ""))
-        done, allowed = self._same_account_stream_retries(error, kwargs)
+        allowed: Final = self._same_account_stream_retries_allowed(error, kwargs)
+        done: Final = state.same_account_stream_retries
         if answered or done >= allowed:
             if error.original_exception is not None:
                 raise error.original_exception from error
             raise error
-        initialize_request_retry_state(kwargs, "litellm_metadata")
-        kwargs["litellm_metadata"][SAME_ACCOUNT_STREAM_RETRIES_KEY] = done + 1
+        state.same_account_stream_retries = done + 1
+        # The restart must keep this request's opt-out of fallbacks, which the call re-records.
+        kwargs["disable_fallbacks"] = fallbacks_disabled_for_request(kwargs)
         self.log_retry(kwargs=kwargs, e=error)
         await asyncio.sleep(
             self._time_to_sleep_before_retry(e=error, remaining_retries=allowed - done, num_retries=allowed)
